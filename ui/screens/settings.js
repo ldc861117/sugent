@@ -178,6 +178,7 @@ export function SettingsScreen({ tab, query: q, onQuery: setQ, onTab, focusRow, 
   const [invite, setInvite] = useState(null);
   const [unread, setUnread] = useState(null);
   const [cu, setCu] = useState(null);
+  const [selfEvo, setSelfEvo] = useState(false);
   const [flash, setFlash] = useState("");
   const mode = useStore(themeMode);
   const p = useStore(prefs);
@@ -199,7 +200,14 @@ export function SettingsScreen({ tab, query: q, onQuery: setQ, onTab, focusRow, 
     if (mf && mf.connected) loadMedia();
   }, [mf && mf.connected]);
   useEffect(() => {
-    if (bots && bots[0]) api(`/bots/${encodeURIComponent(bots[0].id)}/settings`).then((d) => setCu(d.computerUse)).catch(() => {});
+    if (bots && bots[0]) {
+      api(`/bots/${encodeURIComponent(bots[0].id)}/settings`)
+        .then((d) => {
+          setCu(d.computerUse);
+          setSelfEvo(!!(d.settings && d.settings.selfEvolution && d.settings.selfEvolution.enabled));
+        })
+        .catch(() => {});
+    }
   }, [bots && bots[0] && bots[0].id]);
   useEffect(() => {
     if (!focusRow) return;
@@ -277,6 +285,17 @@ export function SettingsScreen({ tab, query: q, onQuery: setQ, onTab, focusRow, 
     setPrefs({ notify: v });
     saved();
   };
+  const toggleSelfEvo = async (v) => {
+    if (!bots || !bots.length) return;
+    setSelfEvo(v);
+    try {
+      await Promise.all(bots.map((b) => api(`/bots/${encodeURIComponent(b.id)}/settings`, { method: "PUT", body: { selfEvolution: { enabled: v } } })));
+      saved();
+    } catch (e) {
+      setSelfEvo(!v);
+      failed(e);
+    }
+  };
   const customized = mode !== "system" || appearanceChanged(p) || (desktop && s.zoom !== 1);
   const resetLook = () => {
     setThemeMode("system");
@@ -303,6 +322,8 @@ export function SettingsScreen({ tab, query: q, onQuery: setQ, onTab, focusRow, 
     return [
       { tab: "general", id: "language", name: t("common.lang.label"), sub: t("settings.rows.language.sub"), keys: t("settings.rows.language.keys"),
         ctl: html`<${Seg} label=${t("common.lang.label")} value=${langPref} onChange=${(v) => changeLang(v).then(() => saved()).catch(failed)} options=${LANG_OPTIONS()} />` },
+      bots && bots.length > 0 && { tab: "general", id: "self-evolution", name: t("settings.rows.selfEvo.name"), sub: t("settings.rows.selfEvo.sub"), keys: t("settings.rows.selfEvo.keys"),
+        ctl: html`<${Switch} label=${t("settings.rows.selfEvo.name")} value=${selfEvo} onChange=${toggleSelfEvo} />` },
       { tab: "general", id: "send-key", name: t("settings.rows.sendKey.name"), sub: t("settings.rows.sendKey.sub", { key: p.sendKey === "mod" ? "Enter" : "Shift+Enter" }), keys: t("settings.rows.sendKey.keys"),
         ctl: html`<${Seg} label=${t("settings.rows.sendKey.name")} value=${p.sendKey} onChange=${(v) => { setPrefs({ sendKey: v }); saved(); }} options=${[["enter", "Enter"], ["mod", MOD_ENTER]]} />` },
       canNotify && { tab: "general", id: "notify", name: t("settings.rows.notify.name"), sub: t("settings.rows.notify.sub"), keys: t("settings.rows.notify.keys"),

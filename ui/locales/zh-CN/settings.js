@@ -109,6 +109,11 @@ export default {
       sub: "界面、托盘菜单和机器人发出的系统消息都用这种语言",
       keys: "语言 中文 英文 English language",
     },
+    selfEvo: {
+      name: "自我迭代与代码自治",
+      sub: "开启后，机器人自动绑定自身源码或热覆盖层目录 (./)，可按指令自主修改界面、新增插件与沉淀技能",
+      keys: "自我迭代 代码 自治 热更新 插件 技能 self evolution",
+    },
     sendKey: {
       name: "发送消息",
       sub: "{key} 换行；输入法选字时的回车不会发送",

@@ -109,6 +109,11 @@ export default {
       sub: "Used for the interface, the tray menu and system messages from your bots",
       keys: "language english chinese 中文", // i18n-ignore
     },
+    selfEvo: {
+      name: "Self-evolution & code autonomy",
+      sub: "Automatically binds the relative repository or hot-overlay directory (./) so bots can evolve UI, plugins, and skills",
+      keys: "self evolution code autonomy hot overlay plugin skill",
+    },
     sendKey: {
       name: "Send with",
       sub: "{key} adds a new line. Enter won't send while you're typing with an input method",
