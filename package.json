@@ -1,9 +1,9 @@
 {
   "name": "anymodel-bot",
-  "productName": "anymodel bot",
+  "productName": "Sugent",
   "version": "0.1.15",
   "private": true,
-  "description": "anymodel bot：任意模型的个人 AI 助手（飞书 + 微信 iLink），内置 magpie 模型网关",
+  "description": "Sugent：面向一人公司与个人数字主权的全能自治智能体工作台",
   "license": "MIT",
   "type": "module",
   "main": "dist/electron/main.js",
@@ -22,10 +22,12 @@
     "test": "vitest run",
     "docs:check": "node scripts/check-readme.mjs",
     "electron:dev": "npm run build && electron .",
-    "dist": "npm run build && node scripts/prepare-dsh.mjs && node scripts/bundle-dsh.mjs && node scripts/build-magpie.mjs --target current && node scripts/fetch-cua-driver.mjs --target current && electron-builder",
+    "dist": "CSC_IDENTITY_AUTO_DISCOVERY=false npm run build && node scripts/prepare-dsh.mjs && node scripts/bundle-dsh.mjs && node scripts/build-magpie.mjs --target current && node scripts/fetch-cua-driver.mjs --target current && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac dmg --arm64",
     "electron:smoke": "npm run build && node scripts/electron-smoke.mjs",
     "dist:linux": "npm run build && node scripts/prepare-dsh.mjs --os linux --cpu x64 && node scripts/bundle-dsh.mjs --os linux --cpu x64 && node scripts/build-magpie.mjs --target linux/amd64,linux/arm64 && node scripts/fetch-cua-driver.mjs --target linux/x64,linux/arm64 && electron-builder --linux",
-    "dist:mac": "npm run build && node scripts/build-magpie.mjs --target darwin/amd64,darwin/arm64 && node scripts/fetch-cua-driver.mjs --target darwin/x64,darwin/arm64 && node scripts/prepare-dsh.mjs --os darwin --cpu arm64 && node scripts/bundle-dsh.mjs --os darwin --cpu arm64 && electron-builder --mac dmg zip --arm64 && node scripts/prepare-dsh.mjs --os darwin --cpu x64 && node scripts/bundle-dsh.mjs --os darwin --cpu x64 && electron-builder --mac dmg zip --x64",
+    "dist:mac": "npm run build && node scripts/build-magpie.mjs --target darwin/arm64 && node scripts/fetch-cua-driver.mjs --target darwin/arm64 && node scripts/prepare-dsh.mjs --os darwin --cpu arm64 && node scripts/bundle-dsh.mjs --os darwin --cpu arm64 && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac dmg --arm64",
+    "dist:mac:signed": "npm run build && node scripts/build-magpie.mjs --target darwin/arm64 && node scripts/fetch-cua-driver.mjs --target darwin/arm64 && node scripts/prepare-dsh.mjs --os darwin --cpu arm64 && node scripts/bundle-dsh.mjs --os darwin --cpu arm64 && electron-builder --mac dmg --arm64",
+    "dist:mac:all": "npm run build && node scripts/build-magpie.mjs --target darwin/amd64,darwin/arm64 && node scripts/fetch-cua-driver.mjs --target darwin/x64,darwin/arm64 && node scripts/prepare-dsh.mjs --os darwin --cpu arm64 && node scripts/bundle-dsh.mjs --os darwin --cpu arm64 && electron-builder --mac dmg zip --arm64 && node scripts/prepare-dsh.mjs --os darwin --cpu x64 && node scripts/bundle-dsh.mjs --os darwin --cpu x64 && electron-builder --mac dmg zip --x64",
     "dist:win": "npm run build && node scripts/build-magpie.mjs --target windows/amd64,windows/arm64 && node scripts/fetch-cua-driver.mjs --target win32/x64,win32/arm64 && node scripts/prepare-dsh.mjs --os win32 --cpu x64 && node scripts/bundle-dsh.mjs --os win32 --cpu x64 && electron-builder --win nsis --x64 && node scripts/prepare-dsh.mjs --os win32 --cpu arm64 && node scripts/bundle-dsh.mjs --os win32 --cpu arm64 && electron-builder --win nsis --arm64",
     "prepare:dsh": "node scripts/prepare-dsh.mjs",
     "bundle:dsh": "node scripts/bundle-dsh.mjs",
@@ -59,13 +61,13 @@
     "vitest": "^5.0.5"
   },
   "author": {
-    "name": "anymodel bot",
+    "name": "Sugent",
     "email": "support@anymodel.bot"
   },
   "build": {
-    "appId": "dev.anymodel.bot",
-    "productName": "anymodel bot",
-    "artifactName": "anymodel-bot-${version}-${os}-${arch}.${ext}",
+    "appId": "ai.sugent.app",
+    "productName": "Sugent",
+    "artifactName": "Sugent-${version}-${os}-${arch}.${ext}",
     "directories": {
       "output": "release",
       "buildResources": "assets"
