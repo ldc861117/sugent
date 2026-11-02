@@ -1,0 +1,12 @@
+[submodule "vendor/magpie"]
+	path = vendor/magpie
+	url = https://github.com/yetone/magpie
+	shallow = true
+[submodule "vendor/deepseek-harness"]
+	path = vendor/deepseek-harness
+	url = https://github.com/deepseek-ai/deepseek-harness
+	shallow = true
+[submodule "vendor/kimi-computer-use"]
+	path = vendor/kimi-computer-use
+	url = https://github.com/songkeys/kimi-computer-use
+	shallow = true

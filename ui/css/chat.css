@@ -1,0 +1,403 @@
+/* 对话页。布局与顶栏参考 Grok Bot，对话流与输入框参考 Codex：
+   顶栏 52（头像 + 名称 | 新对话 · 信息面板），760 阅读列；用户消息是浅灰气泡，机器人回复是整列正文；
+   底部是两行输入框（文字区 + 工具栏：更多 | 模型 · 发送）。
+   顶栏和输入框都是盖在对话流上的毛玻璃：消息从它们底下滚过，透出来是模糊的。 */
+@layer app {
+/* 对话列和输入框同宽、同一个居中列（两侧至少 --page-gutter）。输入框浮在主区底部，
+   对话列的下边距和"回到底部"的位置都从它的高度算出来，改输入框的内边距时这里跟着变。 */
+.chat, .composer {
+  --composer-line: calc(22px * var(--fs-scale));   /* 输入框的行高：跟着设置 › 外观 › 字体大小变 */
+  --composer-pad: var(--space-2); /* 工具栏离输入框的左、右、下边：加号和发送钮都贴着这条线 */
+  /* 一行字时输入框的高度：文字区（上 14 + 行高 + 下 4）+ 工具栏（上 6 + 发送钮 + 下 --composer-pad） */
+  --composer-h: calc(var(--space-3-5) + var(--composer-line) + var(--space-1) + var(--space-1-5) + var(--ctl-lg) + var(--composer-pad));
+}
+.chat {
+  --col: min(var(--col-w), calc(100% - 2 * var(--page-gutter)));
+  --dock-pb: var(--space-4);      /* 输入框离主区下沿 */
+  position: relative; flex: 1; min-height: 0; display: flex; flex-direction: column;
+}
+
+/* —— 顶栏：对话页里浮在滚动内容上；内容滚到它底下时（.scrolled）才出现细线和投影 —— */
+.chat-head {
+  flex: none; display: flex; align-items: center; gap: var(--bar-gap); height: var(--head-h); padding: 0 var(--head-px);
+  -webkit-app-region: drag;
+}
+.chat > .chat-head {
+  position: absolute; z-index: var(--z-float); top: 0; left: 0; right: 0;
+  background: var(--grain), var(--glass-chrome); backdrop-filter: var(--glass-filter);
+  box-shadow: 0 .5px 0 transparent;
+  transition: box-shadow var(--t-base);
+}
+.chat.scrolled > .chat-head { box-shadow: 0 .5px 0 var(--glass-edge), var(--shadow-xs); }
+.chat-head > * { -webkit-app-region: no-drag; }
+.chat-head .grow { -webkit-app-region: drag; align-self: stretch; }
+.chat-head .icon-btn { --ib-size: var(--ctl-md); }   /* 16 的图标四周各 6：最右的图标外沿落在 --head-px + 6 = 16，和左边的头像对称 */
+.head-bot {
+  display: inline-flex; align-items: center; gap: var(--space-2); min-width: 0; height: var(--ctl-lg); padding: 0 var(--space-2-5) 0 var(--space-1-5);
+  border-radius: var(--r-md); font-size: var(--fs-lg); font-weight: var(--fw-semibold); color: var(--fg);
+  transition: background var(--t-fast);
+}
+button.head-bot:hover { background: var(--pill); }
+button.head-bot[aria-pressed="true"] { background: var(--pill-hover); }
+button.head-bot:active { background: var(--pill-press); }
+.head-bot .name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* —— 对话流 ——
+   滚动条总是占着右边那一条（scrollbar-gutter），输入框的底座也留同样一条：对话列和输入框按同一个宽度居中，左右边对齐 */
+.chat-scroll {
+  flex: 1; min-height: 0; overflow-y: auto; overflow-anchor: none; scroll-padding-top: var(--head-h); scrollbar-gutter: stable;
+  /* 输入框下面那一窄条：内容淡出，露出主区本身 */
+  mask-image: linear-gradient(to top, transparent, var(--black) var(--space-4));
+}
+/* 下边距 = 输入框占的高度 + 48，最后一条消息滚到底时停在输入框上方 */
+.chat-col {
+  width: var(--col); margin: 0 auto;
+  padding: calc(var(--head-h) + var(--space-6)) 0 calc(var(--dock-pb) + var(--composer-h) + var(--space-12)); display: flex; flex-direction: column;
+}
+.chat-skel { display: grid; gap: var(--space-3-5); margin-top: var(--space-6); }
+.chat-skel .skel { height: 34px; border-radius: var(--r-bubble); }
+.chat-skel .skel:nth-child(2) { justify-self: end; }
+.chat-col > .notice { margin-top: var(--space-2); }
+/* 历史读到之后整列淡入一次（不是一行行弹出来）；之后的新消息各自有入场 */
+.chat-col.ready { animation: fade-in var(--dur-base) var(--ease-out); }
+
+.msg-row { position: relative; display: flex; flex-direction: column; margin-top: var(--space-4); }
+.msg-row.cont { margin-top: var(--space-1); }
+.msg-row.user { align-items: flex-end; }
+.msg-row.assistant { align-items: stretch; }
+.msg { font-size: var(--fs-xl); word-break: break-word; overflow-wrap: anywhere; cursor: text; }
+.msg-row.user .msg {
+  max-width: min(var(--bubble-w), 80%); padding: var(--space-2-5) var(--space-4); border-radius: var(--r-bubble);
+  background: var(--bubble-user); color: var(--fg); line-height: var(--lh-relaxed); white-space: pre-wrap;
+}
+.msg-row.assistant .msg { color: var(--fg); line-height: var(--lh-prose); }
+.msg-row.pending .msg { opacity: .85; }
+
+/* —— 对话流的动效：一句话"发出 → 思考 → 输出 → 收尾"，每一步只动一样东西，幅度小、不循环抢眼 ——
+   发出：气泡从输入框的方向浮上来。透明度先到位（base），位移和一点点缩放用弹性曲线慢一拍收尾（slow），
+   缩放的原点在右下角，像是从发送钮那边送出去的 */
+.msg-row.user.enter {
+  --pop-dy: 12px; --pop-scale: .96; transform-origin: 100% 100%;
+  animation: fade-in var(--dur-base) var(--ease-out), pop-in var(--dur-slow) var(--ease-spring);
+}
+/* 流里新插进来的提问 / 审批卡、文件、出错提示：轻轻浮起 */
+.msg-row.assistant.enter { --rise: 6px; animation: rise-in var(--dur-moderate) var(--ease-out); }
+/* 思考：工作状态行比你的气泡晚一拍（--stagger）淡入，先看到"发出去了"，再看到"在想" */
+.msg-row.live > .work { animation: fade-in var(--dur-moderate) var(--ease-out) var(--stagger) backwards; }
+/* 输出：新出现的段落、列表项淡入，已经在的不重播；只在输出中，回复结束后不再有动画 */
+.msg-row.live .md > *, .msg-row.live .md > :is(ul, ol) > li + li { animation: fade-in var(--dur-moderate) var(--ease-out); }
+/* 输出中：最后一段文字末尾一个慢慢呼吸的小点，视线不用离开正在读的地方就知道"还在写"（代码块、表格结尾不画） */
+.msg-row.live .md > :is(p, h1, h2, h3, h4):last-child::after,
+.msg-row.live .md > :is(ul, ol):last-child > li:last-child:not(:has(> :is(ul, ol)))::after,
+.msg-row.live .md > blockquote:last-child > :last-child::after {
+  content: ""; display: inline-block; width: .45em; height: .45em; margin-left: .35em; vertical-align: .08em;
+  border-radius: 50%; background: var(--muted);
+  animation: breathe var(--dur-pulse) var(--ease-in-out) infinite;
+}
+
+/* 回复上方的工作状态：进行中带微光，结束后变成一条细线上的"用时"（细线淡入）。
+   外面包一层可以收起的轨道 .work（grid 1fr → 0fr）：很快答完、不显示"用时"的回复，这一行平滑收起，
+   正文不会一下跳上去。这是对话流里唯一的布局动画，只播一次 */
+.work { display: grid; grid-template-rows: 1fr; transition: grid-template-rows var(--t-moderate), opacity var(--t-base); }
+.work.gone { grid-template-rows: 0fr; opacity: 0; }
+.work-in { min-height: 0; overflow: hidden; }
+.work-line {
+  display: flex; align-items: center; gap: var(--space-1-5); padding-bottom: var(--space-2); margin-bottom: var(--space-3);
+  font-size: var(--fs-md); color: var(--muted); border-bottom: 1px solid var(--line-2);
+  transition: border-color var(--t-moderate);
+}
+.work-line.live { border-bottom-color: transparent; }
+.msg-row.assistant .work-line:last-child { margin-bottom: 0; }
+
+/* 处理过程（代理回合）：工作状态行可以展开，默认折叠；展开后是一块 --well，步骤之间一条 --line-2。
+   每步一行：状态点 + 类别图标 + 名称 + 等宽摘要 + 用时；有参数或输出的步骤再点开看全文 */
+.work-line.toggle { width: 100%; text-align: left; transition: color var(--t-fast); }
+.work-line.toggle:hover { color: var(--fg); }
+.work-line .chev, .act-head .chev { flex: none; transition: transform var(--t-fast); }
+[aria-expanded="true"] > .chev { transform: rotate(90deg); }
+.activity { display: grid; grid-template-columns: minmax(0, 1fr); }
+.activity.open > .work-line { border-bottom-color: transparent; margin-bottom: var(--space-2); }
+.msg-row.assistant .activity + .notice { margin-top: var(--space-1); }
+/* 一块 --well 里不画行间分隔线：步骤是内缩的行，悬停才浮出底色（与菜单项同一写法：列表离边 --space-1，项再缩 --space-2）；
+   展开只是折叠打开：参数和输出直接排在这一行下面，不再套底色或内边距 */
+.act-list { --act-r: calc(var(--r-well) - var(--space-1)); list-style: none; margin: 0 0 var(--space-3); padding: var(--space-1); background: var(--well); border-radius: var(--r-well); font-size: var(--fs-sm); display: grid; grid-template-columns: minmax(0, 1fr); gap: 1px; }
+.act-list.empty { padding: var(--space-2-5) var(--space-3); }
+.act-step { min-width: 0; border-radius: var(--act-r); }
+.act-head {
+  display: flex; align-items: center; gap: var(--space-2); width: 100%; min-height: var(--ctl-md);
+  padding: var(--space-1) var(--space-2); color: var(--fg-2); text-align: left; border-radius: var(--act-r);
+}
+button.act-head { --focus-offset: -2px; transition: background var(--t-fast); }
+button.act-head:hover { background: var(--pill); }
+button.act-head:active { background: var(--pill-hover); }
+.act-head .k { flex: none; color: var(--muted); }
+.act-head .t { flex: none; max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fg); font-weight: var(--fw-medium); }
+.act-head .s { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--code); font-size: var(--fs-xs); color: var(--muted); }
+.act-head .d { flex: none; font-size: var(--fs-xs); color: var(--muted); }
+.act-body { display: grid; gap: var(--space-1); padding: 0 var(--space-2) var(--space-1-5); }
+.act-body .t-label { margin-top: var(--space-1); }
+.act-body pre {
+  margin: 0; max-height: 240px; overflow: auto; font: var(--fs-xs)/var(--lh-relaxed) var(--code);
+  color: var(--fg); white-space: pre-wrap; overflow-wrap: anywhere;
+}
+
+.msg-row.assistant > .work-line:last-child, .msg-row.assistant > .work:last-child .work-line { margin-bottom: 0; }
+/* "思考中 → 正在回复 → 用时"换阶段时文字淡入（换的是 key，秒数跳动不重播） */
+.work-line > .wl { animation: fade-in var(--dur-base) var(--ease-out); }
+/* 文字微光：底色是 --muted，一道 --fg-2 的光慢慢扫过去再停一拍；对比只差一档，余光里知道"在动"就够了 */
+.shimmer {
+  color: transparent;
+  background: linear-gradient(90deg, var(--muted) 35%, var(--fg-2) 50%, var(--muted) 65%) 0 0 / 300% 100%;
+  -webkit-background-clip: text; background-clip: text;
+  animation: sheen var(--dur-sheen) var(--ease-in-out) infinite;
+}
+.work-line > .wl.shimmer { animation: fade-in var(--dur-base) var(--ease-out), sheen var(--dur-sheen) var(--ease-in-out) infinite; }
+
+/* 消息下方的操作：悬停出现；最后一条回复常显 */
+.msg-actions {
+  display: flex; align-items: center; gap: var(--bar-gap); height: var(--ctl-sm); margin-top: var(--space-0-5);
+  color: var(--muted); opacity: 0; transition: opacity var(--t-fast);
+}
+.msg-row.user .msg-actions { flex-direction: row-reverse; }
+.msg-row:hover .msg-actions, .msg-row.last .msg-actions, .msg-actions:focus-within { opacity: 1; }
+/* 收尾：回复写完，复制和时刻晚一拍淡入（输出中不出现，免得在正文下面闪） */
+.msg-row.assistant.last .msg-actions { animation: fade-in var(--dur-moderate) var(--ease-out) var(--stagger) backwards; }
+.msg-actions .when { font-size: var(--fs-xs); }
+.msg-actions .icon-btn { --ib-size: var(--ctl-sm); }
+
+.caret { display: inline-block; width: 7px; height: 15px; margin-left: var(--space-0-5); vertical-align: -2px; border-radius: 1px; background: var(--accent); animation: blink var(--dur-blink) steps(2) infinite; }
+.typing { display: inline-flex; gap: var(--space-1); padding: var(--space-2) var(--space-0-5); }
+.typing i { width: 6px; height: 6px; border-radius: 50%; background: var(--muted); animation: breathe var(--dur-shimmer) var(--ease-in-out) infinite; }
+.typing i:nth-child(2) { animation-delay: var(--stagger); }
+.typing i:nth-child(3) { animation-delay: calc(var(--stagger) * 2); }
+
+.time-sep { align-self: center; margin: var(--space-8) 0 0; font-size: var(--fs-xs); color: var(--muted); }
+.time-sep + .msg-row { margin-top: var(--space-4); }
+
+/* markdown：回复是正文，标题和段落有呼吸感 */
+.md > :first-child { margin-top: 0; }
+.md > :last-child { margin-bottom: 0; }
+.md p, .md ul, .md ol, .md blockquote, .md pre, .md table, .md hr { margin: 0 0 var(--space-3); }
+.md h1, .md h2, .md h3, .md h4 { margin: var(--space-5) 0 var(--space-2); font-size: var(--fs-xl); font-weight: var(--fw-semibold); line-height: var(--lh-normal); }
+.md h1 { font-size: var(--fs-2xl); letter-spacing: var(--tracking-tight); line-height: var(--lh-tight); }
+.md h4 { font-size: var(--fs-lg); }
+.md ul, .md ol { padding-left: var(--space-6); }
+.md li + li { margin-top: var(--space-1); }
+.md blockquote { padding-left: var(--space-3); border-left: 3px solid var(--line); color: var(--fg-2); }   /* 描边：引文的排版记号（灰色、不圈住内容），不是提示框的色条 */
+.md hr { border: 0; border-top: 1px solid var(--line); }
+.md code { font-size: .86em; padding: .12em .36em; border-radius: var(--r-xs); background: var(--code-bg); }   /* 跟着所在文字缩放：正文、标题、表格里一样合身 */
+.md a { text-decoration: underline; text-underline-offset: 2px; }
+.md .table-wrap { overflow-x: auto; margin: 0 0 var(--space-3); }
+.md table { border-collapse: collapse; font-size: var(--fs-md); line-height: var(--lh-normal); margin: 0; }
+/* 表格不画格子：表头下一条 --line，行与行之间一条 --line-2，没有外框、竖线和表头底色；列靠右边距分开，第一列贴着正文左边 */
+.md th, .md td { padding: var(--space-1-5) var(--space-5) var(--space-1-5) 0; text-align: left; vertical-align: top; }
+.md :is(th, td):last-child { padding-right: 0; }
+.md th { font-weight: var(--fw-semibold); border-bottom: 1px solid var(--line); }
+.md tr + tr > td { border-top: 1px solid var(--line-2); }
+/* 代码块：一块 --well，不描边 */
+.codeblock { margin: 0 0 var(--space-3); border-radius: var(--r-well); background: var(--well); overflow: hidden; }
+/* 语言名和代码左对齐；复制钮离右边和上边一样远（30 高的条里放 22 的按钮） */
+.codeblock .bar {
+  display: flex; align-items: center; height: 30px; padding: 0 var(--space-1) 0 var(--space-3);
+  font-family: var(--code); font-size: var(--fs-2xs); color: var(--muted);
+}
+.codeblock .bar .lang { flex: 1; }
+.codeblock .bar .icon-btn { --ib-size: var(--ctl-xs); }
+.codeblock pre { margin: 0; padding: 0 var(--space-3) var(--space-3); overflow-x: auto; font: var(--fs-sm)/var(--lh-relaxed) var(--code); color: var(--fg); white-space: var(--code-wrap); overflow-wrap: anywhere; }
+.codeblock pre code { font-size: inherit; padding: 0; background: none; }
+
+/* 流里的一组：提问 / 审批 / 文件。一块 --well，不描边、不加投影；里面不再套框——
+   命令是一行等宽字，选项是可悬停的行，只有输入框留着自己的边 */
+.card {
+  width: min(var(--bubble-w), 100%); background: var(--well); border-radius: var(--r-well);
+  padding: var(--card-pad); display: grid; gap: var(--space-2-5);
+}
+.card .q { font-size: var(--fs-xl); font-weight: var(--fw-semibold); color: var(--fg); line-height: var(--lh-snug); }
+.card .q-detail { font-size: var(--fs-md); color: var(--fg-2); line-height: var(--lh-normal); white-space: pre-wrap; }
+.card .q-block { display: grid; gap: var(--space-2); }
+.card .opts { display: grid; gap: var(--space-0-5); margin: 0 calc(-1 * var(--space-2)); }
+.card .opt {
+  --focus-offset: 0px;
+  display: flex; align-items: center; gap: var(--space-2-5); min-height: 40px; padding: var(--space-1) var(--space-2); border-radius: var(--r-lg);
+  text-align: left; font-size: var(--fs-lg); line-height: var(--lh-snug); color: var(--fg); transition: background var(--t-fast);
+}
+.card .opt:hover:not(:disabled) { background: var(--pill); }
+.card .opt:active:not(:disabled) { background: var(--pill-hover); }
+/* 选项字母平时只是一列字；选中后才填成一块（这是状态，不是容器） */
+.card .opt .letter {
+  width: var(--ctl-xs); height: var(--ctl-xs); border-radius: var(--r-sm); flex: none; display: grid; place-items: center;
+  color: var(--muted); font-size: var(--fs-xs); font-weight: var(--fw-semibold); font-variant-numeric: tabular-nums;
+  transition: background var(--t-fast), color var(--t-fast);
+}
+.card .opt:hover:not(:disabled) .letter { color: var(--fg); }
+.card .opt .desc { display: block; margin-top: var(--space-0-5); font-size: var(--fs-sm); color: var(--muted); }
+.card .opt.picked .letter, .card .opt.picked:hover .letter { background: var(--fg); color: var(--surface-solid); }
+.card.done .q { color: var(--muted); }
+.card.done .opt { color: var(--placeholder); }
+.card .meta { display: flex; align-items: center; gap: var(--space-2); font-size: var(--fs-sm); color: var(--muted); }
+.card .actions { display: flex; gap: var(--ctl-gap); flex-wrap: wrap; }
+.card .cmd {
+  font: var(--fs-sm)/var(--lh-normal) var(--code);
+  white-space: pre-wrap; word-break: break-all; color: var(--fg-2); max-height: 160px; overflow: auto;
+}
+.card .answer { display: flex; gap: var(--ctl-gap); }
+/* 交付的文件（components/files.js）：按交付的顺序挂在回复的文字下面，放得下就排在一行。
+   文件卡片是一块 --well，整块可点（打开），悬停深一级；桌面版右边一个「在文件夹中显示」。找不到的文件不能点 */
+.msg-files { display: flex; flex-wrap: wrap; align-items: flex-start; gap: var(--space-2); }
+.msg-row .msg + .msg-files { margin-top: var(--space-3); }
+.msg-row :is(.msg, .msg-files) + .notice { margin-top: var(--space-3); }
+/* 回合中交付的：轻轻浮起（已经在的不重播） */
+.msg-row.live .msg-files > * { --rise: 6px; animation: rise-in var(--dur-moderate) var(--ease-out); }
+.file-card {
+  display: flex; align-items: center; gap: var(--space-3); width: min(360px, 100%); padding: var(--space-2-5) var(--space-3-5) var(--space-2-5) var(--space-2-5);
+  background: var(--well); border-radius: var(--r-well); color: var(--fg); text-align: left; transition: background var(--t-fast);
+}
+a.file-card:hover { text-decoration: none; }
+a.file-card:hover, .file-card:has(> .file-open:hover) { background: var(--well-hover); }
+a.file-card:active, .file-card:has(> .file-open:active) { background: var(--well-press); }
+.file-card:has(> .file-open) { padding-right: var(--space-2); }
+.file-open { display: flex; align-items: center; gap: var(--space-3); flex: 1; min-width: 0; text-align: left; border-radius: var(--r-sm); }
+.file-card .fic { flex: none; --ic-size: var(--ic-xl); margin: var(--space-2); color: var(--fg-2); }   /* 24px 图标 + 四周 8 = 40 见方，和两行文字等高 */
+.file-card .grow { display: grid; min-width: 0; }
+.file-card .fname { font-size: var(--fs-lg); font-weight: var(--fw-medium); color: var(--fg); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.file-card .fsub { margin-top: var(--space-0-5); font-size: var(--fs-xs); color: var(--muted); }
+.file-card.off .fname { color: var(--muted); }
+/* 图片直接显示：缩略图保持比例，限宽限高（读出来之前先占一小块 --well）；点开看大图 */
+.msg-img { display: block; max-width: 100%; overflow: hidden; border-radius: var(--r-well); background: var(--well); cursor: zoom-in; transition: transform var(--t-fast); }
+.msg-img:active { transform: scale(var(--press)); }
+.msg-img img { display: block; width: auto; height: auto; min-width: 48px; min-height: 48px; max-width: min(320px, 100%); max-height: 240px; }
+.msg-row .notice { max-width: min(var(--bubble-w), 100%); }
+
+.chat-empty { margin: auto; padding-top: 16vh; display: grid; justify-items: center; gap: var(--space-2-5); text-align: center; color: var(--muted); }
+/* 头像和标题之间多留一点：大头像会呼吸、会动，贴太近显得挤 */
+.chat-empty h2 { margin-top: var(--space-2); font-size: var(--fs-2xl); font-weight: var(--fw-semibold); letter-spacing: var(--tracking-tight); line-height: var(--lh-tight); color: var(--fg); }
+.chat-empty > p { max-width: 440px; margin: 0; font-size: var(--fs-md); line-height: var(--lh-normal); }
+.chips { display: flex; gap: var(--space-2); flex-wrap: wrap; justify-content: center; margin-top: var(--space-2-5); }
+/* 建议：和次级按钮一样是一层静默填充，不描边、不浮起 */
+.chip {
+  height: var(--ctl-md); padding: 0 var(--space-3-5); border-radius: var(--r-full); background: var(--pill);
+  font-size: var(--fs-sm); color: var(--fg-2); transition: background var(--t-fast), color var(--t-fast), transform var(--t-fast);
+}
+.chip:hover { background: var(--pill-hover); color: var(--fg); }
+.chip:active { background: var(--pill-press); transform: scale(var(--press)); }
+
+/* —— 回到底部：玻璃小圆钮 —— */
+.to-bottom {
+  position: absolute; z-index: var(--z-float); left: 50%; bottom: calc(var(--dock-pb) + var(--composer-h) + var(--space-6)); translate: -50% 0;
+  width: var(--ctl-lg); height: var(--ctl-lg); border-radius: 50%; display: grid; place-items: center;
+  background: var(--grain), var(--glass-float); backdrop-filter: var(--glass-filter-sm); color: var(--fg-2); box-shadow: var(--shadow-float);
+  --rise: 6px; animation: rise-in var(--dur-base) var(--ease-out);
+  transition: color var(--t-fast), scale var(--t-fast);
+}
+.to-bottom.leaving { animation: sink-out var(--dur-base) var(--ease-in) forwards; pointer-events: none; }
+.to-bottom:hover { color: var(--fg); }
+.to-bottom:active { scale: var(--press-strong); }
+.to-bottom .new { position: absolute; top: 0; right: 0; width: 8px; height: 8px; border-radius: 50%; background: var(--accent-solid); box-shadow: 0 0 0 2px var(--surface-solid), 0 0 0 2.5px var(--accent-line); }   /* 描边：圆点外的缺口和墨色细边，黄绿点才压得住白底 */
+.to-bottom .new { --scale-from: 0; animation: scale-in var(--dur-slow) var(--ease-back); }
+
+/* —— 输入框：文字区 + 工具栏两行，一块浮在对话流上的玻璃（和菜单、提示同一种材质：细边 + 投影，不额外描边）。
+   认得出它靠的是：浮起的投影、常显的占位文字（3:1）、工具栏和发送钮，以及固定在底部的位置。
+   状态：输入时浮得更高（投影更大）；拖入文件时 accent 描边 + 光晕 + 一层黄绿 —— */
+/* 底座是透明的、不接收指针；上边留得够高，输入框聚焦时的投影不会被 overflow 裁掉 */
+.composer-dock {
+  position: absolute; z-index: var(--z-float); left: 0; right: 0; bottom: 0; padding: var(--space-12) 0 var(--dock-pb); pointer-events: none;
+  overflow: hidden; scrollbar-gutter: stable;
+}
+.composer {
+  --composer-edge: var(--glass-edge);
+  --composer-edge-w: .5px;
+  --composer-shadow: var(--shadow-md);
+  --composer-tint: transparent;
+  pointer-events: auto; position: relative;
+  width: var(--col, auto); margin: 0 auto;
+  display: flex; flex-direction: column;
+  background: var(--grain), linear-gradient(var(--composer-tint), var(--composer-tint)), var(--glass-float);
+  backdrop-filter: var(--glass-filter); border-radius: var(--r-3xl);
+  box-shadow: inset 0 1px 0 var(--glass-hi), 0 0 0 var(--composer-edge-w) var(--composer-edge), var(--composer-shadow);   /* 描边：浮层玻璃的细边；拖入文件时换成 accent */
+  transition: box-shadow var(--t-moderate);   /* 聚焦时浮高一点：投影慢慢长出来，不是一下变大 */
+}
+.composer:focus-within { --composer-shadow: var(--shadow-lg); }
+.composer.drag { --composer-edge: var(--accent); --composer-edge-w: 1.5px; --composer-shadow: var(--ring), var(--shadow-md); --composer-tint: var(--accent-wash); }
+.composer textarea {
+  display: block; width: 100%; min-width: 0; border: 0; outline: none; background: transparent; resize: none;
+  font-size: var(--fs-xl); line-height: var(--composer-line); padding: var(--space-3-5) var(--space-4) var(--space-1);
+  max-height: calc(var(--composer-line) * 8 + var(--space-3-5) + var(--space-1)); overflow-y: auto; color: var(--fg);
+}
+.composer textarea::placeholder { color: var(--placeholder); }
+.composer textarea:focus-visible { outline: none; }
+.composer-bar { display: flex; align-items: center; gap: var(--bar-gap); padding: var(--space-1-5) var(--composer-pad) var(--composer-pad); }
+.composer-bar .grow { flex: 1; }
+/* 加号钮和发送钮一样是 32 的圆：加号落在 --composer-pad + 8 = 16，和上面文字的起点对齐；模型胶囊矮一档（28），不和两端的圆钮抢 */
+.composer :is(.plus, .model-chip) {
+  flex: none; height: var(--ctl-md); display: inline-flex; align-items: center; justify-content: center; color: var(--ctl-fg);
+  transition: background var(--t-fast), color var(--t-fast), transform var(--t-fast);
+}
+.composer :is(.plus, .model-chip):hover { background: var(--pill); color: var(--fg); }
+.composer :is(.plus, .model-chip)[aria-expanded="true"] { background: var(--pill-hover); color: var(--fg); }
+.composer :is(.plus, .model-chip):active { background: var(--pill-press); transform: scale(var(--press)); }
+.composer .plus { width: var(--ctl-lg); height: var(--ctl-lg); border-radius: 50%; }
+.composer .plus .ic { transition: transform var(--t-moderate); }
+.composer .plus[aria-expanded="true"] .ic { transform: rotate(45deg); }
+.composer .model-chip { max-width: 240px; padding: 0 var(--space-2) 0 var(--space-2-5); border-radius: var(--r-full); gap: var(--space-1); font-size: var(--fs-sm); }
+.composer .model-chip .v { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.composer .model-chip .ic { --ic-size: var(--ic-xs); transition: transform var(--t-base); }
+.composer .model-chip[aria-expanded="true"] .ic:last-child { transform: rotate(180deg); }
+.composer .model-chip .ic.lead { --ic-size: var(--ic-sm); }
+.composer .model-chip.perm { max-width: 160px; }
+/* 完全权限：胶囊常驻一层淡红，图标用 --red；字仍是 --fg（淡红底上的红字对比度不够）。悬停 / 打开 / 按下在淡红上再叠一层 */
+.composer .model-chip.perm.full { background: var(--red-wash); color: var(--fg); }
+.composer .model-chip.perm.full .ic.lead { color: var(--red); }
+.composer .model-chip.perm.full:hover { background: linear-gradient(var(--pill), var(--pill)), var(--red-wash); }
+.composer .model-chip.perm.full[aria-expanded="true"] { background: linear-gradient(var(--pill-hover), var(--pill-hover)), var(--red-wash); }
+.composer .model-chip.perm.full:active { background: linear-gradient(var(--pill-press), var(--pill-press)), var(--red-wash); }
+/* 发送：空的时候是中性的灰钮（不用半透明的墨色或黄绿，会发浑），箭头也小一号；能发了才亮起品牌色，
+   箭头带一点回弹放大到位（"可以发了"）；悬停时箭头往上提一点。
+   发出后换成停止方块，方块从小弹到位；回复结束，箭头从下面升回来（.back：发过一次之后才有，打开页面时不动） */
+.send {
+  width: var(--ctl-lg); height: var(--ctl-lg); border-radius: 50%; flex: none; display: grid; place-items: center;
+  background: var(--send-bg); color: var(--send-fg); box-shadow: var(--primary-edge);
+  transition: background var(--t-base), color var(--t-base), box-shadow var(--t-base), transform var(--t-fast);
+}
+.send .ic { transition: transform var(--t-base), scale var(--dur-base) var(--ease-back); }
+.send:disabled .ic { scale: .86; }
+.send.stop .ic { --scale-from: .4; animation: scale-in var(--dur-slow) var(--ease-spring); }
+.send.back .ic { --rise: 4px; animation: rise-in var(--dur-moderate) var(--ease-out); }
+.send:hover:not(:disabled) { background: var(--primary-hover); }
+.send:hover:not(:disabled):not(.stop) .ic { transform: translateY(-1px); }
+.send:active:not(:disabled) { background: var(--primary-press); transform: scale(var(--press-strong)); }
+.send:disabled:not([aria-busy="true"]) { background: var(--pill); color: var(--faint); box-shadow: none; }
+/* 正在停止：保持本色转圈，只是不可点（同 Button 的 loading） */
+.send[aria-busy="true"] { cursor: progress; }
+.send .spinner { width: 12px; height: 12px; }
+.composer-disabled { pointer-events: auto; width: var(--col); margin: 0 auto var(--space-2); }
+
+/* —— 后台任务：请求那条消息的回复下面一个胶囊，一句话「后台任务「GPU 价格调研」进行中 ›」（静默填充，不描边；太长时只截标题）；
+   点开是最新进展、文件夹、每次运行折叠的处理过程（和回复上方的"用时"同一种写法）和停止 —— */
+.task-chip { display: grid; grid-template-columns: minmax(0, 1fr); justify-items: start; margin-top: var(--space-2); }
+.task-pill {
+  display: inline-flex; align-items: center; gap: var(--space-1-5); max-width: 100%; height: var(--ctl-md); padding: 0 var(--space-2-5) 0 var(--space-3);
+  border-radius: var(--r-full); background: var(--pill); font-size: var(--fs-sm); color: var(--fg-2);
+  transition: background var(--t-fast), color var(--t-fast), transform var(--t-fast);
+}
+.task-pill:hover { background: var(--pill-hover); color: var(--fg); }
+.task-pill:active { background: var(--pill-press); transform: scale(var(--press)); }
+.task-pill .l { display: flex; min-width: 0; white-space: nowrap; }
+.task-pill .t { min-width: 0; overflow: hidden; text-overflow: ellipsis; color: var(--fg); font-weight: var(--fw-medium); }
+.task-pill .chev { flex: none; color: var(--muted); transition: transform var(--t-fast); }
+.task-detail { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--space-2); width: 100%; margin-top: var(--space-3); }
+/* 详情里一行一样：小标签 + 值 + 行尾的大小、文字按钮（改预算、打开、保留）；每次运行一行折叠的处理过程，行间不画线 */
+.task-line { display: flex; align-items: baseline; gap: var(--space-2); font-size: var(--fs-sm); color: var(--fg-2); }
+.task-line .t-label { flex: none; min-width: 4em; }
+.task-line .v { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.task-line .v.mono { font-family: var(--code); font-size: var(--fs-xs); }
+.task-line .n { flex: none; font-size: var(--fs-xs); color: var(--muted); }
+.task-line .task-note { display: block; color: var(--muted); }   /* 问题下面那一句：不回复就按中文做 */
+.task-line .text { flex: none; margin: calc(-1 * var(--space-1)) 0; }   /* 文字按钮的悬停底不把行撑高 */
+button.task-origin { text-align: left; font-size: inherit; color: inherit; border-radius: var(--r-sm); transition: color var(--t-fast); }
+button.task-origin:hover { color: var(--fg); }
+.task-budget-edit { display: flex; align-items: center; gap: var(--space-1); flex-wrap: wrap; }
+.task-budget-edit .field { width: 88px; --field-h: var(--ctl-sm); }
+.task-detail .activity, .task-detail .work-line { margin-bottom: 0; }
+.task-detail .work-line { border-bottom: 0; padding-bottom: 0; }
+.task-actions { display: flex; justify-content: flex-start; gap: var(--space-1); }
+}

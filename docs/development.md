@@ -1,0 +1,235 @@
+# 开发文档
+
+简体中文 | [English](./development_en.md)
+
+这份文档给想从源码运行、打包或参与开发的人看。普通用户直接从 [Releases](https://github.com/modelflare-ai/AnyModelBot/releases) 下载安装包即可，见 [README](../README.md#-下载)。
+
+- 一个机器人 = 人设 + 默认模型 + 记忆。账号是全局的（设置 › 连接），所有机器人共用，同一个服务可以加多个。定位：自用、单用户。
+- 模型来自 [Modelflare](https://modelflare.dev/?utm_source=anymodelbot&utm_campaign=amb_readme)：首次启动登录（或注册）Modelflare 账户，模型自动列出；也可以直接粘贴一个 API Key。请求经过内置的 [magpie](https://github.com/yetone/magpie) 网关转发。
+- 三种运行方式，同一套代码：**桌面版（Electron）**、**命令行 `npm start`**、**Docker**。
+
+## 目录结构
+
+```
+src/
+  core/          统一消息类型、会话队列与去重、运行时（/model /reset、流式）、重启后的提醒、准入（主人 + 允许名单）、持久化出站队列
+  agent/         代理模式：DSH 宿主与桥接、审批、权限预设、记忆与上下文管家、生图 / 生视频、联网搜索、电脑操作、Windows PowerShell
+    prompts/     交给代理模型的全部提示词：人设、聊天规则、记忆说明、每段第一条消息、技能说明
+  llm/           OpenAI 兼容客户端（模型接入接口）
+  magpie/        内置 magpie 守护：隔离目录、空闲端口、自动生成密钥、健康检查、崩溃重启、干净退出
+  channels/      feishu/（长连接 + CardKit）  weixin/（iLink，MIT 声明见 LICENSE.openclaw-weixin）  messenger/（Telegram、Slack、Discord，共用一套收发）
+  store/         SQLite（node:sqlite，无需原生编译）
+  account/       Modelflare 账户：PKCE 回环登录、令牌轮换、余额与提醒、机器人预算 Key、模型能力与参考价
+  web/           管理界面服务（JSON API + 流式对话 SSE）
+  cli/           init 首次设置向导、weixin-login
+  modelflare.ts  Modelflare 线路、密钥校验（GET /v1/models）、模型路由与归因
+  guide.ts       上手清单的进度
+  i18n/          服务端多语言：报错、状态文字、托盘菜单、机器人发出的系统消息（messages/<命名空间>.ts）
+  diagnostics.ts 故障排查：探测、日志尾部、脱敏的诊断报告
+  main.ts        命令行入口
+electron/        桌面版主进程（启动器 + 托盘）
+ui/              管理界面（Preact + htm，无构建步骤）
+  design/        设计系统：tokens/、base/、components/、机器人形象 bots/
+  locales/       界面文案：zh-CN/ 与 en/，每个命名空间一个文件
+  css/ lib/ components/ screens/ assets/ main.js
+dsh-runtime/     DSH 代理运行时的依赖清单与 AnyModelBot 插件（plugins/）
+scripts/         setup / build-magpie / fetch-cua-driver / prepare-dsh / bundle-dsh / electron-smoke / check-readme 等
+vendor/          git 子模块：magpie（构建时编译）、deepseek-harness、kimi-computer-use
+site/            官网（Astro 静态站），说明见 site/README.md
+docs/            开发文档、隐私说明、README 素材（docs/assets/）
+```
+
+## 从源码运行（命令行）
+
+需要 Node.js 22.13+、Go 1.26.8+（用于从源码编译 magpie）。
+
+```bash
+npm install
+npm run setup        # 拉取 vendor/magpie 子模块并编译到 build/bin/
+npm run init         # 可选：终端里的首次设置（登录 Modelflare 账户或粘贴 API Key、飞书凭据）
+npm start            # 启动全部：内置网关 + 机器人 + 管理界面 http://127.0.0.1:3600/
+```
+
+数据默认在 `./data`（`AMB_DATA_DIR` 可改）。其余环境变量见 `.env.example`。
+
+## 桌面版（Electron）
+
+```bash
+npm run electron:dev     # 开发运行
+npm run electron:smoke   # 冒烟测试（Linux 无显示器时自动用 xvfb-run）
+npm run dist             # 打包当前平台（magpie 随附在 resources/magpie/）
+npm run dist:linux | dist:mac | dist:win
+npm run test:dsh-bundle  # 用 Electron 跑真实 DSH 集成测试，加载打包后的 build/dsh（需先 prepare:dsh + bundle:dsh）
+```
+
+- DSH 代理运行时：`scripts/prepare-dsh.mjs` 按目标平台安装 `dsh-runtime/`，`scripts/bundle-dsh.mjs` 把它打成 `resources/dsh/dsh.asar`（全部 JS，一个文件）加上 `resources/dsh/node_modules/`（只有原生包，约 55 个文件）。Electron 主进程和 `ELECTRON_RUN_AS_NODE` 子进程直接读 asar，无需首启解压；安装包因此只需解出几百个文件（Windows 上解压与杀毒逐个扫描是安装慢的主因）。开发时仍直接用 `dsh-runtime/`。
+- Windows 上代理执行命令用的 PowerShell：经沙箱时 Windows PowerShell 5.1 每条命令要二三十秒，PowerShell 7 约 1 秒。应用按这个顺序选：系统里能用的 PowerShell 7（后台按 DSH 的方式试运行一次，什么都不下载）→ 应用内置的 PowerShell 7 → Windows PowerShell 5.1。没有能用的 7 且代理模式开着时，应用在后台自动下载官方 PowerShell 7.6.9（LTS）的 zip，装到 `%LOCALAPPDATA%\AnyModelBot\pwsh\`：不需要管理员权限，不写注册表、不改 PATH，不影响你自己的 PowerShell。版本和 x64 / arm64 两个 zip 的 SHA256 写死在 `src/agent/pwsh-private.ts`（升级用 `node scripts/pwsh-hashes.mjs <版本>`），下载后核对哈希、解压后核对微软 Authenticode 签名，再按 DSH 的方式试运行（版本、读写临时文件、拉起外部程序）通过才用；装失败或装了一半的不会被用，下次启动会清掉。装的时候对话页和 设置 → 常规 显示进度，`/status` 也有，装好之前命令照常用 5.1；装好后空闲的代理进程在后台换用它，不用重启应用。运行中代理拉不起它（被杀毒软件删除或隔离、被策略拦截）就自动退回上一种并提示原因；设置 → 故障排查 可以安装、重新安装、改回系统默认。Windows 10 1607 / Server 2016 以前的系统不下载。桌面版下载走系统代理（Chromium 网络栈）；命令行版用 Node 的 fetch（较新的 Node 设 `NODE_USE_ENV_PROXY=1` 后认 `HTTPS_PROXY`）；`AMB_PWSH_MIRROR` 可换成镜像前缀（照样核对哈希和签名），`AMB_PWSH_AUTO_INSTALL=0` 关掉自动安装。
+- 代理执行的命令能联网（沙箱只限制写文件），用的是你的代理：应用环境变量里的 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY`（及小写）和证书、软件源变量（`SSL_CERT_FILE`、`REQUESTS_CA_BUNDLE`、`NODE_EXTRA_CA_CERTS`、`PIP_INDEX_URL`、`npm_config_registry`、`GOPROXY` 等）原样传下去；环境里没设代理时，桌面版每次拉起代理进程都问一次系统代理（系统设置和 PAC），按 `http://主机:端口` 传下去（见 `src/agent/proxy-env.ts`）。本机地址（`127.0.0.1`、`localhost`、`::1`）总是并进 `NO_PROXY`，永不走代理。
+- 数据目录：`<userData>/data`（macOS `~/Library/Application Support/anymodel bot/data`，Windows `%APPDATA%\anymodel bot\data`，Linux `~/.config/anymodel bot/data`）。日志在数据目录的 `logs/app.log`。
+- 单实例；关闭窗口默认隐藏到托盘（设置 → 常规 可改为退出）；托盘菜单：打开 / 在浏览器中打开 / 开机自启（macOS、Windows）/ 打开数据目录 / 退出。
+- macOS 下窗口无标题栏，红绿灯嵌在侧栏顶部；窗口最小宽度 860。
+- 界面只监听 127.0.0.1，且每次启动生成随机访问令牌，其他本机程序无法直接调用管理接口。
+- 退出时先停渠道、再停 magpie；若上次被强杀残留 magpie 进程，下次启动会自动清理（Linux/macOS）。
+
+发布：在 `CHANGELOG.md` 和 `CHANGELOG_en.md` 写好这个版本的更新日志（用户能感受到的变化，不写网站和内部改动。官网英文页不显示提到微信、飞书的行），改 `package.json` 的版本号并提交，推送 `v<版本>` 标签。这个版本没写更新日志时，发布流程开始就会失败；写了就作为 GitHub Release 的说明，官网更新日志页也显示它。`.github/workflows/release.yml` 会在六种系统 / 架构上各自打包，并把安装包和 `SHA256SUMS` 发到 GitHub Release。签名与公证所需的仓库密钥见该文件开头的注释。同一个标签还会触发 `.github/workflows/docker.yml`，把 x64 + arm64 镜像发布到 `ghcr.io/modelflare-ai/anymodel-bot`（`<版本>` 和 `latest` 两个标签）。
+
+## Docker
+
+用户直接用已发布的镜像：`docker run -d --name amb -p 3600:3600 -v amb-data:/data ghcr.io/modelflare-ai/anymodel-bot`。下面是从源码自己构建：
+
+```bash
+git submodule update --init --depth 1 vendor/magpie
+docker build -t anymodel-bot .
+docker run -d --name amb -p 3600:3600 -v amb-data:/data anymodel-bot
+docker exec amb cat /data/ui-token     # 打开 http://<主机>:3600/?token=<令牌>
+```
+
+容器内界面监听 0.0.0.0，因此强制令牌访问。不要把 3600 端口直接暴露到公网。微信扫码在 设置 › 连接 里完成。
+
+## 模型（Modelflare）
+
+- 首次启动只有一个按钮「登录 / 注册 Modelflare」：在系统浏览器里登录（没有账户可当场注册）并点「继续」授权，回到本程序后自动为这台电脑签发一把专用 API Key 并连接 → 选默认模型 → 开始对话。Docker 或远程部署收不到浏览器登录的回调，首次启动页改为填写 API Key（校验 `GET https://modelflare.dev/v1/models`）。
+- 登录方式：OIDC 授权码 + PKCE（RFC 7636），按 RFC 8252 作为原生应用——本程序是公共客户端（`client_id` 为 `anymodel-bot`，没有也不需要客户端密钥），授权结果回调到本机 `127.0.0.1` 的临时端口。在 Modelflare 网页个人资料页的「已授权的应用」里可以随时撤销；撤销后本程序会发现并回到登录页。
+- 账户凭据（refresh token）存在数据目录的 `modelflare-account.json`（权限 600），桌面版用系统钥匙串加密（Electron safeStorage）；界面只拿到账户名称。「退出登录」会撤销这台电脑的授权，Modelflare 同时删除登录时为它和各机器人签发的 Key。
+- 余额：不常驻显示，点侧栏左下角的头像弹出，设置 → Modelflare 里也有，显示账户钱包余额（只用 API Key 时读 `/v1/dashboard/billing/credit_grants`）；「充值」打开 Modelflare 网页，回到窗口时自动刷新。余额低于提醒线（默认 1 美元，可改或关闭）时在应用里提醒一次，也可以设置让机器人发到你的微信 / 飞书。
+- 登录后还能在 设置 → Modelflare 查看按天、按模型的用量，Modelflare 发来的通知，以及复制邀请链接。
+- 机器人预算（需要登录）：机器人设置 → 预算，开启后这个机器人用自己的 Key（内置网关里单独的 provider），最多花设定的美元数；关闭后回到共用的 Key。
+- 生图 / 生视频：代理模式下机器人有 `media_models`（可用模型、默认模型、参数范围、参考价）、`media_docs`（从 docs.modelflare.dev 实时读该模型的请求格式）、`generate_image`、`generate_video` 四个工具，并自带一份 media 技能说明。各模型的参数格式不同，机器人按文档写请求体，工作区里的参考图写成 `workspace:路径` 即可；Key 始终只在本程序里，由本程序带着该机器人用的 Key 调 Modelflare，结果存进机器人工作区的 `media/`，再交付到聊天。
+- 生成前确认：直接生成，不打扰你。机器人选了不是默认的模型、要求没说清，都不问：它按最合理的理解生成，再说一句用了什么。只在预计花费超过 $0.5 时（按参考价、张数、视频时长和分辨率估算；视频估不出来也算）先在聊天里问你这次用哪个模型（附提示词、参数、参考价和为什么问）。可以确认、换成别的模型或取消；微信回复编号或模型名，飞书 / 网页点选。10 分钟内没回答就不生成。想每次都确认：机器人设置 → 生图 / 生视频 → 生成前确认 →「每次都问」。
+- 联网搜索：代理的 `web_search` 不用 DeepSeek 自带的搜索（它要 DeepSeek 的 Key），经 `amb-web-search` 插件交给本程序搜。默认免费、不用设置：依次试 Exa 的公开 MCP、必应、DuckDuckGo，上次成功的先试，出错的（限流、验证页、必应给出不相干的结果）跳过 10 分钟。设置 → 网络与访问 → 联网搜索 可以换成 Tavily、Exa、博查、智谱（填 Key）或自己的 SearXNG，填了就先用它，出错时退回免费的。Key 和渠道令牌一样存在本机数据库里，代理进程拿不到。桌面版搜索走系统代理；命令行版用 Node 的 fetch（设 `NODE_USE_ENV_PROXY=1` 后认 `HTTPS_PROXY`）。
+- 聊天渠道账号（`src/core/routes.ts`）：微信、飞书、Telegram、Slack、Discord 的账号也是全局的，在设置 › 连接里添加，可以起别名。消息交给哪个机器人：这个人用 `/bot` 选过的 → 账号的默认机器人 → 第一个机器人。`/bot` 列出机器人，发一次 `/bot 名字` 就切换并记住，之后这个会话一直和它聊。每个机器人的系统提示词里都有其他机器人的名单和切换方法，用户问起时答得上来。名单和主人跟着账号走，能用这个账号的人可以和任何机器人聊。账号的 key 是命名空间：升级前的渠道 key 就是原来的机器人 id，登录态、配额、名单、队列都不用搬，默认机器人也是原来那个。删除机器人不影响账号。
+- 已授权账号（`src/agent/accounts.ts`）：全局一份（设置 › 连接），所有机器人共用，同一个服务可以加多个账号，比如对任何机器人说「看我第一个飞书和第二个飞书的消息」。`amb-connections` 插件把每次工具调用经 bridge 交给本程序，令牌不进代理进程；账号用工具的 `account` 参数选（序号或名字），`connected_accounts` 列出来。有账号的服务才有工具。只读机器人和观察规则不能写，宿主也会再查一次。聊天渠道账号见下一条。
+  - **Notion**（`notion.ts`）：用户添加时选一键授权或令牌。令牌走 REST API；一键授权用 OAuth + PKCE + 动态注册，回调到本机 `/oauth/notion/callback`，再由本程序调官方远程 MCP（`mcp.notion.com`）的工具。模型看到的是同一套工具：`notion_search`、`notion_read_page`、`notion_query_database`，不是只读的机器人再加 `notion_create_page`、`notion_update_page`。没有删除页面的工具。
+  - **飞书**（`feishu-account.ts`）：和官方 lark-cli 同一套流程：扫码创建个人应用（也可以填已有的自建应用），再设备授权拿用户令牌。只读，工具是 `feishu_list_chats`、`feishu_read_chat`、`feishu_search_messages`。
+- 默认图片 / 视频模型：首次设置时和默认文本模型一起选，之后在 设置 → Modelflare 修改；选「自动」时用推荐顺序里第一个不需要参考素材的模型。
+- 模型选择器里显示上下文长度、视觉 / 工具 / 推理能力，以及每百万 tokens 输入 / 输出的起步参考价（来自公开价格目录，以账单为准）。
+- 调用归因：经 Modelflare 的请求都带 `X-Modelflare-Skill: anymodel-bot/<版本>`，链接都带 `utm_source=anymodelbot&utm_campaign=amb_<位置>`（应用内 `amb_signup`、`amb_topup`、`amb_console` 等，README 与仓库文档 `amb_readme`，官网 `amb_homepage`；格式由 `test/utm.unit.test.ts` 固定）。
+- 线路：默认国际线路 `https://modelflare.dev/v1`；中国大陆可在「高级」或 设置 → Modelflare → 线路 选「中国大陆优化」（`https://origin.modelflare.dev/v1`）。线路由你选定，不自动切换。
+- 设置 → Modelflare：账户、余额与充值、余额提醒、用量、通知、邀请；连接状态（只显示 Key 尾号）；未登录时可更换密钥或断开（机器人与会话保留，断开后回到首次连接页）；默认模型、刷新模型列表。
+- 对话中输入框右侧的模型按钮可为当前会话切换模型（也可设为机器人默认）；`/model`、`/reset`、`/new`、`/status`、`/stop`、`/help` 照常可用。
+- 处理过程：代理回合的每一步（模型请求及用时与 tokens、工具调用及参数与输出、重试、子代理）折叠在回复上方的"用时"一行里，点开查看；微信 / 飞书会话在信息面板 → 最近会话里看，正在处理的那一轮实时显示并可中止。
+- 卡住的消息：`/stop`（任何渠道）或信息面板里的「中止」立即结束正在处理的回合；代理 10 分钟没有任何进展（模型不回、工具不动、只在重试；等你批准或回答不算）会自动中止，单回合最长 30 分钟（`AMB_AGENT_IDLE_TIMEOUT_MS`、`AMB_AGENT_TURN_TIMEOUT_MS` 可调）。中止只停这个会话的回合（经代理进程里的 amb-control 插件取消它），同一机器人的其它会话照常进行；10 秒内没停下（`AMB_STOP_GRACE_MS`）才重启代理进程。`/status` 显示它走到了哪一步、多久没有进展。网页对话里切到别的机器人或刷新窗口不会打断正在处理的消息，回来时接着显示（你的消息、到目前为止的回复和处理过程）；停止按钮在排队、代理启动中、等你批准时也能用，纯对话也一样。
+- 插话：代理正在处理时又发来的消息（文字连同图片 / 文件）直接并入这一轮，模型在下一步就看到，回复一起给（先回一句"收到"，经出站队列发、10 分钟没发出去就不再发）；插话同样先过准入（不在允许名单里的人发的消息不会并入）；代理还没接手或正在收尾时照常排队，命令（`/model`、`/reset`…）也排队。网页对话在回复进行中同样可以接着发。
+- 长命令转后台：命令跑过 30 秒（Windows PowerShell 60 秒）就转成后台任务、不再卡住这一轮，代理先回复"还在跑"；命令结束时代理被唤醒、拿到结果，回复作为一条新消息发到同一个会话（网页对话实时显示；微信、飞书和普通回复一样经出站队列发送：id 由代理会话和回合号推出、只发一次，微信发送时才查 24 小时窗口和配额，飞书回复你最近的那条消息，这条消息的 id 存在库里），处理过程里能看到后台命令的步骤，`/status`、中止、看门狗都认这一轮。
+- 每个会话用自己的模型：同一个代理进程里各会话各走各的模型和接口（每种接口一个 provider，上下文窗口、最大输出按模型），换模型不重启代理进程；补丁里没列出的模型在运行中补上。
+- 换新的代理进程：DSH 的 SDK 关不掉会话，后台任务和每次规则运行的会话都留在代理进程里，直到它重启（实测一个跑完、空闲的会话多占约 0.25–0.45 MB）。一个代理进程开过 100 个以上这样的会话后，等它完全空闲（没有聊天回合、没有在跑或收尾的任务和规则、没有等批准的、没有在压缩的会话、进程里没有后台命令）就在后台换一个新的；会话照常接着用，不中断任何东西，用户看不到。故障排查的代理状态里有 `taskSessions` 和 `recycles`；`AMB_DSH_RECYCLE_SESSIONS` 可改门槛。
+- 重启后的提醒：应用退出或崩溃时还没处理完的消息（每个会话在数据库里留一个处理中的标记，处理完就删），下次启动时在原会话里说一次「上次的消息「…」因为应用重启没有处理完，请重新发送」，不会自动重发。网页对话记进会话历史；微信用存下的 context_token 发送、占用同一份回复配额，超过 24 小时窗口或配额用完时等你在那个会话里发下一条消息时先说；飞书发到原单聊。
+- 代理的对话接口：代理按 Modelflare 公开目录里该模型支持的接口选——有 Responses API 的（GPT-5.4 及以后、Grok 4.5 及以后、DeepSeek V4、GLM-5、Kimi K3 等）走 `/v1/responses`（推理模型默认推理强度 medium，加密推理随历史回放）；没有 Responses、有 Anthropic Messages 的（Claude）走 `/v1/messages`；其余模型、拿不到目录时（离线、中国大陆线路）以及外部端点走 Chat Completions。接口按模型在代理进程里第一次用到它时选定（故障排查的代理状态里显示最近一轮的 `api` 和进程里的模型）；`AMB_AGENT_API=chat` 强制全部走 Chat Completions（排查用）。纯对话（非代理）仍走 Chat Completions。安全网：某个模型在 Responses / Messages 上的请求被上游拒绝（HTTP 400/404/405/415/422 或“不支持的参数 / 接口”，限流、余额、权限、上游故障、上下文过长不算）时，这个模型 24 小时内改走 Chat Completions（记在数据目录的 `dsh/api-fallback.json`，日志有警告，代理状态显示 `openai-completions (fallback: 原因)`）；这一轮如果还没调用过工具，这个会话换到 Chat 上自动重做一遍（不重启代理进程），用户照常收到回复，已经调用过工具的则照常报错、下一轮起走 Chat。
+- 内置网关：magpie 以 `--gateway` 模式运行，使用本程序数据目录内独立的 HOME/配置目录；**不读取**你电脑上已有的 Claude/Codex 等订阅凭据，**不改写**任何 agent 配置，关闭自动更新与账户发现。它只供本进程内部调用，界面不再反代它的页面或 `/v1`。
+- API Key 只保存在内置网关的隔离配置中，不经过命令行参数、不写日志，前端只拿到尾号。
+- 开发/测试：设置 `AMB_MAGPIE_BASE_URL` 可直接使用一个 OpenAI 兼容端点（不启动内置网关，界面视为已连接，账户功能不可用）；`AMB_MODELFLARE_BASE_URL` 可把 Modelflare 基址指向本地 mock，`AMB_MODELFLARE_ISSUER` 把登录与账户接口指向本地 mock。
+
+## 界面
+
+- 侧栏：机器人列表（头像 + 名称 + 最近一条消息），＋ 新建，右键 重命名 / 删除；左下角点头像看余额，点齿轮打开设置（`⌘/Ctrl+,`）。
+- 对话页：顶部悬浮的机器人名称胶囊打开信息面板（`⌘/Ctrl+⇧+I`：默认由它回复的渠道账号、待审批、任务和规则、记忆、最近会话，⚙ 进机器人设置）；回复流式显示（Markdown、代码块一键复制），可随时停止（`Esc`）；审批与提问以卡片形式出现在对话里；向上翻阅时不会被拉回底部。
+- 命令面板 `⌘/Ctrl+K`；外观（跟随系统 / 浅色 / 深色）在 设置 → 常规。
+- 语言：简体中文 / English，设置 → 常规 → 语言（引导页右上角、命令面板里也能切），默认跟随系统（系统语言不是中文也不是英文时用英文）。偏好存在 config.json 的 `ui.lang`，托盘菜单、服务端报错和状态文字、机器人发到微信 / 飞书的系统消息（`/help`、审批提示等）都跟着它；命令行 / Docker 下"跟随系统"看 `AMB_LANG`，再看 `LC_ALL` / `LANG`，都没有时用简体中文。日志、发给模型的提示词和用户自己起的机器人名不翻译。
+  - 界面文案在 `ui/locales/<语言>/<命名空间>.js`，代码里写 `t("命名空间.键", { 参数 })`（`ui/lib/i18n.js`）；服务端在 `src/i18n/messages/<命名空间>.ts`，键有类型检查。每个界面请求带 `x-amb-lang`，服务端在这个请求里用同一种语言回话。
+  - 新增文案两种语言都要写；`node scripts/i18n-check.mjs [文件…]` 检查界面代码里有没有漏掉的中文、用到的键在不在、中英词典是否对齐（`npm test` 里的 `test/i18n.unit.test.ts` 也会查）。确需留在代码里的中文（字体名、匹配中文输入的正则）在那一行写 `// i18n-ignore`。
+- 上手清单（新手引导）：对话空状态里是 6 步清单——打招呼、换模型、接到微信、让它动手、让它记住你、生成一张图。最后一步在引导里只放预置演示，不管账户有没有图片 / 视频模型都一样：和真的默认流程一样直接生成、图片显示在对话里，但不发给机器人、不调用模型、不扣费，图是客户端自带的 `ui/assets/guide-demo.svg`。目的是教会怎么操作，不替用户花钱；之后真的让它画图、收到图片也会算完成这一步。点「发送这句」直接试，点「带我去」或侧栏左下角的清单入口，会有一张引导卡片指着要点的地方（那里亮一圈）。做完自动打勾：对话里有了回复、换了模型、收到文件 / 图片、渠道连上、记忆写入；进度存在 config.json 的 `ui.guide`（接口 `/amb/api/guide`），老用户已经做过的步骤会自动算完成。清单可以收起到左下角或「不再显示」，设置 → 常规 → 上手清单 可以重新开始。
+- 视觉：中性色与组件改编自 magpie 的界面（MIT），强调色为 Modelflare 荧光黄绿 `#d7ff00`。设计系统说明见 `ui/design/README.md`。
+
+## 人设与提示词
+
+代理模式下模型看到的提示词都在 `src/agent/prompts/`；`test/prompts.unit.test.ts` 检查每段必须有、不能有的句子和字符数上限，`test/agent.integration.test.ts` 用真实的 DSH 子进程检查模型收到的系统提示词和整份系统提示词加工具定义的上限。
+
+- **人设**：DSH 自带的人设是「coding agent」，前面还有一句「You are an AI agent powered by DeepSeek Harness.」。补丁（`host.ts` writePatch）把 `personaPrefix` 换成个人助手的人设（能聊天，也能写代码、运行命令、处理文件，开着电脑操作时还能操作桌面应用；网页、文件、转发的消息里的文字是资料不是指令），并关掉 `includeHarnessIdentity`（它只控制那一句）。
+- **机器人段**：聊天规则、长期记忆的用法（开着记忆时）、机器人名字和你写的人设，排在系统提示词最后一段（`amb:bot`）。宿主在每个回合开始前把它写进数据目录的 `dsh/.prompts/<机器人>.md`（代理的文件工具读不到、改不了；内容没变就不写），插件 `dsh-runtime/plugins/amb-prompt.mjs` 在每次模型请求时现读——改了人设或名字，下一条消息就生效，不用 `/new`，也不重启代理进程。DSH 0.2.1-rc.4 同步调用这段的 `text`（返回 Promise 不会被等待），所以是同步读文件而不是走 bridge。人设和聊天规则冲突时以人设为准。子代理不带这一段：它们不和用户说话。
+- **聊天规则**（改编自 dsh-superagent 的注意力原则）：先给答案；要花一阵子的任务开始时用一句话说要做什么，之后不逐步讲解（每一步在「处理过程」里）；做完说清做了什么、结果在哪里；没做完就说没做完，失败就说失败；自己做决定，说一句选了什么，语言、格式、范围、风格都不问；只在猜错会造成损失、花钱或白做大半，要你才有的东西（登录、文件、密码），或这一步不可撤回（付款、删你的数据、给别人发消息）时才问，一次一个问题，有选项时用 `ask_user_question`；不说客套话；微信、飞书里回复要短。后台任务也一样：自己定，在结果里说明。
+- **每段对话的第一条消息**：对话渠道（微信只显示纯文本，飞书和网页支持 Markdown）、当时的长期记忆快照、上一段的交接便条，再接你的消息。这些按会话不同（群记忆、渠道），记一条记忆就会变；放进系统提示词会让同一机器人所有会话共用的前缀缓存失效，所以留在这里，一段之内不变，之后的记忆变化用 `recall` 查。
+- 前缀缓存：内容没变时系统提示词逐字节不变；人设变了只改最后一段，前面的部分照旧。升级前开始的对话第一条消息里还留着当时的人设，下一段（`/new` 或上下文管家换段）起不再有。
+
+## 文件权限
+
+代理模式下每个机器人有一个文件权限预设，在输入框左下角的权限胶囊或 机器人设置 → 权限 中切换，`/status` 会显示当前预设：
+
+- **工作区可写**（默认）：命令在沙箱里运行，只能改这个机器人的工作区；越界操作先在聊天里问你。
+- **只读**：不能改文件，命令在只读沙箱里运行。
+- **完全权限**：给熟悉风险、嫌审批太多的用户。命令**不经沙箱**，以你的用户身份直接运行，越界操作不再请求批准——它可以读取和修改你电脑上的任何文件，包括 AnyModelBot 自己的数据目录（数据库、渠道令牌、密钥）。只有**递归删除**仍会先问你（同一套审批：微信回复编号、飞书 / 网页卡片）：`rm -r` / `-rf` / `--recursive`（含 `sudo`、`xargs`、`sh -c` 里的）、`find -delete`、`git clean`、`rsync --delete`，PowerShell 的 `Remove-Item` / `rm` / `del` / `rd` / `rmdir` 加 `-Recurse`（及其缩写），cmd 的 `rd /s`、`del /s`，`robocopy /MIR`，以及 Python `shutil.rmtree`、Node `fs.rm(…, { recursive })` 等常见写法；命令里点名的脚本文件也会检查。选它时界面会先弹出确认，权限胶囊和设置页用红色标出。
+  - 这是防误删的保险，不是安全边界：检查的是命令文字，运行时才拼出来的命令（`eval "$(…)"`、`curl … | sh`）和 `make clean`、`npm run clean` 这类构建脚本看不到；拿不准时宁可多问。只在你信任当前模型和任务时开启。
+
+## 谁能使用机器人
+
+代理跑在你自己的电脑上（甚至可能是完全权限），所以默认**只有主人和你允许的人**能和机器人对话。按渠道账号分开算，能用这个账号的人可以和任何机器人聊（`src/core/access.ts`）：
+
+- **主人**：微信是扫码登录的那个微信；飞书不管是扫码创建应用还是填 App ID / App Secret，连上之后**第一个给机器人发单聊消息的人**就是主人（先到先得）——连上后用你自己的飞书给机器人发一句话就完成绑定，这条消息照常回复。扫码时没拿到扫码者的微信也一样。机器人设置 → 谁能使用 里显示飞书主人，点「更换」（要确认）清掉主人，下一个发消息的人成为主人；换一个飞书应用或断开飞书时也会清掉。拒绝过的人不会成为主人。本机的网页对话不受限制。
+- **其他人**发消息：只收到一句「你还没有被允许使用这个机器人，已通知主人」（同一个人每小时最多一次），不进队列、不调用模型、不花钱。请求出现在 设置 › 连接 里这个账号的「管理」（允许 / 拒绝），也会带 4 位配对码发给主人（每个账号每小时最多 3 条；主人 24 小时内在那个渠道说过话才发得出去），主人在聊天里回复「同意 1234」/「拒绝 1234」即可。配对码不会和工具审批的编号撞。被拒绝的人之后发什么都不回。
+- 允许名单在 设置 › 连接 里这个账号的「管理」，可以移除（移除后他再发消息会重新申请）；`/status` 也会显示。
+- 升级时，已经和机器人有单聊会话的人自动加入允许名单（标为「升级前已在使用」），不会被拦在外面；换一个微信重新扫码时，原来的主人也留在名单里。
+- 群聊：目前没有渠道接入群聊（飞书只处理单聊，微信 iLink 没有群），群消息不受名单限制、保持原样；接入群聊时要在 `access.ts` 里补规则。
+
+## 消息不会丢
+
+最终回复、交付的文件、审批提示和通知先写进本地数据库的出站队列再发送（`src/core/outbox.ts`；流式卡片的中间内容和“正在输入”除外）：
+
+- 同一会话按顺序一条一条发；网络或平台临时出错时自动重试（5 秒起，逐步拉长到 5 分钟），渠道没连上时等它连上。
+- 应用退出或崩溃后，重启时接着发，已经发出去的不会再发（长回复分段发，从没发的那段接着发）。每条消息的 id 由收到的那条消息推出来，同一条消息被平台重复投递也只有一个最终回复；只有恰好在发送途中崩溃的那一段可能再发一次——它带着固定的飞书 `uuid`（飞书 1 小时内去重）和微信 `client_id`。
+- 微信只能在对方 24 小时内发过消息时回复，每条消息之后最多回 10 条。这时发不了的消息不丢，先留着（held），等对方下次发消息时先发出去：几条文字合成一条「你不在时：…」（一条微信放得下就合，文件照原样），排在这次的回复前面，顺序不变、只发一次。留着的最多 7 天；“收到”、审批提示这类过一会儿就没意义的照旧按自己的期限。
+- 再也发不出去的（平台多次拒绝、等待太久）标记出来并写明原因，记在日志和诊断信息里。
+
+## 后台任务和规则
+
+要跑一阵子的事在后台做，不占聊天（设计见 `docs/design/background-tasks-and-proactive.md`，代码在 `src/tasks/`）：
+
+- **后台任务**：聊天代理用 `task_start` 开一个任务（自己的 DSH 会话 `task-<id>` 和工作区里的文件夹 `tasks/<名字>-<id6>/`），一句话说清在后台做什么；做完把结果发回原会话（微信引用、飞书回复那条消息可以接着问）。中途要问你的，一个会话一次只推一个问题。应用重启后接着做，已经做过的外部动作先查再做。`/tasks` 列出任务和规则，`/stop 编号` 停一个。
+- **规则**：`rule_create` 或 机器人设置 › 主动消息 › 规则 建好，直接执行：你的原话就是授权，到点去查，有值得说的才发一句；改了原话也照样执行。观察要自己选（跟机器人说「先观察」，或在规则编辑器里选观察）：只读，不发消息，只记「本会发送」，好好观察 3 次后在「需要你」里问要不要改为执行。每次运行一个新会话，运行记录可以导出成 Markdown。
+- **看得到、不打扰**：信息面板的「任务」组列着这个机器人的任务和规则（结束了的收在「已结束」里），点开看来自哪、最新进展、预算、文件夹和每次运行的处理过程；所有在等你的事在侧栏的「需要你」里。只推结果、要你决定的事和失败；免打扰（默认 22:00–08:00）、每天上限（微信 3 条、飞书 5 条）、合并成摘要都在 机器人设置 › 主动消息。
+- **预算**：任务默认 $1，规则每次 $0.10、每月 $3（估算，按 Modelflare 的参考价）。用完时停下问你；任务详情里能改任务的预算，规则编辑器里能改规则的。机器人的预算 Key 剩不到 20% 时停后台工作，留给聊天。
+- **暂停**：机器人设置 › 主动消息 › 暂停后台工作（或跟机器人说），任务和规则先停、主动消息排着，聊天照常。
+- **保留与清理**：任务和运行记录留 30 天，30 天没动过的任务归档。任务文件夹 30 天没动过就删除，连同 DSH 里它的会话记录（`dsh/<机器人>/sessions/` 下；SDK 没有删会话的接口，由应用直接删，会话还开在代理进程里的等进程换过再删）；不问你、不发通知：第 27 天定下删除的日期，任务详情里写着，可以保留（至少 3 天后才删）。任务详情里能看到文件夹多大，也能直接删掉任务（连同文件夹）。
+
+## 电脑操作（Computer Use）
+
+每个机器人可在 机器人设置（信息面板的 ⚙）→ 电脑操作 中开关、选择后端和审批方式；`/status` 与设置页会显示当前后端、是否可用及原因。
+
+- **后端**
+  - **Cua Driver（默认，三平台）**：随安装包附带官方预编译的 [cua-driver](https://github.com/trycua/cua/tree/main/libs/cua-driver) 0.37.0（MIT），构建时由 `scripts/fetch-cua-driver.mjs` 按平台/架构下载并校验 SHA256。作为内置 MCP 服务器 `cua-driver mcp` 运行，始终使用 `CUA_DRIVER_PERMISSION_MODE=bounded` + 能力清单，**从不**使用 `--dangerously-bypass-approvals`；子进程环境经过清理，不传任何密钥，关闭遥测，禁用 `run_script`。只开放所需的 24 个工具（读取窗口/截图、启动应用、点击、输入、按键、组合键、滚动、拖拽、设值、菜单等），其余工具（脚本、结束进程、剪贴板、浏览器注入、录制、更新等）对模型不可见且会被拒绝。清单列出本机已安装的图形应用（Linux 读 .desktop、macOS 读 /Applications、Windows 读开始菜单），并允许整屏输入；清单最长 24 小时有效，到期前自动重启驱动。
+  - **Codex Computer Use 桥（可选，仅 macOS）**：kimi-computer-use，需要本机已安装 OpenAI Codex Computer Use；不可用时自动回退到 Cua Driver。
+- **审批**：默认所有电脑操作（读取、截图、点击、输入、按键、滚动、拖拽、设值）**自动执行，无需审批**；可选「点击、输入等改变界面的操作先问我」（读取界面仍自动）。升级时已有机器人（含默认机器人）会被迁移为自动执行。权限预设为「只读」的机器人只开放读取类工具。
+- **平台说明**
+  - macOS：需在「系统设置 → 隐私与安全性」中给本应用授予「辅助功能」与「屏幕录制」权限；以 `--direct` 方式运行驱动（尚未在真机验证）。
+  - Linux：X11 下通过 AT-SPI 读取界面（需要 at-spi2-core，应用需开启无障碍）；Wayland 会降级——只能操作 XWayland 应用的前台窗口，界面会给出提示。没有图形会话（DISPLAY/WAYLAND_DISPLAY）时不可用。
+  - Windows：必须在已登录用户的交互式桌面会话中运行（服务/计划任务的非交互会话不可用）。
+- 截图只发给（支持视觉的）模型使用，不会被转发到微信/飞书聊天中；只有用户要求时才会作为文件发送。
+- 未打包：cua-perception、OmniParser（AGPL）以及任何 Cua Spaces（FSL）组件。
+
+## 飞书应用配置
+
+最省事的办法：设置 › 连接 → 飞书 →「添加账号」，用飞书扫码，自动创建机器人应用，然后在飞书里给它发条消息。
+
+想用已有的企业自建应用，点「用已有应用」，按下面的步骤配置：
+
+1. 打开 [飞书开放平台](https://open.feishu.cn/app) → 创建企业自建应用，添加「机器人」能力。
+2. 权限管理开通：
+   - `im:message.p2p_msg:readonly`（读取用户发给机器人的单聊消息）
+   - `im:message:send_as_bot`（以应用身份发消息）
+   - `cardkit:card:write`（创建与更新卡片，用于流式回复）
+   - `im:message.history:readonly`（读取会话历史消息：飞书长连接不补推离线时发来的消息，程序启动、断线重连时从历史里补上 7 天内有过来往的单聊里、24 小时内的消息，每个会话最多 20 条；没开也能用，只是补不上，会提示一次）
+3. 先在本程序 设置 › 连接 → 飞书 →「添加账号」→「用已有应用」里填入 App ID / App Secret 并保存（长连接需要程序在线才能保存下一步）。
+4. 事件与回调 → 订阅方式选「**使用长连接接收事件**」，添加事件 `im.message.receive_v1`。
+5. 发布版本并在可用范围内添加自己，然后用你自己的飞书私聊机器人发一句话：连上后第一个发消息的人就是飞书主人（见「谁能使用机器人」）。
+
+说明：当前只处理单聊（p2p），群聊消息会被忽略。
+
+## 微信（iLink）
+
+- 设置 › 连接 → 微信 →「添加账号」→「扫码登录」，用微信扫描二维码并确认；或命令行 `npm run weixin:login`（终端显示二维码，同时保存 PNG 到数据目录）。
+- 登录态、同步游标、context_token 保存在数据目录，重启后自动续用。
+- 平台限制：用户每发来一条消息后 24 小时内最多可回复 10 条；回复在生成结束后一次发出，超过 4000 字自动分段；生成期间显示“正在输入”。
+- 图片、文件、视频：用户发来（或引用）的会从微信 CDN 下载解密（单个最大 50 MB）。代理模式下存进机器人工作区的 `inbox/`，消息里写明路径，代理可以读取、处理或当生图的参考图；能看图的模型（Claude、GPT-5/6、Gemini、Grok 4、Kimi K3、Muse Spark 等）同时直接收到图片本身，其余模型只拿到路径。Linux 版代理暂不直接收图（sharp 在 Electron 下会崩溃），只给路径。机器人交付的文件（present）按图片或文件发回微信。
+- 登录过期（错误码 -14）时自动暂停并在界面提示，重新扫码即可。
+
+## 开发与测试
+
+```bash
+npm run typecheck
+npm test            # 单元测试 + 离线端到端（模拟飞书/iLink/Modelflare，含流式对话与停止）+ 内置网关集成测试（需已编译 magpie）
+npm run docs:check  # README 自检：素材是否存在与体积、中英文结构一致、相对链接与锚点、禁用词、alt
+```
+
+README 的素材清单与录制规范见 [docs/assets/README.md](./assets/README.md)。
+
+## 许可
+
+MIT，见 `LICENSE`；第三方组件（magpie MIT——含界面样式改编、Tencent openclaw-weixin MIT 等）见 `THIRD_PARTY_NOTICES.md`，也可在 设置 → 关于 中查看。

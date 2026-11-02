@@ -1,0 +1,16 @@
+/* 行内提示（可带一个操作）：.notice [amber | red] > 图标 + .notice-text + .btn（Notice 组件会带上图标）。
+   一行安静的提示：只铺一层很淡的底色，不描边、不加左侧色条。字总是 --fg（在淡底上 ≥ 14:1），
+   语气由图标的颜色和底色表达，所以不会出现"淡红底上的红字"这种对比度不够的组合。
+   定制：覆盖 --notice-bg / --notice-ic。 */
+.notice {
+  --notice-bg: var(--well);
+  --notice-ic: var(--muted);
+  display: flex; align-items: center; gap: var(--space-2); padding: var(--space-2) var(--space-2) var(--space-2) var(--space-3);
+  border-radius: var(--r-well); font-size: var(--fs-sm); line-height: var(--lh-normal);
+  background: var(--notice-bg); color: var(--fg);
+}
+.notice > .ic { color: var(--notice-ic); }
+.notice .notice-text { flex: 1; min-width: 0; }
+.notice.amber { --notice-bg: var(--amber-wash); --notice-ic: var(--amber); }
+.notice.red { --notice-bg: var(--red-wash); --notice-ic: var(--red); }
+.notice .btn { --btn-h: var(--ctl-sm); --btn-px: var(--space-2-5); }

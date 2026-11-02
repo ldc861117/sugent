@@ -1,0 +1,556 @@
+/**
+ * 后台任务（3a）端到端：真实 DSH 子进程 + 脚本化的模型 + mock iLink（主人在微信里和自己的机器人聊）。
+ * 退出演示：微信里说「调研 Y」，聊天代理开一个后台任务，聊天照常回答；任务跑完，结果经出站队列回到同一个微信会话、只发一次；
+ * 任务跑到一半应用重启，带着恢复说明接着做，结果仍只发一次。另外：/stop 编号和界面的停止只停这个任务；
+ * 两个任务在跑时，聊天消息不排在它们后面（人的通道）；收尾（后台命令）、没报告时的提醒、每种会话的工具。
+ * 3b 退出演示：任务在微信里问「中文还是英文？」，用户回编号，任务接着做完；桌面的「需要你」列出它，回答后变空。
+ * 另外：引用回答、中间的普通聊天不被当成回答；任务会话里的审批推到同一个微信会话（带任务名），y 编号批准后接着做。
+ * 3e 退出演示：模型每次请求报的用量按（mock 的）Modelflare 价格目录估算，任务花到 $1 停下，微信和「需要你」里问
+ * 「已用约 $1.00，再给 $1 继续？」，在桌面上点继续后同一个会话接着做完。
+ * 问了还接着做：任务问一个有默认回答的问题（马上推到微信，带「不回复就按中文做」）、接着跑命令；用户回编号，回答并进在跑的这一轮；
+ * 没人回答就按默认做完，提问从「需要你」里撤掉，之后引用那条提问回答，任务接着做。
+ */
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import http from "node:http";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { App } from "../src/app.js";
+import { loadConfig } from "../src/config.js";
+import { locateDshRuntime } from "../src/agent/host.js";
+import { findAppRoot } from "../src/magpie/supervisor.js";
+import { listen, mockIlink } from "./helpers.js";
+
+const runtime = locateDshRuntime(findAppRoot());
+const hasBwrap = fs.existsSync("/usr/bin/bwrap");
+
+async function body(req: http.IncomingMessage): Promise<any> {
+  const chunks: Buffer[] = [];
+  for await (const c of req) chunks.push(c as Buffer);
+  return JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+}
+const textOf = (c: any): string => (typeof c === "string" ? c : Array.isArray(c) ? c.map((p) => (typeof p === "string" ? p : (p?.text ?? ""))).join("") : "");
+/** usage：这次请求报的输入 tokens（默认 10） */
+type Step = { tool?: { name: string; args: any }; text?: string; hang?: boolean; usage?: number };
+/**
+ * mock 的 Modelflare 价格目录（AMB_MODELFLARE_ISSUER 指向 mock）：mock-agent 输入 $4 / 百万 tokens，一次 62,500 tokens = $0.25；
+ * 上下文 100 万，几次大请求不会触发压缩。平常的请求只有 10 个 tokens，花费可以忽略。
+ */
+const PRICING = { data: [{ model_name: "mock-agent", quota_type: 0, input_price: 4, completion_ratio: 1, enable_groups: ["default"], context_window: 1_000_000 }], group_ratio: { default: 1 }, usable_group: { default: "" } };
+
+describe.skipIf(!runtime || !hasBwrap || process.platform !== "linux")("background tasks (real DSH, WeChat)", () => {
+  const OWNER = "owner@im.wechat";
+  const CONV = `default:weixin:${OWNER}`;
+  let app: App;
+  let dataDir: string;
+  let llm: Awaited<ReturnType<typeof listen>>;
+  let ilink: Awaited<ReturnType<typeof mockIlink>>;
+  let base = "";
+  /** 每个模型请求：工具名、用户消息、是不是任务会话 */
+  const calls: Array<{ tools: string[]; users: string[]; task: boolean; at: number }> = [];
+  const hung: http.ServerResponse[] = [];
+
+  /** 脚本：聊天会话（没有 task_report）和任务会话（有）各自按最后一条带记号的用户消息走 */
+  function plan(messages: any[], tools: string[]): Step {
+    const task = tools.includes("task_report");
+    // DSH 在用户消息后面插"Current runtime context"那条：跳过它
+    let last = -1;
+    for (let i = messages.length - 1; i >= 0; i--) if (messages[i].role === "user" && !/^Current runtime context/.test(textOf(messages[i].content))) { last = i; break; }
+    const user = textOf(messages[last]?.content);
+    const done = messages.slice(last + 1).filter((m) => m.role === "tool").length;
+    if (!task) {
+      const r = /RESEARCH (\w+)/.exec(user);
+      if (r) return done ? { text: `ACK-${r[1]}：好，后台开始调研，好了告诉你，你可以继续聊别的。` } : { tool: { name: "task_start", args: { title: `调研 ${r[1]}`, brief: `research ${r[1]} and write notes.md` } } };
+      const p = /PING (\w+)/.exec(user);
+      if (p) return { text: `PONG-${p[1]}` };
+      const pause = /PAUSEBG (on|off)/.exec(user);
+      if (pause) return done ? { text: `PAUSED-${pause[1]}` } : { tool: { name: "background_pause", args: { paused: pause[1] === "on" } } };
+      const l = /LISTTOOLS/.exec(user);
+      if (l) return { text: `CHATTOOLS<<${tools.join(",")}>>` };
+      return { text: "好的" };
+    }
+    // 任务会话：最近一条带记号的输入（第一条输入里是用户原话）
+    const all = messages.map((m, i) => ({ i, role: m.role, text: textOf(m.content) }));
+    const tag = /RESEARCH (\w+)/.exec(all.find((m) => m.role === "user" && /\[用户的原话\]/.test(m.text))?.text ?? "")?.[1] ?? "X";
+    // at：这一轮里前面已经有几次工具调用（报告是第 at+1 个）
+    const report = (message: string, at = 0): Step => (done > at ? { text: "已报告" } : { tool: { name: "task_report", args: { state: "done", summary: `notes for ${tag}`, message, files: tag.startsWith("FILE") ? ["notes.md"] : [] } } });
+    if (/The app restarted while you were working/.test(user)) return report(`RECOVERED-${tag}：调研好了，结论在 notes.md。`);
+    if (/^Report this task's state with task_report now/.test(user)) return report(`NUDGED-${tag}`);
+    if (/^background job /.test(user)) return report(`BGRESULT-${tag}`);
+    // 用户引用结果追加的一句（不经聊天代理，直接到任务）
+    const more = /^\[用户追加\]\n(.+)$/.exec(user);
+    if (more) return report(`FOLLOWED-${tag}：${more[1]}`);
+    // ASKD / ASKL：先问一个有默认回答的问题，接着跑一条命令（ASKD 6 秒，等用户回答；ASKL 2 秒，没人回答），
+    // 做完时有回答就按回答，没有就按默认；之后又来了回答（引用撤回的提问）就按它改
+    if (tag.startsWith("ASKD") || tag.startsWith("ASKL")) {
+      const tc = messages.flatMap((m: any) => (m.role === "assistant" ? (m.tool_calls ?? []) : []));
+      const names = tc.map((c: any) => String(c.function?.name ?? ""));
+      const lastArgs = (() => {
+        try {
+          return JSON.parse(tc.at(-1)?.function?.arguments ?? "{}");
+        } catch {
+          return {};
+        }
+      })();
+      if (messages.at(-1)?.role === "tool" && names.at(-1) === "task_report" && lastArgs.state === "done") return { text: "已报告" };
+      if (!names.includes("task_report")) return { tool: { name: "task_report", args: { state: "needs_you", summary: "先写正文，差语言", question: "中文还是英文？", options: ["中文", "英文"], default: "中文" } } };
+      if (!names.includes("bash")) return { tool: { name: "bash", args: { description: "draft", command: `sleep ${tag.startsWith("ASKD") ? 6 : 2} && echo drafted` } } };
+      if (messages.at(-1)?.role === "tool" && names.at(-1) !== "bash") return { text: "继续" };
+      // 并进来的回答可能被 DSH 包了一层：不锚定开头结尾
+      const ans = all.map((m) => /\[用户回答了你[^\]]*\]\s*问题：[^\n]*\n回答：([^\n<]+)/.exec(m.text)?.[1]?.trim()).filter(Boolean).at(-1);
+      return { tool: { name: "task_report", args: { state: "done", summary: "写好了", message: ans ? `ANSWERED-${tag}：用${ans}写好了。` : `DEFAULTED-${tag}：按中文写好了，要英文的话引用这条说一声。` } } };
+    }
+    // ASK：先问用户（needs_you），回答作为下一条输入回来，再按回答做完
+    if (tag.startsWith("ASK")) {
+      const ans = /^\[用户回答了你的问题\][\s\S]*回答：(.+)$/.exec(user);
+      if (ans) return report(`ANSWERED-${tag}：用${ans[1]}写好了。`);
+      return done ? { text: "已提问" } : { tool: { name: "task_report", args: { state: "needs_you", summary: "差语言", question: "中文还是英文？", options: ["中文", "英文"] } } };
+    }
+    // APPR：一条要提权的命令（要批准），批了才跑
+    if (tag.startsWith("APPR")) {
+      if (done === 0) return { tool: { name: "bash", args: { description: "run", command: "echo appr-$((40+2))", sandbox_permissions: "danger-full-access", justification: "测试提权" } } };
+      const out = messages.filter((m) => m.role === "tool").map((m) => textOf(m.content)).join("|");
+      return report(`APPROVED-${tag}<<${out.includes("appr-42") ? "ran" : "not run"}>>`, 1);
+    }
+    if (tag.startsWith("HANG")) return { hang: true };
+    // BUDGET：每一步都是一次 $0.25 的请求，一直做下去，直到宿主在 $1 停下它；加了预算之后报告做完
+    if (tag.startsWith("BUDGET")) {
+      if (/^This task was stopped when it used its budget/.test(user)) return report(`BUDGET-DONE-${tag}：报告写好了。`);
+      return { tool: { name: "bash", args: { description: "run", command: `echo step-${done}` } }, usage: 62_500 };
+    }
+    if (tag.startsWith("TOOLS")) return done ? { text: `TASKTOOLS` } : report(`TASKTOOLS-${tag}<<${tools.join(",")}>>`);
+    if (tag.startsWith("QUIET")) return { text: "我做完了" }; // 不调用 task_report：宿主提醒一次
+    if (tag.startsWith("BG")) return done ? { text: "后台命令在跑" } : { tool: { name: "bash", args: { description: "run", command: "sleep 2 && echo bg-done", run_in_background: true } } };
+    // SLOW / FILE：跑一条几秒的命令写文件，再报告
+    if (done === 0) return { tool: { name: "bash", args: { description: "run", command: `sleep 3 && pwd > notes.md && echo found-${tag} >> notes.md && cat notes.md` } } };
+    return report(`RESULT-${tag}：调研好了，结论在 notes.md。`, 1);
+  }
+
+  const makeApp = () =>
+    new App(loadConfig({ dataDir, env: { AMB_MAGPIE_BASE_URL: llm.url + "/v1", AMB_MAGPIE_API_KEY: "gw-key", AMB_UI_PORT: "0", AMB_WEIXIN_API_BASE: ilink.url, AMB_DEFAULT_MODEL: "mock-agent", AMB_AGENT_PREWARM: "0" } }), {
+      printQrToTerminal: false,
+      weixinPollTimeoutMs: 1000,
+      // 这里测任务本身：所有测试共用主人的一个会话，主动消息的每天上限和合并（3c，见 delivery 的测试）不拦
+      deliveryLimits: { dailyCap: { weixin: 1000 }, coalesceMs: 0 },
+    });
+
+  beforeAll(async () => {
+    llm = await listen(async (req, res) => {
+      const url = req.url?.split("?")[0] ?? "";
+      if (url.endsWith("/models")) return void res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ object: "list", data: [{ id: "mock-agent", object: "model" }] }));
+      if (url === "/api/pricing") return void res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(PRICING));
+      const b = await body(req);
+      const tools = (b.tools ?? []).map((t: any) => t.function?.name ?? t.name);
+      const step: Step = b.tools ? plan(b.messages ?? [], tools) : { text: "标题" };
+      if (b.tools) calls.push({ tools, users: (b.messages ?? []).filter((m: any) => m.role === "user").map((m: any) => textOf(m.content)), task: tools.includes("task_report"), at: Date.now() });
+      if (step.hang) return void hung.push(res);
+      if (!b.stream) return void res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ choices: [{ message: { role: "assistant", content: step.text ?? "" }, finish_reason: "stop" }] }));
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      const send = (o: any) => res.write(`data: ${JSON.stringify({ id: "c1", object: "chat.completion.chunk", model: b.model, ...o })}\n\n`);
+      if (step.tool) {
+        send({ choices: [{ index: 0, delta: { role: "assistant", tool_calls: [{ index: 0, id: "call_" + Math.random().toString(36).slice(2, 8), type: "function", function: { name: step.tool.name, arguments: JSON.stringify(step.tool.args) } }] } }] });
+        send({ choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] });
+      } else {
+        send({ choices: [{ index: 0, delta: { role: "assistant", content: step.text } }] });
+        send({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
+      }
+      const prompt = step.usage ?? 10;
+      send({ choices: [], usage: { prompt_tokens: prompt, completion_tokens: 5, total_tokens: prompt + 5 } });
+      res.end("data: [DONE]\n\n");
+    });
+    ilink = await mockIlink();
+    // 价格目录（估算花费）从 mock 读
+    process.env.AMB_MODELFLARE_ISSUER = llm.url;
+    dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "amb-tasks-"));
+    app = makeApp();
+    // 主人已经扫码登录；渠道连到 mock iLink
+    app.store.createBot({ id: "default", name: "小蓝", weixinEnabled: true, settings: { avatar: "blue", quietHours: { enabled: false, from: "22:00", to: "08:00" } } as any });
+    app.store.saveWeixinAccount({ botId: "default", botToken: "tok", ilinkBotId: "bot@im.bot", baseUrl: ilink.url, ownerUserId: OWNER });
+    await app.start();
+    base = app.web!.url.replace(/\/+$/, "");
+  }, 60_000);
+
+  afterAll(async () => {
+    for (const r of hung.splice(0)) r.destroy();
+    await app?.stop();
+    await llm?.close();
+    await ilink?.close();
+    delete process.env.AMB_MODELFLARE_ISSUER;
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  const api = async (p: string, init?: RequestInit) => (await fetch(`${base}/amb/api${p}`, init)).json() as Promise<any>;
+  const waitFor = async (fn: () => boolean | Promise<boolean>, ms = 60_000) => {
+    for (const end = Date.now() + ms; Date.now() < end; await new Promise((r) => setTimeout(r, 100))) if (await fn()) return;
+    throw new Error("waitFor: timeout");
+  };
+  /** 发给主人的、以这段文字开头的微信消息 */
+  const sentTo = (text: string) => ilink.state.sent.filter((s) => s.to === OWNER && s.text.startsWith(text));
+  const taskOf = (tag: string) => app.tasks.list({ conversationId: CONV, limit: 100 }).find((t) => t.title === `调研 ${tag}`);
+  /** 在微信里请机器人后台调研：等它回了确认、任务建好 */
+  const research = async (tag: string) => {
+    ilink.push(OWNER, `RESEARCH ${tag}`);
+    await waitFor(() => sentTo(`ACK-${tag}`).length === 1);
+    await waitFor(() => !!taskOf(tag));
+    return taskOf(tag)!;
+  };
+  const stage = (tag: string) => taskOf(tag)?.stage.key;
+  /** 任务在跑一轮：模型请求挂着（HANG） */
+  const hanging = (tag: string) => calls.some((c) => c.task && c.users.some((u) => u.includes(`RESEARCH ${tag}`)));
+
+  it("demo: 'research Y' from WeChat runs in the background while chat continues; the result reaches the same chat once, through the outbox", async () => {
+    const host = app.agent.host("default");
+    const t = await research("SLOWY");
+    expect(t.stage.group).toBe("working");
+    expect(t.folder).toBe(`tasks/slowy-${t.id.slice(2, 8)}`);
+    // 任务在跑的时候聊天照常回答
+    await waitFor(() => calls.some((c) => c.task && c.users.some((u) => u.includes("RESEARCH SLOWY"))));
+    expect(stage("SLOWY")).toBe("working");
+    const t0 = Date.now();
+    ilink.push(OWNER, "PING during");
+    await waitFor(() => sentTo("PONG-during").length === 1);
+    expect(Date.now() - t0).toBeLessThan(10_000);
+    expect(stage("SLOWY")).toBe("working");
+    // 结果：一句话，经出站队列发回同一个微信会话，只发一次
+    await waitFor(() => sentTo("RESULT-SLOWY").length === 1);
+    await waitFor(() => stage("SLOWY") === "ready");
+    await new Promise((r) => setTimeout(r, 1500));
+    await app.outbox.idle();
+    expect(sentTo("RESULT-SLOWY")).toHaveLength(1);
+    const rows = app.store.listOutbox({ botId: "default", limit: 500 }).filter((r) => r.id.startsWith(`task:${t.id}:`));
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ status: "sent", channel: "weixin", peerId: OWNER });
+    expect(rows[0].id).toMatch(new RegExp(`^task:${t.id}:result:r_[0-9a-f]{12}$`));
+    // 任务在自己的文件夹里干活（在工作区里）
+    const notes = fs.readFileSync(path.join(host.workspace, t.folder, "notes.md"), "utf8");
+    expect(notes).toContain(path.join(host.workspace, t.folder));
+    expect(notes).toContain("found-SLOWY");
+    // 会话历史里有这句结果；聊天代理的下一条输入带着便条
+    expect(app.store.listMessages(CONV).map((m) => m.content)).toContain("RESULT-SLOWY：调研好了，结论在 notes.md。");
+    ilink.push(OWNER, "PING after");
+    await waitFor(() => sentTo("PONG-after").length === 1);
+    const after = calls.findLast((c) => !c.task && c.users.some((u) => u.includes("PING after")))!;
+    expect(after.users.at(-1)).toMatch(/^\[后台任务「调研 SLOWY」已完成，已把结果发给用户\] RESULT-SLOWY/);
+    // 一个 run，结果 done，有步骤；没有重启过代理进程
+    const d = await api(`/tasks/${t.id}`);
+    expect(d.runs.map((r: any) => [r.cause, r.state, r.outcome])).toEqual([["launch", "ended", "done"]]);
+    expect(d.runs[0].steps).toBeGreaterThan(2);
+    expect(d.task.stage).toMatchObject({ key: "ready", label: "已完成" });
+    expect(host.restarts).toBe(0);
+  }, 180_000);
+
+  it("pause switch: the chat agent pauses background work; a new task waits (chat still answers), /tasks says so; resuming starts it and its result arrives once", async () => {
+    ilink.push(OWNER, "PAUSEBG on");
+    await waitFor(() => sentTo("PAUSED-on").length === 1);
+    expect(app.store.getBot("default")!.settings.paused).toBe(true);
+    const t = await research("PAUSEQ");
+    await new Promise((r) => setTimeout(r, 1500));
+    expect(stage("PAUSEQ")).toBe("working/queued");
+    expect(calls.some((c) => c.task && c.users.some((u) => u.includes("RESEARCH PAUSEQ")))).toBe(false);
+    ilink.push(OWNER, "/tasks");
+    await waitFor(() => sentTo("后台任务：").some((s) => s.text.includes("调研 PAUSEQ · 排队中")));
+    expect(sentTo("后台任务：").at(-1)!.text).toMatch(/\n后台工作已暂停，跟我说一声就恢复。$/);
+    ilink.push(OWNER, "PAUSEBG off");
+    await waitFor(() => sentTo("PAUSED-off").length === 1);
+    await waitFor(() => sentTo("RESULT-PAUSEQ").length === 1);
+    await waitFor(() => stage("PAUSEQ") === "ready");
+    await app.outbox.idle();
+    expect(sentTo("RESULT-PAUSEQ")).toHaveLength(1);
+    expect((await api(`/tasks/${t.id}`)).runs.map((r: any) => [r.cause, r.outcome])).toEqual([["launch", "done"]]);
+  }, 180_000);
+
+  it("follow-ups reach the task directly: quoting its pushed result on WeChat resumes the same task without a chat turn", async () => {
+    const t = await research("FOLLOWQ");
+    await waitFor(() => sentTo("RESULT-FOLLOWQ").length === 1);
+    const result = sentTo("RESULT-FOLLOWQ")[0].text;
+    expect(result).toBe("RESULT-FOLLOWQ：调研好了，结论在 notes.md。引用这条消息可以继续问。");
+    await waitFor(() => stage("FOLLOWQ") === "ready");
+    const chats = calls.filter((c) => !c.task).length;
+    ilink.pushItems(OWNER, [{ type: 1, text_item: { text: "加上 H100" }, ref_msg: { title: "", message_item: { type: 1, text_item: { text: result } } } }]);
+    await waitFor(() => sentTo("收到，「调研 FOLLOWQ」继续。").length === 1);
+    await waitFor(() => sentTo("FOLLOWED-FOLLOWQ").length === 1);
+    expect(sentTo("FOLLOWED-FOLLOWQ")[0].text).toBe("FOLLOWED-FOLLOWQ：加上 H100。引用这条消息可以继续问。");
+    await waitFor(() => stage("FOLLOWQ") === "ready");
+    // 聊天代理没有被叫醒；同一个任务、同一个会话接着做
+    expect(calls.filter((c) => !c.task).length).toBe(chats);
+    expect((await api(`/tasks/${t.id}`)).runs.map((r: any) => [r.cause, r.outcome])).toEqual([
+      ["launch", "done"],
+      ["followup", "done"],
+    ]);
+  }, 180_000);
+
+  it("exit demo (3b): a task asks 「中文还是英文？」 on WeChat; a bare number answers it and the task continues; needs-you lists it on desktop and is empty after", async () => {
+    expect((await api("/attention")).items).toEqual([]);
+    const t = await research("ASKQ");
+    // 问题推到同一个微信会话：设计里的样式，只推一次
+    await waitFor(() => sentTo("❓「调研 ASKQ」").length === 1);
+    expect(sentTo("❓「调研 ASKQ」")[0].text).toBe("❓「调研 ASKQ」想问你：中文还是英文？\n1. 中文\n2. 英文\n（回复编号，或引用这条消息回答）");
+    await waitFor(() => stage("ASKQ") === "needs-you/answer");
+    // 桌面：「需要你」列出它，侧栏的件数是 1
+    const { items } = await api("/attention");
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({ kind: "question", botName: "小蓝", subject: "调研 ASKQ", status: "等你回答", line: "中文还是英文？", channel: "weixin", taskId: t.id, actions: ["answer"] });
+    expect(items[0].questions[0].options.map((o: any) => o.label)).toEqual(["中文", "英文"]);
+    expect((await api("/agent")).attention).toBe(1);
+    // 用户在微信里只回了一个编号：是回答，不进聊天
+    const chats = calls.filter((c) => !c.task).length;
+    ilink.push(OWNER, "1");
+    await waitFor(() => sentTo("收到，「调研 ASKQ」继续。").length === 1);
+    await waitFor(() => sentTo("ANSWERED-ASKQ").length === 1);
+    expect(sentTo("ANSWERED-ASKQ")[0].text).toBe("ANSWERED-ASKQ：用中文写好了。引用这条消息可以继续问。");
+    await waitFor(() => stage("ASKQ") === "ready");
+    expect(calls.slice(0).filter((c) => !c.task).length).toBe(chats);
+    // 回答作为任务的下一条输入，在同一个会话里接着做（人的唤醒：answer run）
+    const last = calls.filter((c) => c.task && c.users.some((u) => u.includes("RESEARCH ASKQ"))).at(-1)!;
+    expect(last.users).toContain("[用户回答了你的问题]\n问题：中文还是英文？\n回答：中文");
+    const d = await api(`/tasks/${t.id}`);
+    expect(d.runs.map((r: any) => [r.cause, r.outcome])).toEqual([
+      ["launch", "needs_you"],
+      ["answer", "done"],
+    ]);
+    // 回答之后「需要你」是空的；问题只推过一次
+    expect((await api("/attention")).items).toEqual([]);
+    expect((await api("/agent")).attention).toBe(0);
+    await app.outbox.idle();
+    expect(sentTo("❓「调研 ASKQ」")).toHaveLength(1);
+    expect(app.store.listApprovals({ taskId: t.id })[0]).toMatchObject({ status: "answered", blocking: false, conversationId: CONV });
+  }, 180_000);
+
+  it("answering by quote: a bare number after other chat is ordinary chat; quoting the question answers it", async () => {
+    const t = await research("ASKW");
+    await waitFor(() => sentTo("❓「调研 ASKW」").length === 1);
+    const asked = sentTo("❓「调研 ASKW」")[0].text;
+    // 中间聊了一句：机器人最后一条消息不再是提问
+    ilink.push(OWNER, "PING mid");
+    await waitFor(() => sentTo("PONG-mid").length === 1);
+    ilink.push(OWNER, "2");
+    await waitFor(() => calls.some((c) => !c.task && c.users.at(-1) === "2"));
+    expect(stage("ASKW")).toBe("needs-you/answer");
+    // 引用那条提问回答（自己写的回答）
+    ilink.pushItems(OWNER, [{ type: 1, text_item: { text: "英文" }, ref_msg: { title: "", message_item: { type: 1, text_item: { text: asked } } } }]);
+    await waitFor(() => sentTo("ANSWERED-ASKW").length === 1);
+    expect(sentTo("ANSWERED-ASKW")[0].text).toBe("ANSWERED-ASKW：用英文写好了。引用这条消息可以继续问。");
+    expect(sentTo("收到，「调研 ASKW」继续。")).toHaveLength(1);
+    await waitFor(() => stage("ASKW") === "ready");
+    expect(calls.some((c) => !c.task && c.users.some((u) => u.includes("英文") && u.includes(">")))).toBe(false);
+    expect((await api(`/tasks/${t.id}`)).runs.map((r: any) => r.cause)).toEqual(["launch", "answer"]);
+  }, 180_000);
+
+  it("a question with a default is pushed right away and the task keeps working; a bare number answers it and reaches the running turn", async () => {
+    const t = await research("ASKD1");
+    await waitFor(() => sentTo("❓「调研 ASKD1」").length === 1);
+    expect(sentTo("❓「调研 ASKD1」")[0].text).toBe("❓「调研 ASKD1」想问你：中文还是英文？\n1. 中文\n2. 英文\n不回复就按中文做\n（回复编号，或引用这条消息回答）");
+    // 推出去的时候任务还在跑（进行中，有个问题等你回答），「需要你」里有它和那一句
+    expect(stage("ASKD1")).toBe("working/asking");
+    const { items } = await api("/attention");
+    expect(items.map((x: any) => [x.kind, x.subject, x.status, x.line, x.note])).toEqual([["question", "调研 ASKD1", "等你回答", "中文还是英文？", "不回复就按中文做"]]);
+    const chats = calls.filter((c) => !c.task).length;
+    ilink.push(OWNER, "2");
+    await waitFor(() => sentTo("收到，「调研 ASKD1」继续。").length === 1);
+    await waitFor(() => sentTo("ANSWERED-ASKD1").length === 1);
+    expect(sentTo("ANSWERED-ASKD1")[0].text).toBe("ANSWERED-ASKD1：用英文写好了。引用这条消息可以继续问。");
+    await waitFor(() => stage("ASKD1") === "ready");
+    // 回答并进了在跑的那一轮：一个 run，不经聊天代理
+    expect((await api(`/tasks/${t.id}`)).runs.map((r: any) => [r.cause, r.outcome])).toEqual([["launch", "done"]]);
+    expect(calls.filter((c) => !c.task).length).toBe(chats);
+    expect((await api("/attention")).items).toEqual([]);
+  }, 180_000);
+
+  it("a task that finishes before the answer goes with the default and withdraws its question; quoting the question later resumes it", async () => {
+    const t = await research("ASKL1");
+    await waitFor(() => sentTo("❓「调研 ASKL1」").length === 1);
+    const asked = sentTo("❓「调研 ASKL1」")[0].text;
+    await waitFor(() => sentTo("DEFAULTED-ASKL1").length === 1);
+    await waitFor(() => stage("ASKL1") === "ready");
+    expect(sentTo("DEFAULTED-ASKL1")[0].text).toBe("DEFAULTED-ASKL1：按中文写好了，要英文的话引用这条说一声。引用这条消息可以继续问。");
+    // 提问撤回了：「需要你」是空的，审批中心里它作废了
+    expect((await api("/attention")).items).toEqual([]);
+    expect(app.store.listApprovals({ taskId: t.id })[0]).toMatchObject({ status: "cancelled", decidedBy: "default" });
+    // 引用那条提问回答：交给任务，同一个任务接着做
+    ilink.pushItems(OWNER, [{ type: 1, text_item: { text: "2" }, ref_msg: { title: "", message_item: { type: 1, text_item: { text: asked } } } }]);
+    await waitFor(() => sentTo("收到，「调研 ASKL1」继续。").length === 1);
+    await waitFor(() => sentTo("ANSWERED-ASKL1").length === 1);
+    expect(sentTo("ANSWERED-ASKL1")[0].text).toBe("ANSWERED-ASKL1：用英文写好了。引用这条消息可以继续问。");
+    await waitFor(() => stage("ASKL1") === "ready");
+    expect((await api(`/tasks/${t.id}`)).runs.map((r: any) => [r.cause, r.outcome])).toEqual([
+      ["launch", "done"],
+      ["answer", "done"],
+    ]);
+    // 撤回之后光回编号是普通聊天（聊天的输入前面带着任务的便条）
+    ilink.push(OWNER, "1");
+    await waitFor(() => calls.some((c) => !c.task && /(^|\n)1$/.test(c.users.at(-1) ?? "")));
+    expect(app.store.listApprovals({ taskId: t.id }).map((a) => a.status)).toEqual(["cancelled"]);
+  }, 180_000);
+
+  it("an approval from a task session lands on the task's WeChat chat, named after the task; 'y CODE' lets the task continue", async () => {
+    const t = await research("APPR1");
+    await waitFor(() => sentTo("需批准（任务「调研 APPR1」）").length === 1);
+    const row = app.store.listApprovals({ status: "pending", taskId: t.id })[0];
+    expect(row).toMatchObject({ kind: "approval", blocking: true, conversationId: CONV, tool: "bash", detail: "echo appr-$((40+2))" });
+    expect(row.expiresAt - row.createdAt).toBe(12 * 3600_000);
+    expect(sentTo("需批准（任务「调研 APPR1」）")[0].text).toBe(`需批准（任务「调研 APPR1」）：\`echo appr-$((40+2))\` — 回复 y ${row.code} / n ${row.code}`);
+    expect(stage("APPR1")).toBe("needs-you/approval");
+    expect((await api("/attention")).items.map((x: any) => [x.kind, x.subject, x.status, x.line])).toEqual([["approval", "调研 APPR1", "等你批准", "echo appr-$((40+2))"]]);
+    ilink.push(OWNER, `y ${row.code}`);
+    await waitFor(() => sentTo(`✅ 已批准 ${row.code}`).length === 1);
+    await waitFor(() => sentTo("APPROVED-APPR1").length === 1);
+    expect(sentTo("APPROVED-APPR1")[0].text).toBe("APPROVED-APPR1<<ran>>。引用这条消息可以继续问。");
+    await waitFor(() => stage("APPR1") === "ready");
+    expect((await api("/attention")).items).toEqual([]);
+  }, 180_000);
+
+  it("exit demo (3e): a task stops at its $1 budget and asks 「再给 $1 继续？」 on WeChat and in needs-you; continuing from the desktop finishes it in the same session", async () => {
+    expect((await api("/attention")).items).toEqual([]);
+    const t = await research("BUDGETQ");
+    const taskCalls = () => calls.filter((c) => c.task && c.users.some((u) => u.includes("RESEARCH BUDGETQ"))).length;
+    await waitFor(() => stage("BUDGETQ") === "needs-you/budget");
+    // 4 次 $0.25 的请求之后停下：这一轮被取消，模型不再被调用（取消到达之前已经发出的那一次也记上）
+    const n = taskCalls();
+    await new Promise((r) => setTimeout(r, 2000));
+    expect(taskCalls()).toBe(n);
+    expect(n).toBeLessThanOrEqual(5);
+    // 每次还有 5 个输出 tokens（$0.00002）；第 5 次请求可能在取消到达之前就回来了：那就是 $1.25
+    const spent = app.store.getTask(t.id)!.spentUsd;
+    expect([1, 1.25].some((v) => Math.abs(spent - v) < 0.001), `spent ${spent}`).toBe(true);
+    // 微信里问一次，设计里的样子
+    await waitFor(() => sentTo("❓「调研 BUDGETQ」").length === 1);
+    expect(sentTo("❓「调研 BUDGETQ」")[0].text).toBe("❓「调研 BUDGETQ」想问你：已用约 $1.00，再给 $1 继续？\n1. 继续\n2. 停止\n（回复编号，或引用这条消息回答）");
+    // 桌面：「需要你」一行，状态是预算用完；任务详情里有花费
+    const { items } = await api("/attention");
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({ kind: "question", subject: "调研 BUDGETQ", status: "预算用完", line: "已用约 $1.00，再给 $1 继续？", taskId: t.id, actions: ["answer"] });
+    expect(items[0].questions[0].options.map((o: any) => o.label)).toEqual(["继续", "停止"]);
+    const d0 = await api(`/tasks/${t.id}`);
+    expect(d0.task).toMatchObject({ budgetUsd: 1, stage: { key: "needs-you/budget", label: "预算用完" } });
+    expect(d0.runs.map((r: any) => [r.cause, r.outcome])).toEqual([["launch", "budget"]]);
+    expect(d0.runs[0].costUsd).toBeCloseTo(spent, 6);
+    // 在「需要你」里点「继续」：预算加 $1，同一个会话接着做完，结果发回微信
+    const r = await api(`/attention/${encodeURIComponent(items[0].id)}/answer`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: "1" }) });
+    expect(r.ok).toBe(true);
+    await waitFor(() => sentTo("BUDGET-DONE-BUDGETQ").length === 1);
+    await waitFor(() => stage("BUDGETQ") === "ready");
+    const d = await api(`/tasks/${t.id}`);
+    expect(d.task.budgetUsd).toBe(2);
+    expect(d.task.spentUsd).toBeGreaterThan(spent);
+    expect(d.task.spentUsd).toBeLessThan(spent + 0.01);
+    expect(d.runs.map((x: any) => [x.cause, x.outcome])).toEqual([
+      ["launch", "budget"],
+      ["continue", "done"],
+    ]);
+    const last = calls.filter((c) => c.task && c.users.some((u) => u.includes("RESEARCH BUDGETQ"))).at(-1)!;
+    expect(last.users.filter((u) => /^This task was stopped when it used its budget/.test(u))).toHaveLength(1);
+    expect(last.users.filter((u) => u.includes("[用户的原话]\nRESEARCH BUDGETQ"))).toHaveLength(1);
+    expect((await api("/attention")).items).toEqual([]);
+    await app.outbox.idle();
+    expect(sentTo("❓「调研 BUDGETQ」")).toHaveLength(1);
+  }, 180_000);
+
+  it("each session kind gets its own tools: tasks report and never present, ask or start tasks; chats start tasks but cannot report", async () => {
+    ilink.push(OWNER, "LISTTOOLS");
+    await waitFor(() => sentTo("CHATTOOLS<<").length === 1);
+    const chatTools = /CHATTOOLS<<(.*)>>/.exec(sentTo("CHATTOOLS<<")[0].text)![1].split(",");
+    expect(chatTools).toEqual(expect.arrayContaining(["task_start", "task_message", "task_list", "present", "ask_user_question"]));
+    expect(chatTools).not.toContain("task_report");
+    await research("TOOLS1");
+    await waitFor(() => stage("TOOLS1") === "ready");
+    const taskTools = calls.find((c) => c.task && c.users.some((u) => u.includes("RESEARCH TOOLS1")))!.tools;
+    expect(taskTools).toContain("task_report");
+    for (const t of ["present", "ask_user_question", "task_start", "task_message", "task_list"]) expect(taskTools).not.toContain(t);
+  }, 120_000);
+
+  it("a turn that ends without task_report gets one nudge; a background job keeps the run settling until it ends", async () => {
+    await research("QUIET1");
+    await waitFor(() => sentTo("NUDGED-QUIET1").length === 1);
+    expect(stage("QUIET1")).toBe("ready");
+    const nudges = calls.filter((c) => c.task && c.users.some((u) => u.includes("RESEARCH QUIET1"))).at(-1)!.users.filter((u) => /^Report this task's state/.test(u));
+    expect(nudges).toHaveLength(1);
+    // 后台命令：这一轮没报告就结束了，但命令还在跑——run 收尾中（仍占名额），命令结束唤醒代理，它报告完才结束
+    const t = await research("BG1");
+    await waitFor(async () => (await api(`/tasks/${t.id}`)).runs[0]?.state === "settling", 30_000);
+    expect(stage("BG1")).toBe("working");
+    await waitFor(() => sentTo("BGRESULT-BG1").length === 1);
+    expect(stage("BG1")).toBe("ready");
+    expect(calls.filter((c) => c.task && c.users.some((u) => u.includes("RESEARCH BG1"))).at(-1)!.users.some((u) => /^Report this task's state/.test(u))).toBe(false);
+  }, 120_000);
+
+  it("the human lane: a chat message never waits behind 2 running tasks; a third task waits for a slot", async () => {
+    const a = await research("HANGA");
+    const b = await research("HANGB");
+    await waitFor(() => hanging("HANGA") && hanging("HANGB"));
+    expect([stage("HANGA"), stage("HANGB")]).toEqual(["working", "working"]);
+    const c = await research("HANGC");
+    expect(stage("HANGC")).toBe("working/queued");
+    expect(hanging("HANGC")).toBe(false);
+    const t0 = Date.now();
+    ilink.push(OWNER, "PING lane");
+    await waitFor(() => sentTo("PONG-lane").length === 1);
+    expect(Date.now() - t0).toBeLessThan(5_000);
+    expect([stage("HANGA"), stage("HANGB"), stage("HANGC")]).toEqual(["working", "working", "working/queued"]);
+    // 停掉一个，排队的那个接上
+    expect(await app.tasks.stopTask(a.id, "test")).toBe(true);
+    await waitFor(() => hanging("HANGC"));
+    expect(stage("HANGC")).toBe("working");
+    await app.tasks.stopTask(b.id, "test");
+    await app.tasks.stopTask(c.id, "test");
+  }, 180_000);
+
+  it("/stop <n> from WeChat and the UI stop button stop one task; chat and the agent process carry on", async () => {
+    const host = app.agent.host("default");
+    const pid = host.pid;
+    await research("HANGS1");
+    await waitFor(() => hanging("HANGS1"));
+    // /tasks 列出编号；/stop 1 停掉它（插队，不进会话队列）
+    const listed = sentTo("后台任务：").length;
+    ilink.push(OWNER, "/tasks");
+    await waitFor(() => sentTo("后台任务：").length > listed);
+    expect(sentTo("后台任务：").at(-1)!.text).toMatch(/^后台任务：\n1\. 调研 HANGS1 · 进行中/);
+    ilink.push(OWNER, "/stop 1");
+    await waitFor(() => sentTo("已停止后台任务「调研 HANGS1」").length === 1);
+    await waitFor(() => stage("HANGS1") === "stopped");
+    ilink.push(OWNER, "PING stopped1");
+    await waitFor(() => sentTo("PONG-stopped1").length === 1);
+    // 界面的停止
+    const t2 = await research("HANGS2");
+    await waitFor(() => hanging("HANGS2"));
+    const r = await api(`/tasks/${t2.id}/stop`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+    expect(r.task.stage.key).toBe("stopped");
+    ilink.push(OWNER, "PING stopped2");
+    await waitFor(() => sentTo("PONG-stopped2").length === 1);
+    // 停掉的任务不发任何东西；代理进程没重启
+    await new Promise((r) => setTimeout(r, 1000));
+    expect(ilink.state.sent.filter((s) => /HANGS[12]/.test(s.text) && !/已停止|ACK-/.test(s.text))).toEqual([]);
+    expect(host.pid).toBe(pid);
+    expect(host.state).toBe("running");
+  }, 180_000);
+
+  it("an app restart mid-task: the task resumes with the recovery note (once), and its result still arrives once", async () => {
+    const t = await research("HANGR");
+    await waitFor(() => hanging("HANGR"));
+    const sessionId = app.store.getTask(t.id)!.sessionId;
+    // 应用退出：跑着的 run 留在库里
+    await app.stop();
+    for (const r of hung.splice(0)) r.destroy();
+    // 重新启动（同一个数据目录）：run 记为中断，排恢复；恢复说明是新 run 的第一条输入
+    app = makeApp();
+    await app.start();
+    base = app.web!.url.replace(/\/+$/, "");
+    await waitFor(() => sentTo("RECOVERED-HANGR").length === 1, 90_000);
+    await waitFor(() => stage("HANGR") === "ready");
+    const d = await api(`/tasks/${t.id}`);
+    expect(d.runs.map((r: any) => [r.cause, r.outcome])).toEqual([
+      ["launch", "interrupted"],
+      ["recover", "done"],
+    ]);
+    // 同一个会话恢复过来（历史里还有原来的任务说明），恢复说明只交了一次
+    expect(app.store.getTask(t.id)!.sessionId).toBe(sessionId);
+    const last = calls.filter((c) => c.task && c.users.some((u) => u.includes("RESEARCH HANGR"))).at(-1)!;
+    expect(last.users.filter((u) => /The app restarted while you were working/.test(u))).toHaveLength(1);
+    expect(last.users.filter((u) => u.includes("[用户的原话]\nRESEARCH HANGR"))).toHaveLength(1);
+    await new Promise((r) => setTimeout(r, 1500));
+    await app.outbox.idle();
+    expect(sentTo("RECOVERED-HANGR")).toHaveLength(1);
+    expect(app.store.listOutbox({ botId: "default", limit: 500 }).filter((r) => r.id.startsWith(`task:${t.id}:`))).toHaveLength(1);
+    // 重启前的任务结果没有被重发
+    expect(sentTo("RESULT-SLOWY")).toHaveLength(1);
+  }, 240_000);
+});

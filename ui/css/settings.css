@@ -1,0 +1,224 @@
+/* 设置页与机器人设置（参考 Codex / macOS 系统设置）：大标题，分组标题是正文色的小标题，每组是一块 --well（底色深一级、
+   不描边），一行一项、行间一条细线，开关用 Switch。
+   设置分页在侧栏（shell.css 的 .side-nav）。 */
+@layer app {
+/* 内容列居中、最宽 --page-w，两侧至少 --page-gutter（和对话列同一条规则） */
+.settings { --page-px: max(var(--page-gutter), calc((100% - var(--page-w)) / 2)); flex: 1; min-height: 0; overflow-y: auto; }
+.set-head {
+  display: flex; align-items: center; gap: var(--space-3);
+  padding: var(--page-top) var(--page-px) var(--space-2);
+  -webkit-app-region: drag;
+}
+.set-head > * { -webkit-app-region: no-drag; }
+.set-title { font-size: var(--fs-4xl); font-weight: var(--fw-semibold); letter-spacing: var(--tracking-tighter); line-height: var(--lh-tight); }
+.set-titles { min-width: 0; display: grid; gap: var(--space-0-5); }
+.set-titles .set-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.set-sub { font-size: var(--fs-md); color: var(--muted); }
+/* 返回钮往左探出，箭头的笔画落在内容列的左边上（和分组标题、标签、卡片同一条线） */
+.set-back { --ib-size: var(--ctl-lg); --ib-r: var(--r-full); --ib-fg: var(--ctl-fg); margin-left: calc(-1 * var(--space-2-5)); }
+.set-body { padding: var(--space-2) var(--page-px) var(--page-bottom); }
+
+/* 分组标题与卡片：标题、输入框标签、卡片共用内容列的左边 */
+.settings .list-head { margin: var(--section-gap) 0 var(--heading-gap); font-size: var(--fs-lg); font-weight: var(--fw-semibold); color: var(--fg); }
+.settings .list-head:first-child { margin-top: var(--space-6); }
+.settings .list + .list { margin-top: var(--space-3); }
+/* 分组下方的风险提示（完全权限）：紧跟在组的下面，不放进组里 */
+.settings .list + .notice { margin-top: var(--space-2); align-items: flex-start; padding: var(--space-3); }
+.settings .list + .notice > .ic { margin-top: 3px; }   /* 微调：图标对齐第一行文字（14px 图标 / 约 20px 行高） */
+/* 行：上下 10，一行的行和"名称 + 说明"两行的行都是 60 高（14 × 1.4 + 2 + 12.5 × 1.4 + 20 ≈ 59）。
+   名称用常规字重、说明用 --muted：一页十几行时不发闷，层次交给分组标题的字重和说明的颜色 */
+.settings .row { --row-h: 60px; --row-py: var(--space-2-5); --row-pl: var(--space-4); --row-pr: var(--space-4); --row-gap: var(--space-4); }
+.settings .row .name { font-size: var(--fs-lg); font-weight: var(--fw-regular); line-height: var(--lh-snug); }
+.settings .row .sub { font-size: var(--fs-sm); line-height: var(--lh-snug); max-width: 460px; white-space: normal; }
+.settings .pick { height: var(--ctl-md); padding: 0 var(--space-2) 0 var(--space-3); border-radius: var(--r-lg); }
+.settings .seg { --seg-r: var(--r-lg); }
+.settings .seg button { height: var(--ctl-sm); }
+.set-part { margin: var(--section-gap) 0 var(--heading-gap); font-size: var(--fs-lg); font-weight: var(--fw-semibold); }
+.set-part:first-child { margin-top: var(--space-6); }
+.set-body > .list:first-child { margin-top: var(--space-6); }
+.set-none { margin: var(--section-gap) 0; font-size: var(--fs-md); color: var(--muted); }
+.mf-state { display: inline-flex; align-items: center; gap: var(--space-1-5); font-size: var(--fs-sm); color: var(--fg-2); }
+.balance { font-size: var(--fs-lg); font-weight: var(--fw-semibold); font-variant-numeric: tabular-nums; }
+.balance.low { color: var(--red); }
+/* 免打扰的起止：两个整点选择 + 中间一条短横，开关和它们隔开一点 */
+.settings .row .range-dash { color: var(--muted); font-variant-numeric: tabular-nums; }
+.settings .row .ctl .pick ~ .switch { margin-left: var(--space-2); }
+.settings input.field.num-in { width: 96px; --field-h: var(--ctl-md); text-align: right; font-variant-numeric: tabular-nums; }
+.settings input.field.font-in { width: min(220px, 36vw); --field-h: var(--ctl-md); }
+.settings input.field.key-in { width: min(220px, 36vw); --field-h: var(--ctl-md); }
+
+/* 外观预览（设置 › 外观顶部）：一组 --well，里面一问一答 + 一行代码，用对话页同样的字号与字体 token，
+   跟着字体大小、界面字体、代码字体和代码换行实时变 */
+.ap-preview {
+  display: grid; gap: var(--space-3); margin-top: var(--space-6); padding: var(--card-pad);
+  background: var(--well); border-radius: var(--r-well);
+}
+.set-body > .ap-preview + .list { margin-top: var(--space-3); }
+.ap-bubble {
+  justify-self: end; max-width: 80%; padding: var(--space-2-5) var(--space-4); border-radius: var(--r-bubble);
+  background: var(--bubble-user); font-size: var(--fs-xl); line-height: var(--lh-relaxed);
+}
+.ap-reply { font-size: var(--fs-xl); line-height: var(--lh-relaxed); }
+.ap-reply b { font-weight: var(--fw-semibold); }
+.ap-code {
+  margin: 0; font: var(--fs-sm)/var(--lh-relaxed) var(--code); color: var(--fg-2);
+  white-space: var(--code-wrap); overflow-wrap: anywhere; overflow-x: auto;
+}
+
+/* 用量：近 N 天的日柱状图 + 模型排行 */
+.usage-days { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); align-items: end; gap: var(--space-1); height: 120px; padding: var(--space-2) 0; }
+.usage-days .bar { display: grid; align-content: end; justify-items: center; gap: var(--space-1); height: 100%; font-size: var(--fs-2xs); color: var(--muted); }
+.usage-days .bar i {
+  display: block; width: 100%; min-height: 2px; border-radius: var(--r-sm) var(--r-sm) 0 0; background: var(--accent-solid);
+  box-shadow: inset 0 0 0 var(--hairline) var(--accent-line);   /* 描边：黄绿柱子在白底上只有 1.15:1，要一道细边才看得出高度（同应用标志） */
+}
+.usage-models { display: grid; gap: var(--space-1); font-size: var(--fs-sm); }
+.usage-models div { display: flex; justify-content: space-between; gap: var(--space-3); }
+.usage-models .v { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.usage-models .n { color: var(--muted); font-variant-numeric: tabular-nums; }
+.notif { display: grid; gap: var(--space-1); padding: var(--space-3) 0; border-bottom: 1px solid var(--line-2); }
+.notif:last-child { border-bottom: 0; }
+.notif b { font-weight: var(--fw-semibold); }
+/* 未读点用 --accent（浅色墨、深色黄绿）：6px 的黄绿点在浅色玻璃上几乎看不见 */
+.notif.unread b::before { content: ""; display: inline-block; width: 6px; height: 6px; margin-right: var(--space-1-5); border-radius: 50%; background: var(--accent); vertical-align: middle; }
+.notif p { font-size: var(--fs-sm); color: var(--fg-2); white-space: pre-wrap; }
+.notif time { font-size: var(--fs-2xs); color: var(--muted); }
+
+/* 需要你（screens/needs-you.js）：和设置页同一种页面；一组 .list，一件事一块，块间一条细线。
+   左边一列是状态点，右边一列从上到下：一句话说谁的什么怎么了（可点：展开任务详情）、问题或命令、行内操作 */
+.needs-list .need {
+  display: grid; grid-template-columns: auto minmax(0, 1fr); column-gap: var(--space-2-5); row-gap: var(--space-2);
+  padding: var(--space-3-5) var(--space-4);
+}
+.needs-list .need + .need { border-top: 1px solid var(--line-2); }
+.need > .dot { grid-row: 1; align-self: center; }
+.need > :not(.dot) { grid-column: 2; }
+.need-head { display: flex; align-items: center; gap: var(--space-2); min-width: 0; text-align: left; font-size: var(--fs-sm); color: var(--fg-2); }
+button.need-head { --focus-offset: 2px; border-radius: var(--r-sm); transition: color var(--t-fast); }
+button.need-head:hover, button.need-head:hover .need-who b { color: var(--fg); }
+.need-who { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.need-who b { font-weight: var(--fw-semibold); color: var(--fg); }
+.need-when { flex: none; font-size: var(--fs-xs); color: var(--muted); }
+.need-head .chev { flex: none; color: var(--muted); transition: transform var(--t-fast); }
+.need.open .need-head .chev { transform: rotate(90deg); }
+.need-line { font-size: var(--fs-lg); font-weight: var(--fw-medium); color: var(--fg); line-height: var(--lh-snug); overflow-wrap: anywhere; }
+.need-line.mono { font-family: var(--code); font-size: var(--fs-sm); font-weight: var(--fw-regular); }
+/* 有默认回答的提问：不回复会怎样，贴着问题 */
+.need-note { margin-top: calc(-1 * var(--space-1)); font-size: var(--fs-sm); color: var(--fg-2); }
+.need-actions { display: flex; align-items: center; gap: var(--ctl-gap); flex-wrap: wrap; }
+.need-actions:empty { display: none; }
+.need-reply { display: flex; align-items: center; gap: var(--ctl-gap); }
+.need-reply .field { flex: 1; --field-h: var(--ctl-md); }
+.need-detail .task-detail, .need-detail .rule-detail { margin-top: var(--space-1); }
+
+/* 故障排查（screens/troubleshoot.js）：状态和检测结果是普通的行；stderr 尾部是组里展开的一块（不再套底）；
+   日志是自己的一块 --well（和代码块同一种面），不描边 */
+.ts-state { display: inline-flex; align-items: center; gap: var(--space-1-5); font-size: var(--fs-sm); color: var(--fg-2); white-space: nowrap; }
+.ts-mono { font-family: var(--code); font-size: var(--fs-xs); user-select: text; -webkit-user-select: text; }
+.settings .row .sub.ts-mono { max-width: none; word-break: break-all; display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; }
+.ts-tail pre { margin: 0; white-space: pre-wrap; word-break: break-all; line-height: var(--lh-normal); color: var(--fg-2); max-height: 200px; overflow: auto; }
+.ts-log-head { display: flex; align-items: center; gap: var(--space-2); }
+.ts-log-head .t-meta { font-weight: var(--fw-regular); }
+.ts-log-head .grow { flex: 1; }
+.ts-log-head .text { display: inline-flex; align-items: center; gap: var(--space-1); font-weight: var(--fw-regular); }
+.ts-log {
+  margin: 0; padding: var(--card-pad); border-radius: var(--r-well); background: var(--well);
+  font: var(--fs-xs)/var(--lh-normal) var(--code); color: var(--fg-2);
+  white-space: pre-wrap; word-break: break-all; max-height: 420px; overflow: auto;
+  user-select: text; -webkit-user-select: text;
+}
+.ts-note { margin-top: var(--space-2); font-size: var(--fs-xs); color: var(--muted); line-height: var(--lh-normal); }
+
+/* 机器人设置：身份是带标签的输入框（参考 Codex 的编辑页） */
+.set-field { display: grid; gap: var(--space-2); margin-bottom: var(--space-5); }
+.set-field .k { display: flex; align-items: baseline; gap: var(--space-2); font-size: var(--fs-md); font-weight: var(--fw-medium); color: var(--fg-2); }
+.set-field .k .hint { font-weight: var(--fw-regular); }
+.set-field .field { --field-h: var(--ctl-xl); --field-px: var(--space-3); --field-r: var(--r-lg); font-size: var(--fs-lg); }
+.set-field textarea.field { min-height: 120px; padding: var(--space-2-5) var(--field-px); line-height: var(--lh-relaxed); }
+
+/* 新建机器人（参考 Grok Bot 的创建页）：居中的表单，下面是模板卡片 */
+.new-bot { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.new-bot .head-bot.static:hover { background: none; }
+.new-body { flex: 1; min-height: 0; overflow-y: auto; display: grid; justify-items: center; align-content: start; gap: var(--space-12); padding: var(--page-top) var(--page-gutter) var(--page-bottom); }
+.new-form { width: min(460px, 100%); display: grid; justify-items: center; }
+.new-title { margin-top: var(--space-4); font-size: var(--fs-4xl); font-weight: var(--fw-semibold); letter-spacing: var(--tracking-tighter); line-height: var(--lh-tight); text-align: center; }
+.new-lead { margin: var(--space-2) 0 var(--space-6); font-size: var(--fs-md); color: var(--muted); line-height: var(--lh-relaxed); text-align: center; }
+.new-form .set-field { width: 100%; }
+.new-form .btn { min-width: 140px; }
+.new-sugg { width: min(720px, 100%); }
+.new-sugg .list-head { margin: 0 0 var(--heading-gap); font-size: var(--fs-lg); font-weight: var(--fw-semibold); color: var(--fg); }
+.tpl-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(216px, 1fr)); gap: var(--space-3); }
+/* 模板卡：一块 --well，不描边、不浮起。悬停底色深一级，按下再深一级并轻微缩小；
+   选中是一层黄绿 + 图标亮成黄绿片（图标平时只是一个字形，不套底） */
+.tpl {
+  display: grid; grid-template-columns: auto minmax(0, 1fr); column-gap: var(--space-3); row-gap: var(--space-0-5); align-content: start;
+  padding: var(--card-pad); border-radius: var(--r-well); text-align: left;
+  background: var(--well);
+  transition: background var(--t-fast), transform var(--t-fast);
+}
+.tpl:hover { background: var(--well-hover); }
+.tpl:active { background: var(--well-press); transform: scale(var(--press)); }
+.tpl.on, .tpl.on:hover { background: var(--accent-wash); }
+.tpl-ic {
+  grid-row: span 2; width: var(--ctl-xl); height: var(--ctl-xl); border-radius: var(--r-lg); display: grid; place-items: center; color: var(--fg-2);
+  transition: background var(--t-base), color var(--t-base);
+}
+.tpl:hover .tpl-ic { color: var(--fg); }
+.tpl.on .tpl-ic { background: var(--accent-solid); color: var(--on-accent); box-shadow: inset 0 0 0 var(--hairline) var(--accent-line); }   /* 描边：黄绿在白底上只有 1.15:1，要一道墨色细边 */
+.tpl-name { font-size: var(--fs-lg); font-weight: var(--fw-medium); line-height: var(--lh-snug); }
+.tpl-desc { font-size: var(--fs-sm); color: var(--muted); line-height: var(--lh-snug); }
+
+/* onboarding */
+.onboard {
+  flex: 1; min-height: 0; height: 100vh; overflow-y: auto;
+  display: grid; justify-items: center; align-content: center; padding: var(--page-top) var(--page-gutter);
+  -webkit-app-region: drag;
+}
+.onboard > * { -webkit-app-region: no-drag; }
+.onboard-col { width: min(400px, 100%); display: grid; gap: var(--space-3-5); --rise: 4px; animation: rise-in var(--dur-moderate) var(--ease-out); }
+.onboard-hero { display: grid; justify-items: center; gap: var(--space-2-5); text-align: center; margin-bottom: var(--space-1-5); }
+.onboard-hero h1 { font-size: var(--fs-3xl); font-weight: var(--fw-semibold); letter-spacing: var(--tracking-tighter); }
+.onboard-hero p { font-size: var(--fs-md); color: var(--muted); line-height: var(--lh-relaxed); }
+/* 引导页的卡片是浮在环境光上的一块玻璃，和对话框同一种面（同一个圆角、同一种材质） */
+.onboard .list {
+  padding: var(--card-pad); display: grid; gap: var(--space-2-5); border-radius: var(--r-pane);
+  background: var(--grain), var(--glass-sheet); box-shadow: var(--shadow-pop);
+}
+/* 同一个表单（onboarding.js 的 KeyForm）在"更换密钥"对话框里：对话框本身就是那张卡，表单直接排在对话框的内边距里，不再套一层 */
+.sheet > form.list { padding: 0; background: none; border-radius: 0; overflow: visible; display: grid; gap: var(--space-2-5); }
+.onboard label.k { font-size: var(--fs-sm); font-weight: var(--fw-medium); color: var(--fg-2); }
+.onboard .err-text { font-size: var(--fs-sm); color: var(--red); line-height: var(--lh-normal); display: flex; gap: var(--space-2); align-items: center; flex-wrap: wrap; }
+.onboard .slow { font-size: var(--fs-sm); color: var(--muted); }
+.onboard .links { display: grid; gap: var(--space-2); justify-items: center; font-size: var(--fs-sm); color: var(--muted); }
+.onboard details { width: 100%; }
+.onboard details summary { list-style: none; cursor: default; display: flex; justify-content: center; align-items: center; gap: var(--space-1); font-size: var(--fs-sm); color: var(--muted); }
+.onboard details summary::-webkit-details-marker { display: none; }
+.onboard details summary .ic { transition: transform var(--t-base); }
+.onboard details[open] summary .ic { transform: rotate(180deg); }
+.onboard details summary { transition: color var(--t-fast); }
+.onboard details summary:hover { color: var(--fg); }
+/* "高级"里的行直接排在卡片里，左右贴着卡片的内容边，不再套一块玻璃 */
+.onboard details .row { --row-pl: 0; --row-pr: 0; margin-top: var(--space-1); }
+.onboard .media-pick { display: grid; gap: var(--space-1); }
+.onboard .media-pick .row { --row-pl: 0; --row-pr: 0; }
+.onboard .connected { display: flex; align-items: center; gap: var(--space-2); font-size: var(--fs-lg); font-weight: var(--fw-semibold); }
+.login-cta { display: grid; gap: var(--space-2-5); }
+.login-wait { display: flex; align-items: center; justify-content: center; gap: var(--space-2); font-size: var(--fs-md); color: var(--fg-2); }
+.login-links { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: var(--space-3); font-size: var(--fs-sm); }
+.picklist { max-height: 300px; overflow-y: auto; margin: 0 calc(-1 * var(--space-1-5)); padding: 0 var(--space-1-5); }
+.picklist > .hint { padding: var(--space-2); }
+.picklist .group { padding: var(--space-2) var(--space-2) var(--space-1); font-size: var(--fs-2xs); font-weight: var(--fw-semibold); color: var(--muted); }
+.picklist button {
+  --focus-offset: -2px;
+  display: flex; align-items: center; width: 100%; height: var(--ctl-lg); padding: 0 var(--space-2); border-radius: var(--r-md);
+  font-size: var(--fs-sm); text-align: left; gap: var(--space-2); transition: background var(--t-fast);
+}
+.picklist button:hover { background: var(--sel); }
+.picklist button:active { background: var(--sel-press); }
+.picklist button.cur { background: var(--sel); font-weight: var(--fw-medium); }
+.picklist button .v { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.picklist button .check { color: var(--accent); }
+
+/* 头像角色（components/avatar.js 的 AvatarPicker）：新建页在介绍语下面一排，机器人设置里是"身份"的第一项 */
+.new-form .avatar-picker { justify-content: center; margin: calc(var(--space-2) * -1) 0 var(--space-6); }
+}
