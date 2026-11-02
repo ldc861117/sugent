@@ -142,7 +142,9 @@ export class MagpieSupervisor {
       XDG_CACHE_HOME: path.join(home, ".cache"),
       APPDATA: path.join(home, "AppData", "Roaming"),
       LOCALAPPDATA: path.join(home, "AppData", "Local"),
-      MAGPIE_NO_ACCOUNTS: "1",
+      ...(process.env.SUGENT_UNLOCK_SUBSCRIPTIONS === "1" || process.env.SUGENT_UNLOCK_SUBSCRIPTIONS === "true"
+        ? {}
+        : { MAGPIE_NO_ACCOUNTS: "1" }),
       MAGPIE_NO_STATS: "1",
       MAGPIE_NO_HANDOVER: "1",
       DO_NOT_TRACK: "1",
@@ -157,7 +159,7 @@ export class MagpieSupervisor {
     const cfgDir = path.join(this.root, "config", "magpie");
     fs.mkdirSync(home, { recursive: true });
     fs.mkdirSync(cfgDir, { recursive: true, mode: 0o700 });
-    // 预写设置：关闭自动更新与账户（订阅凭据）发现；保留 magpie 写入的其它字段
+    // 预写设置：关闭自动更新与账户（订阅凭据）发现（除非通过 SUGENT_UNLOCK_SUBSCRIPTIONS=1 显式解锁）；保留 magpie 写入的其它字段
     const settingsPath = path.join(cfgDir, "settings.json");
     let settings: Record<string, unknown> = {};
     try {
@@ -166,7 +168,9 @@ export class MagpieSupervisor {
       /* new */
     }
     settings.noAutoUpdate = true;
-    settings.noAccountDiscovery = true;
+    settings.noAccountDiscovery = !(
+      process.env.SUGENT_UNLOCK_SUBSCRIPTIONS === "1" || process.env.SUGENT_UNLOCK_SUBSCRIPTIONS === "true"
+    );
     fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2), { mode: 0o600 });
 
     const keysPath = path.join(this.root, "keys.json");
