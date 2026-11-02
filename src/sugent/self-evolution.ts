@@ -1,11 +1,15 @@
 /**
  * Sugent 自我迭代与代码自治引擎 (src/sugent/self-evolution.ts)
  *
- * 解决"智能体自己修改自己代码（Self-Hosting / Brain-Surgery）"的四大工程难题：
- * 1. 自动相对路径解析 (Relative Root Resolution)：无需用户手动查找目录，自动通过当前运行模块相对定位项目根目录（`./`）或应用数据目录下的受管仓库；
- * 2. 核心底线围栏 (Immutable Guardrails)：区分可自主演进目录与必须人类审批的底线文件；
- * 3. 强制回归门禁 (Verification Gate)：未通过 `npm run verify:sugent` 严禁提交或覆盖主分支；
- * 4. 固化自演进技能 (Self-Dev SKILL.md)：当用户一键打开 `selfEvolution.enabled` 开关时，自动将工作区与技能挂载到自身仓库。
+ * 同时支持「开发者源码态」与「普通用户打包安装态 (.app / .exe)」的双模自演进架构：
+ *
+ * 1. 开发者源码态（本地有完整 Git 仓库）：
+ *    - 自动通过相对路径绑定项目根目录（`./`），支持修改 `src/sugent/`、`ui/`、`skills/` 并执行 `npm run verify:sugent` 编译与 Git 推送。
+ * 2. 普通用户安装包态（只读 `app.asar` 黄金镜像 + 可写 `<dataDir>/self-repo` 热覆盖层 OverlayFS）：
+ *    - 黄金镜像不动：`/Applications/Sugent.app` 内部签名与 `app.asar` 保持只读，确保应用永远不会破坏系统签名或"改砖"；
+ *    - 写时复制热覆盖（Copy-on-Write Overlay）：开启自我迭代时，自动在 `<dataDir>/self-repo/` 初始化 `ui/`（免编译 Preact+htm 前端模块）、`plugins/`（DSH Cordis `.mjs` 运行时插件）与 `skills/`（`SKILL.md` 技能）；
+ *    - 动态劫持加载：`src/web/server.ts` 优先加载 `<dataDir>/self-repo/ui/` 下被 Agent 演进过的文件，未修改文件无缝回退至 `app.asar/ui/`；
+ *    - 一键安全回滚（Factory Reset）：若 Agent 改坏了某个界面或插件，调用 `resetSelfEvolutionOverlay()` 即可瞬间回退至出厂黄金镜像。
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -30,19 +34,136 @@ export interface SelfEvolutionPlan {
 }
 
 /**
+ * 判断当前是否运行在打包后的只读归档（`app.asar`）模式下
+ */
+export function isPackagedAsar(appRoot = findAppRoot()): boolean {
+  return path.resolve(appRoot).includes(".asar");
+}
+
+/**
+ * 获取普通用户安装包模式下的热覆盖层根目录 `<dataDir>/self-repo`
+ */
+export function getOverlayRepoDir(dataDir: string): string {
+  return path.join(path.resolve(dataDir), "self-repo");
+}
+
+/**
+ * 递归复制目录（仅在目标文件不存在时复制，保护用户/Agent 已演进的文件不被覆盖）
+ */
+function copyDirIfMissing(srcDir: string, destDir: string): void {
+  if (!fs.existsSync(srcDir)) return;
+  fs.mkdirSync(destDir, { recursive: true, mode: 0o700 });
+  for (const entry of fs.readdirSync(srcDir, { withFileTypes: true })) {
+    const srcPath = path.join(srcDir, entry.name);
+    const destPath = path.join(destDir, entry.name);
+    if (entry.isDirectory()) {
+      copyDirIfMissing(srcPath, destPath);
+    } else if (entry.isFile() && !fs.existsSync(destPath)) {
+      fs.copyFileSync(srcPath, destPath);
+    }
+  }
+}
+
+/**
+ * 初始化普通用户安装包态的 `<dataDir>/self-repo` 热演进工作区：
+ * 将免编译的 `ui/` 源码、扩展插件目录 `plugins/`、技能目录 `skills/` 及自演进说明同步到可写目录中，
+ * 让没有安装 Git 或编译器的普通用户也能直接让 Agent 修改界面、新增插件与扩展能力。
+ */
+export function ensureSelfEvolutionOverlay(dataDir: string, appRoot = findAppRoot()): string {
+  const overlayDir = getOverlayRepoDir(dataDir);
+  fs.mkdirSync(path.join(overlayDir, "ui"), { recursive: true, mode: 0o700 });
+  fs.mkdirSync(path.join(overlayDir, "plugins"), { recursive: true, mode: 0o700 });
+  fs.mkdirSync(path.join(overlayDir, "skills"), { recursive: true, mode: 0o700 });
+
+  // 若在打包态（或显式初始化 overlay），将内置 ui/ 种子文件同步一份供 Agent 直接阅读和热修改
+  const bundledUi = path.join(path.resolve(appRoot), "ui");
+  if (isPackagedAsar(appRoot) && fs.existsSync(bundledUi)) {
+    copyDirIfMissing(bundledUi, path.join(overlayDir, "ui"));
+  }
+
+  const readmeFile = path.join(overlayDir, "README_SELF_EVOLUTION.md");
+  if (!fs.existsSync(readmeFile)) {
+    fs.writeFileSync(
+      readmeFile,
+      [
+        "# Sugent 热演进覆盖层工作区 (Hot-Evolution Overlay Workspace)",
+        "",
+        "本目录是打包版 Sugent App 的可写热演进层（OverlayFS）：",
+        "- `ui/`：前端界面覆盖层（Preact + htm 原生 ES Module，无需编译，修改后刷新窗口立即生效，未修改文件自动回退至内置黄金镜像）。",
+        "- `plugins/`：DSH 运行时插件扩展层（放置在此处的 `.mjs` 插件会在机器人下次启动回合时自动挂载进 Cordis 插件树）。",
+        "- `skills/`：自定义技能层（放置 `<skill-name>/SKILL.md` 即可扩展机器人能力）。",
+        "",
+      ].join("\n"),
+      { mode: 0o600 },
+    );
+  }
+  return overlayDir;
+}
+
+/**
  * 自动通过相对路径解析 Sugent 自身源码根目录，无需用户手动查找或选择文件夹：
- * 1. 开发/源码/Electron 开发态：直接通过 `findAppRoot()`（基于 `import.meta.url` 的相对上级目录）定位到项目根目录（含 `package.json` 且不在只读 `.asar` 归档内）；
- * 2. 打包后的只读安装包态（如 `.app/Contents/Resources/app.asar`）：自动回退到标准相对数据目录 `<dataDir>/self-repo`。
+ * 1. 开发者源码态：直接通过 `findAppRoot()` 定位到项目根目录（`./`）；
+ * 2. 普通用户打包态（`app.asar`）：自动初始化并返回 `<dataDir>/self-repo` 热演进覆盖层目录。
  */
 export function resolveSelfEvolutionRoot(dataDir: string, appRoot = findAppRoot()): string {
   const normalizedRoot = path.resolve(appRoot);
-  const insideAsar = normalizedRoot.includes(".asar");
-  if (!insideAsar && fs.existsSync(path.join(normalizedRoot, "package.json"))) {
+  if (!isPackagedAsar(normalizedRoot) && fs.existsSync(path.join(normalizedRoot, "package.json"))) {
     return normalizedRoot;
   }
-  const managedRepo = path.join(path.resolve(dataDir), "self-repo");
-  fs.mkdirSync(managedRepo, { recursive: true, mode: 0o700 });
-  return managedRepo;
+  return ensureSelfEvolutionOverlay(dataDir, normalizedRoot);
+}
+
+/**
+ * 动态解析前端 UI 静态文件路径（Copy-on-Write Overlay）：
+ * - 若 `<dataDir>/self-repo/ui/<relPath>` 存在（即 Agent 在打包版 App 中热修改了界面），优先返回该演进文件；
+ * - 否则无缝回退至应用内置的 `<uiDir>/<relPath>` 黄金镜像文件。
+ */
+export function resolveOverlayUiFile(dataDir: string, builtinUiDir: string, relPath: string): string {
+  const cleanRel = relPath.replace(/^[/\\]+/, "");
+  if (!cleanRel || cleanRel.split(/[/\\]/).includes("..")) {
+    return path.join(builtinUiDir, cleanRel);
+  }
+  const overlayCandidate = path.join(getOverlayRepoDir(dataDir), "ui", cleanRel);
+  try {
+    if (fs.existsSync(overlayCandidate) && fs.statSync(overlayCandidate).isFile()) {
+      return overlayCandidate;
+    }
+  } catch {
+    /* fallback to builtin */
+  }
+  return path.join(builtinUiDir, cleanRel);
+}
+
+/**
+ * 扫描 `<dataDir>/self-repo/plugins/*.mjs` 下由 Agent 自主编写的扩展插件，供 `AgentHost.writePatch()` 动态挂载
+ */
+export function listSelfEvolutionPlugins(dataDir: string): Array<{ id: string; filePath: string }> {
+  const pluginsDir = path.join(getOverlayRepoDir(dataDir), "plugins");
+  if (!fs.existsSync(pluginsDir)) return [];
+  try {
+    return fs
+      .readdirSync(pluginsDir, { withFileTypes: true })
+      .filter((e) => e.isFile() && e.name.endsWith(".mjs"))
+      .sort((a, b) => a.name.localeCompare(b.name))
+      .map((e) => ({
+        id: `sugent-ext-${e.name.slice(0, -4).replace(/[^a-zA-Z0-9_-]/g, "-")}`,
+        filePath: path.join(pluginsDir, e.name),
+      }));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * 安全模式一键回退（Factory Reset Overlay）：
+ * 当普通用户的 Agent 把某个热演进 UI 或插件改坏时，将当前 `self-repo` 归档备份并清空覆盖层，瞬间恢复出厂黄金镜像。
+ */
+export function resetSelfEvolutionOverlay(dataDir: string): { archivedTo?: string } {
+  const overlayDir = getOverlayRepoDir(dataDir);
+  if (!fs.existsSync(overlayDir)) return {};
+  const backupDir = path.join(path.resolve(dataDir), `self-repo.backup-${Date.now()}`);
+  fs.renameSync(overlayDir, backupDir);
+  return { archivedTo: backupDir };
 }
 
 /**
@@ -93,13 +214,15 @@ export function assessSelfEditPath(relPath: string): FileChangeAssessment {
     norm.startsWith("test/") ||
     norm.startsWith("docs/") ||
     norm.startsWith("ui/") ||
+    norm.startsWith("plugins/") ||
+    norm.startsWith("skills/") ||
     norm === "README.md" ||
     norm === "ARCHITECTURE.md"
   ) {
     return {
       filePath: norm,
       risk: "autonomous",
-      reason: "Within Sugent's zero-intrusion extension, UI, test, or documentation scope.",
+      reason: "Within Sugent's zero-intrusion extension, hot-overlay UI/plugins/skills, test, or documentation scope.",
     };
   }
 
@@ -141,33 +264,25 @@ export function buildSelfEvolutionPlan(
  */
 export const SUGENT_SELF_DEV_SKILL = `---
 name: sugent-self-dev
-description: Autonomous self-iteration, upstream synchronization, and safe code management workflow for the Sugent repository itself. Use whenever the user asks you to add features to Sugent, fix bugs in your own codebase, sync upstreams, or push updates to GitHub.
+description: Autonomous self-iteration, hot-overlay UI/plugin evolution, upstream synchronization, and safe code management workflow for Sugent. Use whenever the user asks you to customize the app UI, add new capabilities/plugins/skills, or evolve Sugent's own codebase.
 ---
 
-# Sugent 自我迭代与代码自治规范 (Self-Evolution SOP)
+# Sugent 双模自我迭代与热演进规范 (Self-Evolution SOP)
 
-当前机器人已开启「自我迭代与代码自治（Self-Evolution）」开关，你的当前工作区（\`.\`）已通过相对路径自动绑定至 Sugent 自身源代码根目录。请严格按以下 5 步闭环执行：
+当前机器人已开启「自我迭代与代码自治（Self-Evolution）」开关，你的工作区（\`.\`）已自动绑定至 Sugent 的演进目录。请根据当前目录结构按对应模式执行：
 
-## 1. 先读架构与计划（Context First）
-- 直接在当前相对工作区（\`./\`）阅读 \`AGENTS.md\`、\`ARCHITECTURE.md\` 与 \`docs/ROADMAP.md\`。
-- 所有新增的核心业务逻辑优先写在 \`src/sugent/\` 目录下，测试写在 \`test/sugent*.test.ts\`，保持对上游宿主代码的零侵入隔离。
+## 模式 A：普通用户安装包态（Hot-Overlay 热覆盖层模式，无需编译器或 Git）
+若当前工作区包含 \`README_SELF_EVOLUTION.md\`（位于 \`<dataDir>/self-repo\`）：
+1. **免编译热修改界面 (\`./ui/\`)**：前端采用 Preact + htm 原生 ES Module（无构建步骤）。直接修改 \`./ui/screens/\`、\`./ui/components/\` 或 \`./ui/css/\` 下的文件，服务端会自动通过写时复制（OverlayFS）优先加载你修改的文件，刷新界面即刻生效！
+2. **动态扩展运行时插件 (\`./plugins/*.mjs\`)**：在 \`./plugins/\` 下编写标准的 DeepSeek Harness (Cordis) 插件（\`.mjs\`），宿主会在下次拉起会话时自动将其挂载进运行时。
+3. **沉淀新技能 (\`./skills/<name>/SKILL.md\`)**：将新能力写成标准 \`SKILL.md\` 即可永久复用。
+4. **安全回退保险丝**：内置的 \`app.asar\` 黄金镜像始终只读保护；若某个覆盖文件异常，删除 \`./ui/\` 或 \`./plugins/\` 下对应的覆盖文件即可瞬间恢复出厂状态。
 
-## 2. 检查工作区与记录回滚锚点（Snapshot）
-- 修改任何文件前，先运行 \`git status -s\` 和 \`git rev-parse --short HEAD\` 记录当前干净的基准 Commit。
-- 严禁篡改 \`.git/config\`、\`dsh-runtime/plugins/amb-bridge.mjs\` 等安全围栏文件；如需修改 \`package.json\`、\`electron/main.ts\` 或 \`scripts/verify-sugent.mjs\`，先向主人说明原因并请求批准。
-
-## 3. 测试驱动开发（TDD & Verification Gate）
-- 编写或修改代码后，同步在 \`scripts/verify-sugent.mjs\` 与 \`test/\` 中补充契约断言。
-- **强制门禁**：必须运行 \`npm run verify:sugent\`（依次执行 \`tsc --noEmit\`、\`npm run build\`、核心契约验证与 \`docs:check\`）。
-- 若 \`npm run verify:sugent\` 报错，必须先修复错误直至退出码为 0；若连续修复失败，执行 \`git checkout -- .\` 恢复工作区并如实向主人报告原因。
-
-## 4. 双上游同步（Upstream Sync）
-- 当主人要求同步上游最新特性时，先运行 \`npm run sync:upstreams\` 查看 \`modelflare-ai/AnyModelBot\` 与 \`deepseek-ai/dsh-superagent-prototype\` 的最新提交。
-- 确认无误后运行 \`npm run sync:upstreams:merge\`，随后立即执行 \`npm run verify:sugent\` 确保合并后契约完好。
-
-## 5. 原子提交与 SSH 远端推送（Commit & Push）
-- 验证 100% 通过后，使用清晰的 Conventional Commit（如 \`feat(sugent): ...\` 或 \`fix(sugent): ...\`）提交到 \`main\` 分支。
-- 运行 \`git push origin main\` 将改动经 SSH 443 通道推送到 \`ldc861117/sugent\`，并在微信/飞书或桌面端用一两句话向主人汇报 Commit 哈希与核心结果。
+## 模式 B：开发者完整源码态（Full Source Git 模式）
+若当前工作区包含 \`package.json\` 与 \`src/sugent/\`：
+1. **零侵入扩展**：所有新增核心逻辑优先写在 \`src/sugent/\` 目录下，测试写在 \`test/sugent*.test.ts\`。
+2. **强制回归门禁**：修改后必须运行 \`npm run verify:sugent\`（依次执行 \`tsc --noEmit\`、\`npm run build\`、核心契约验证与 \`docs:check\`），未 100% 通过前严禁提交。
+3. **原子提交与远端同步**：通过后可执行 \`git commit\` 与 \`git push origin main\`。
 `;
 
 /**
@@ -183,11 +298,13 @@ export function installSelfDevSkill(skillsRootDir: string): string {
 
 /**
  * 当机器人在设置中开启 `selfEvolution.enabled` 时由宿主自动调用：
- * 1. 解析相对源码根目录（`./`）；
- * 2. 在该机器人的 DSH `skills/` 目录自动挂载 `sugent-self-dev/SKILL.md`；
- * 3. 在知识图谱中自动确保自演进工作流节点已就位。
+ * 1. 解析源码根目录（开发态 `./` 或打包态 `<dataDir>/self-repo` 热覆盖层）；
+ * 2. 确保 `<dataDir>/self-repo/` 的 `ui/`、`plugins/`、`skills/` 覆盖层目录已就绪；
+ * 3. 在该机器人的 DSH `skills/` 目录自动挂载 `sugent-self-dev/SKILL.md`；
+ * 4. 在知识图谱中自动确保自演进工作流节点已就位。
  */
 export function prepareSelfEvolutionWorkspace(dataDir: string, dshHomeDir: string): { workspaceRoot: string; skillFile: string } {
+  ensureSelfEvolutionOverlay(dataDir);
   const workspaceRoot = resolveSelfEvolutionRoot(dataDir);
   const skillFile = installSelfDevSkill(path.join(dshHomeDir, "skills"));
   try {
@@ -199,8 +316,8 @@ export function prepareSelfEvolutionWorkspace(dataDir: string, dshHomeDir: strin
             id: "proj:sugent",
             kind: "project",
             name: "Sugent (Super-Agent)",
-            summary: "全能个人自治智能体项目（工作区已通过相对目录 ./ 自动挂载）",
-            tags: ["self-dev", "dsh"],
+            summary: "全能个人自治智能体项目（支持源码态编译演进与打包态 OverlayFS 免编译热演进）",
+            tags: ["self-dev", "dsh", "overlay"],
             reinforcements: 3,
           },
         ],

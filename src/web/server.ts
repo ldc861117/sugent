@@ -21,6 +21,7 @@ import { connectionFromPids } from "../agent/peer-guard.js";
 import type { ApprovalRow, Message, Store } from "../store/db.js";
 import { defaultLine } from "../agent/approvals.js";
 import { normalizeSettings } from "../agent/settings.js";
+import { resetSelfEvolutionOverlay, resolveOverlayUiFile } from "../sugent/self-evolution.js";
 import { SEARCH_PROVIDERS, normalizeSearxUrl, type SearchProvider } from "../agent/search.js";
 import { ConnectionError } from "../agent/accounts.js";
 import { scopeLabel } from "../agent/memory.js";
@@ -1229,10 +1230,10 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
       });
       return;
     }
-    if (url.pathname === "/" || url.pathname === "/index.html") return serveFile(res, path.join(uiDir, "index.html"));
+    if (url.pathname === "/" || url.pathname === "/index.html") return serveFile(res, resolveOverlayUiFile(cfg.dataDir, uiDir, "index.html"));
     if (url.pathname.startsWith("/amb/static/")) {
       const rel = path.normalize(url.pathname.slice("/amb/static/".length)).replace(/^(\.\.[/\\])+/, "");
-      return serveFile(res, path.join(uiDir, rel));
+      return serveFile(res, resolveOverlayUiFile(cfg.dataDir, uiDir, rel));
     }
     if (url.pathname.startsWith("/amb/vendor/")) {
       const f = vendor[url.pathname.slice("/amb/vendor/".length)];

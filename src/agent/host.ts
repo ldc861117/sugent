@@ -17,7 +17,7 @@ import { DEFAULT_SETTINGS, permissionMode, type BotSettings } from "./settings.j
 import type { AccountService } from "./accounts.js";
 import { acceptsImages } from "../llm/client.js";
 import { CUA_SKILL, MEDIA_SKILL, TASK_RULES, agentPersona, botPrompt } from "./prompts/index.js";
-import { prepareSelfEvolutionWorkspace, resolveSelfEvolutionRoot } from "../sugent/self-evolution.js";
+import { listSelfEvolutionPlugins, prepareSelfEvolutionWorkspace, resolveSelfEvolutionRoot } from "../sugent/self-evolution.js";
 import { t, t as tr } from "../i18n/index.js";
 import { dirBytes, taskSessionDirs } from "../tasks/retention.js";
 
@@ -778,6 +778,7 @@ export class AgentHost {
       // 后台任务：聊天会话的 task_start / task_message / task_list；任务会话的限定工具、任务规则、task_report、收尾
       "    - id: amb-tasks",
       `      name: ${yamlStr(path.join(this.o.runtimeDir, "plugins", "amb-tasks.mjs"))}`,
+      ...this.selfEvolutionPluginLines(),
       ...this.computerUseLines(apps),
       ...this.fullAccessLines(),
       "",
@@ -823,7 +824,7 @@ export class AgentHost {
     }
   }
 
-  /** 自我迭代技能：开启 selfEvolution.enabled 时自动挂载 sugent-self-dev 技能并绑定相对源码目录 ./ */  
+  /** 自我迭代技能：开启 selfEvolution.enabled 时自动挂载 sugent-self-dev 技能并绑定相对源码目录 ./ 或打包态 OverlayFS */  
   private writeSelfEvolutionSkill(): void {
     const dir = path.join(this.home, "skills", "sugent-self-dev");
     try {
@@ -835,6 +836,16 @@ export class AgentHost {
     } catch (e) {
       log.warn("self-evolution skill setup failed", { err: String(e) });
     }
+  }
+
+  /** 动态挂载 <dataDir>/self-repo/plugins/*.mjs 下由智能体自主演进编写的 Cordis 运行时插件 */
+  private selfEvolutionPluginLines(): string[] {
+    if (!this.settings().selfEvolution?.enabled) return [];
+    const out: string[] = [];
+    for (const p of listSelfEvolutionPlugins(this.o.dataDir)) {
+      out.push(`    - id: ${p.id}`, `      name: ${yamlStr(p.filePath)}`);
+    }
+    return out;
   }
 
   /** 当前机器上本机器人所选后端的可用性（不看本机器人的开关）。 */

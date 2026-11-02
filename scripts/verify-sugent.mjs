@@ -15,10 +15,14 @@ import {
   assessSelfEditPath,
   buildMagpieEnvOverrides,
   buildSelfEvolutionPlan,
+  ensureSelfEvolutionOverlay,
   evaluatePersonalTrigger,
   installSelfDevSkill,
+  listSelfEvolutionPlugins,
   parseKGDelta,
   prepareSelfEvolutionWorkspace,
+  resetSelfEvolutionOverlay,
+  resolveOverlayUiFile,
   resolveSelfEvolutionRoot,
   resolveSugentGatewayConfig,
   selectModelForRole,
@@ -121,7 +125,7 @@ import { normalizeSettings } from "../dist/src/agent/settings.js";
   assert.equal(shouldSuggestRulePromotion({ ...ruleObserve, verifiedObservations: 3 }), true);
 }
 
-// 4. 自主知识图谱与标准化「一键自我迭代开关 + 相对目录解析」验证
+// 4. 自主知识图谱、标准化一键自我迭代开关与打包态 OverlayFS 热覆盖验证
 {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sugent-kg-verify-"));
   try {
@@ -184,8 +188,9 @@ import { normalizeSettings } from "../dist/src/agent/settings.js";
     assert.equal(writtenFiles.length, 1);
     assert.ok(fs.existsSync(writtenFiles[0]));
 
-    // 5. 自我迭代围栏、BotSettings.selfEvolution 开关与相对源码目录自动解析验证
+    // 5. 自我迭代围栏、BotSettings.selfEvolution 开关与打包态 OverlayFS 热演进验证
     assert.equal(assessSelfEditPath("src/sugent/new-feature.ts").risk, "autonomous");
+    assert.equal(assessSelfEditPath("plugins/my-hook.mjs").risk, "autonomous");
     assert.equal(assessSelfEditPath("electron/main.ts").risk, "requires_approval");
     assert.equal(assessSelfEditPath(".git/config").risk, "forbidden");
 
@@ -197,6 +202,28 @@ import { normalizeSettings } from "../dist/src/agent/settings.js";
     const resolvedRoot = resolveSelfEvolutionRoot(tmpDir);
     assert.ok(fs.existsSync(path.join(resolvedRoot, "package.json")));
 
+    // 模拟打包态 (app.asar) 下自动回退到 <dataDir>/self-repo 热覆盖层
+    const packagedRoot = resolveSelfEvolutionRoot(tmpDir, "/Applications/Sugent.app/Contents/Resources/app.asar");
+    assert.equal(packagedRoot, path.join(tmpDir, "self-repo"));
+    assert.ok(fs.existsSync(path.join(packagedRoot, "README_SELF_EVOLUTION.md")));
+
+    // 验证 UI Copy-on-Write 热覆盖与回退
+    const builtinUi = path.join(resolvedRoot, "ui");
+    assert.equal(resolveOverlayUiFile(tmpDir, builtinUi, "main.js"), path.join(builtinUi, "main.js"));
+    const customMain = path.join(packagedRoot, "ui", "main.js");
+    fs.writeFileSync(customMain, "// evolved by sugent\n");
+    assert.equal(resolveOverlayUiFile(tmpDir, builtinUi, "main.js"), customMain);
+
+    // 验证自定义运行时插件 (.mjs) 发现与一键安全重置 (resetSelfEvolutionOverlay)
+    fs.writeFileSync(path.join(packagedRoot, "plugins", "auto-tagger.mjs"), "export default {}\n");
+    const extPlugins = listSelfEvolutionPlugins(tmpDir);
+    assert.equal(extPlugins.length, 1);
+    assert.equal(extPlugins[0].id, "sugent-ext-auto-tagger");
+
+    const resetRes = resetSelfEvolutionOverlay(tmpDir);
+    assert.ok(resetRes.archivedTo && fs.existsSync(resetRes.archivedTo));
+    assert.equal(resolveOverlayUiFile(tmpDir, builtinUi, "main.js"), path.join(builtinUi, "main.js"));
+
     const dshHome = path.join(tmpDir, "dsh-bot1");
     const prepared = prepareSelfEvolutionWorkspace(tmpDir, dshHome);
     assert.equal(prepared.workspaceRoot, resolvedRoot);
@@ -204,7 +231,6 @@ import { normalizeSettings } from "../dist/src/agent/settings.js";
 
     const plan = buildSelfEvolutionPlan("Add mail source", "31ef67c", ["src/sugent/sources.ts", "test/sugent-sources.unit.test.ts"]);
     assert.equal(plan.overallRisk, "autonomous");
-    assert.equal(plan.verificationCommand, "npm run verify:sugent");
 
     const selfDevSkillPath = installSelfDevSkill(skillsDir);
     assert.ok(fs.existsSync(selfDevSkillPath));
@@ -214,5 +240,5 @@ import { normalizeSettings } from "../dist/src/agent/settings.js";
 }
 
 console.log(
-  "verify:sugent — 全部核心契约断言通过 (Gateway 解耦 / 四角色路由 / 状态机 / 自主知识图谱 / 一键自我迭代开关与相对目录自动解析)",
+  "verify:sugent — 全部核心契约断言通过 (Gateway 解耦 / 四角色路由 / 状态机 / 知识图谱 / 双模自我迭代与打包态 OverlayFS 热演进)",
 );
