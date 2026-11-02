@@ -5,9 +5,13 @@
  * 确保在任何沙箱或 CI 环境下都能秒级完成端到端回归验证。
  */
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import {
   DEFAULT_ROLE_ROUTING,
   PersonalSourceRegistry,
+  SugentKnowledgeGraph,
   buildMagpieEnvOverrides,
   evaluatePersonalTrigger,
   resolveSugentGatewayConfig,
@@ -113,4 +117,62 @@ import {
   assert.equal(shouldSuggestRulePromotion({ ...ruleObserve, verifiedObservations: 3 }), true);
 }
 
-console.log("verify:sugent — 全部核心契约断言通过 (Gateway 解耦 / 四角色路由 / Intake-Eval-Ticket 状态机)");
+// 4. 自主知识图谱（多跳子图召回 + 时效冲突消解 + 技能结晶）验证
+{
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sugent-kg-verify-"));
+  try {
+    const kg = new SugentKnowledgeGraph(tmpDir);
+    kg.applyDelta(
+      {
+        nodes: [
+          { id: "user:owner", kind: "person", name: "Owner", summary: "Sugent 架构师", tags: ["owner"] },
+          { id: "proj:sugent", kind: "project", name: "Sugent", summary: "全能个人 Agent", tags: ["agent"] },
+          { id: "model:old", kind: "tool", name: "Old Model", summary: "旧默认模型", tags: ["llm"] },
+          { id: "model:new", kind: "tool", name: "New Model", summary: "新主力模型", tags: ["llm"] },
+          {
+            id: "wf:sync",
+            kind: "workflow",
+            name: "双上游同步 SOP",
+            summary: "每日自动巡检并合并上游变更",
+            tags: ["sop"],
+            reinforcements: 3,
+            steps: ["npm run sync:upstreams", "npm run verify:sugent"],
+          },
+        ],
+        edges: [
+          { from: "user:owner", relation: "owns", to: "proj:sugent", source: "init" },
+          { from: "proj:sugent", relation: "uses_model", to: "model:old", source: "t1", exclusive: true },
+          { from: "proj:sugent", relation: "has_sop", to: "wf:sync", source: "t1" },
+        ],
+      },
+      "2026-11-01T10:00:00.000Z",
+    );
+
+    // 排他关系更新：model:new 自动取代 model:old
+    kg.applyDelta(
+      {
+        edges: [{ from: "proj:sugent", relation: "uses_model", to: "model:new", source: "t2", exclusive: true }],
+      },
+      "2026-11-01T11:00:00.000Z",
+    );
+
+    const sub = kg.recallSubgraph("Owner", 2);
+    const ids = sub.matchedNodes.map((n) => n.id);
+    assert.ok(ids.includes("user:owner"));
+    assert.ok(ids.includes("proj:sugent"));
+    assert.ok(ids.includes("model:new"));
+    assert.ok(ids.includes("wf:sync"));
+    assert.ok(!ids.includes("model:old"));
+
+    const crystallized = kg.crystallizeSkills(3);
+    assert.equal(crystallized.length, 1);
+    assert.equal(crystallized[0].skillName, "wf-sync");
+    assert.ok(crystallized[0].markdown.includes("## 标准执行步骤"));
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+}
+
+console.log(
+  "verify:sugent — 全部核心契约断言通过 (Gateway 解耦 / 四角色路由 / Intake-Eval-Ticket 状态机 / 自主知识图谱与技能结晶)",
+);
