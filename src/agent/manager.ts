@@ -30,6 +30,7 @@ import {
   stewardRequest,
   type Line,
 } from "./steward.js";
+import { KG_EXTRACTION_SYSTEM, SugentKnowledgeGraph, parseKGDelta } from "../sugent/knowledge-graph.js";
 
 const log = logger("agent");
 
@@ -153,6 +154,7 @@ export class AgentManager {
   /** botId → 正在进行回合的会话（子代理 session 无映射时用来归属审批） */
   private activeConvs = new Map<string, Set<string>>();
   readonly memory: MemoryStore;
+  readonly knowledgeGraph: SugentKnowledgeGraph;
   /** 在 Responses / Anthropic Messages 上被拒过、暂时改走 Chat Completions 的模型（所有机器人共用） */
   readonly apiFallbacks: ApiFallbacks;
   /** 会话 → 管家判定（是否原地压缩），插件在代理空闲时取 */
@@ -213,6 +215,7 @@ export class AgentManager {
       },
     });
     this.memory = new MemoryStore(path.join(o.dataDir, "memory"));
+    this.knowledgeGraph = new SugentKnowledgeGraph(path.join(o.dataDir, "knowledge-graph"));
     this.apiFallbacks = new ApiFallbacks(path.join(o.dataDir, "dsh", "api-fallback.json"));
   }
 
@@ -645,6 +648,17 @@ export class AgentManager {
       } catch {
         /* 重复、超限或像密钥：跳过 */
       }
+    }
+    try {
+      const skillsDir = path.join(this.o.dataDir, "dsh", "skills", "crystallized");
+      this.knowledgeGraph.ingestMemoryReviewOps(ops, this.memory.key(scope));
+      if (process.env.SUGENT_KG_DEEP_EXTRACT === "1") {
+        const kgOut = await this.o.complete(botId, this.utilityModel(botId, model), KG_EXTRACTION_SYSTEM, recentTranscript(lines, 12_000));
+        this.knowledgeGraph.applyDelta(parseKGDelta(kgOut));
+      }
+      this.knowledgeGraph.crystallizeSkillsToDir(skillsDir);
+    } catch (e) {
+      log.warn("knowledge graph sync failed", { message: (e as Error).message.slice(0, 200) });
     }
     store.setKV(`review:${conv}`, String(msgs[msgs.length - 1].id));
     log.info("memory review", { conversationId: conv, added: res.added, removed: res.removed });

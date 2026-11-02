@@ -11,7 +11,7 @@
  * 3. 多跳子图关联召回 (Multi-Hop Subgraph Recall)：
  *    - 给定查询词或种子实体，自动做 K-Hop (默认 2 跳) 邻域扩展，拼装成可直接注入 System Prompt 的高密度 Markdown 子图快照
  * 4. 经验 -> 固化技能结晶 (Autonomous Skill Crystallization)：
- *    - 当某个 workflow 节点在实践中累计成功执行达到阈值（默认 3 次），自动生成标准 SKILL.md 模板，将"非结构化经验"永久固化为"可执行技能"
+ *    - 当某个 workflow 节点在实践中累计成功执行达到阈值（默认 3 次），自动生成标准 SKILL.md 模板并落盘到技能目录，将"非结构化经验"永久固化为"可执行技能"
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -71,6 +71,59 @@ export interface SubgraphSnapshot {
 }
 
 export const SKILL_CRYSTALLIZE_THRESHOLD = 3;
+
+/**
+ * 供后台管家模型（steward）从对话归档中抽取结构化知识图谱与可复用 SOP 工作流的系统提示词
+ */
+export const KG_EXTRACTION_SYSTEM = [
+  "你是 Sugent 的知识图谱与技能架构师。请从给定的对话记录中抽取值得长期固化的实体（nodes）、语义关系（edges）以及可复用的多步工作流（workflow）。",
+  "不要抽取密码、API Key、令牌或一次性闲聊。若某项配置或偏好取代了旧设置，将该边标记为 exclusive: true。",
+  "只输出一行合法的 JSON，格式如下：",
+  '{"nodes":[{"id":"proj:sugent","kind":"project|person|repo|preference|workflow|tool|concept","name":"名称","summary":"一句话描述","tags":["标签"],"steps":["仅当kind为workflow时填写的步骤1","步骤2"]}],"edges":[{"from":"源节点id","relation":"关系名","to":"目标节点id","source":"review","exclusive":false}]}',
+].join("\n");
+
+/**
+ * 解析管家模型返回的知识图谱增量 JSON（容错解析）
+ */
+export function parseKGDelta(raw: string): KGDelta {
+  const m = String(raw ?? "").match(/\{[\s\S]*\}/);
+  if (!m) return {};
+  try {
+    const parsed = JSON.parse(m[0]);
+    const validKinds = new Set<EntityKind>(["person", "project", "repo", "preference", "workflow", "tool", "concept"]);
+    const nodes: NonNullable<KGDelta["nodes"]> = [];
+    const edges: NonNullable<KGDelta["edges"]> = [];
+
+    for (const n of Array.isArray(parsed?.nodes) ? parsed.nodes : []) {
+      if (!n || typeof n.id !== "string" || typeof n.name !== "string" || typeof n.summary !== "string") continue;
+      const kind: EntityKind = validKinds.has(n.kind) ? n.kind : "concept";
+      const steps = Array.isArray(n.steps) ? n.steps.filter((s: unknown) => typeof s === "string" && s.trim()).map((s: string) => s.trim()) : undefined;
+      nodes.push({
+        id: n.id.trim(),
+        kind,
+        name: n.name.trim(),
+        summary: n.summary.trim(),
+        tags: Array.isArray(n.tags) ? n.tags.map(String) : [],
+        ...(steps?.length ? { steps } : {}),
+      });
+    }
+
+    for (const e of Array.isArray(parsed?.edges) ? parsed.edges : []) {
+      if (!e || typeof e.from !== "string" || typeof e.relation !== "string" || typeof e.to !== "string") continue;
+      edges.push({
+        from: e.from.trim(),
+        relation: e.relation.trim(),
+        to: e.to.trim(),
+        source: typeof e.source === "string" && e.source.trim() ? e.source.trim() : "steward",
+        exclusive: Boolean(e.exclusive),
+      });
+    }
+
+    return { nodes, edges };
+  } catch {
+    return {};
+  }
+}
 
 export class SugentKnowledgeGraph {
   private nodes = new Map<string, KGNode>();
@@ -180,6 +233,57 @@ export class SugentKnowledgeGraph {
     return { upsertedNodes, upsertedEdges };
   }
 
+  /**
+   * 将上下文管家（steward.ts REVIEW_SYSTEM）产出的 ReviewOps 自动同步沉淀至知识图谱：
+   * - 将新增条目转化为 `preference` 或 `concept` 节点，并与对应的 `scope` 及 `topic` 建立语义边；
+   * - 将删除条目对应的关联节点执行弱化或移除。
+   */
+  ingestMemoryReviewOps(
+    ops: { add: Array<{ text: string; topic?: string }>; remove: string[] },
+    scopeKey: string,
+    now = new Date().toISOString(),
+  ): { upsertedNodes: number; upsertedEdges: number } {
+    const delta: KGDelta = { nodes: [], edges: [] };
+    const scopeNodeId = `scope:${scopeKey}`;
+    delta.nodes!.push({
+      id: scopeNodeId,
+      kind: "concept",
+      name: `记忆域 (${scopeKey})`,
+      summary: `作用域 ${scopeKey} 的知识锚点`,
+      tags: ["scope"],
+    });
+
+    for (const item of ops.add) {
+      if (looksSecret(item.text)) continue;
+      const slug = item.text
+        .toLowerCase()
+        .replace(/[^\p{L}\p{N}]+/gu, "-")
+        .replace(/^-+|-+$/g, "")
+        .slice(0, 32) || "fact";
+      const topicTag = item.topic ? item.topic.trim().toLowerCase() : "general";
+      const nodeId = `mem:${topicTag}:${slug}`;
+      const isWorkflow = /步骤|流程|先.*再|npm run|git /i.test(item.text);
+
+      delta.nodes!.push({
+        id: nodeId,
+        kind: isWorkflow ? "workflow" : "preference",
+        name: item.topic ? `${item.topic}: ${item.text.slice(0, 24)}` : item.text.slice(0, 28),
+        summary: item.text,
+        tags: [topicTag, "review"],
+        ...(isWorkflow ? { steps: item.text.split(/[；;。]/).map((s) => s.trim()).filter(Boolean) } : {}),
+      });
+      delta.edges!.push({
+        from: scopeNodeId,
+        relation: item.topic ? `has_${topicTag}` : "remembers",
+        to: nodeId,
+        source: "steward_review",
+      });
+    }
+
+    if (!delta.nodes!.length && !delta.edges!.length) return { upsertedNodes: 0, upsertedEdges: 0 };
+    return this.applyDelta(delta, now);
+  }
+
   getNode(id: string): KGNode | undefined {
     return this.nodes.get(id);
   }
@@ -281,5 +385,22 @@ export class SugentKnowledgeGraph {
       out.push({ skillName, markdown: md, node });
     }
     return out;
+  }
+
+  /**
+   * 将达到阈值的 workflow 节点直接落盘生成 `<skillsRootDir>/<skillName>/SKILL.md` 文件
+   */
+  crystallizeSkillsToDir(skillsRootDir: string, threshold = SKILL_CRYSTALLIZE_THRESHOLD): string[] {
+    const crystallized = this.crystallizeSkills(threshold);
+    const writtenPaths: string[] = [];
+    for (const item of crystallized) {
+      const dir = path.join(skillsRootDir, item.skillName);
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+      const file = path.join(dir, "SKILL.md");
+      fs.writeFileSync(file, item.markdown, { mode: 0o600 });
+      writtenPaths.push(file);
+      this.appendJournal({ op: "crystallize_skill", skillName: item.skillName, file, reinforcements: item.node.reinforcements });
+    }
+    return writtenPaths;
   }
 }

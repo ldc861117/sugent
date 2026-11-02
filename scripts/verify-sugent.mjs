@@ -14,6 +14,7 @@ import {
   SugentKnowledgeGraph,
   buildMagpieEnvOverrides,
   evaluatePersonalTrigger,
+  parseKGDelta,
   resolveSugentGatewayConfig,
   selectModelForRole,
   shouldSuggestRulePromotion,
@@ -117,7 +118,7 @@ import {
   assert.equal(shouldSuggestRulePromotion({ ...ruleObserve, verifiedObservations: 3 }), true);
 }
 
-// 4. 自主知识图谱（多跳子图召回 + 时效冲突消解 + 技能结晶）验证
+// 4. 自主知识图谱（多跳子图召回 + 时效冲突消解 + Steward Review 注入 + 技能落盘结晶）验证
 {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sugent-kg-verify-"));
   try {
@@ -164,15 +165,30 @@ import {
     assert.ok(ids.includes("wf:sync"));
     assert.ok(!ids.includes("model:old"));
 
-    const crystallized = kg.crystallizeSkills(3);
-    assert.equal(crystallized.length, 1);
-    assert.equal(crystallized[0].skillName, "wf-sync");
-    assert.ok(crystallized[0].markdown.includes("## 标准执行步骤"));
+    // 验证 Steward ReviewOps 自动注入与 JSON 解析
+    const syncRes = kg.ingestMemoryReviewOps(
+      { add: [{ text: "发布流程：先运行 npm run verify:sugent；再执行 git push", topic: "devops" }], remove: [] },
+      "bot:default",
+    );
+    assert.ok(syncRes.upsertedNodes >= 2);
+
+    const parsedDelta = parseKGDelta(
+      '{"nodes":[{"id":"tool:magpie","kind":"tool","name":"Magpie","summary":"本地模型网关"}],"edges":[{"from":"proj:sugent","relation":"uses_gateway","to":"tool:magpie","source":"steward","exclusive":true}]}',
+    );
+    assert.equal(parsedDelta.nodes?.length, 1);
+    assert.equal(parsedDelta.edges?.length, 1);
+
+    // 验证技能自动落盘生成 SKILL.md
+    const skillsDir = path.join(tmpDir, "skills");
+    const writtenFiles = kg.crystallizeSkillsToDir(skillsDir, 3);
+    assert.equal(writtenFiles.length, 1);
+    assert.ok(fs.existsSync(writtenFiles[0]));
+    assert.ok(fs.readFileSync(writtenFiles[0], "utf8").includes("## 标准执行步骤"));
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 }
 
 console.log(
-  "verify:sugent — 全部核心契约断言通过 (Gateway 解耦 / 四角色路由 / Intake-Eval-Ticket 状态机 / 自主知识图谱与技能结晶)",
+  "verify:sugent — 全部核心契约断言通过 (Gateway 解耦 / 四角色路由 / Intake-Eval-Ticket 状态机 / 自主知识图谱与技能落盘结晶)",
 );

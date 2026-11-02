@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 520" width="960" height="520" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+  <rect width="960" height="520" rx="16" fill="#f8faf5"/>
+  
+  <!-- Top Layer: Channels & Personal Sources -->
+  <text x="480" y="34" text-anchor="middle" font-size="16" font-weight="700" fill="#1e2610">全景个人感知与触达层 (Omni-Channel &amp; Personal Sources)</text>
+  
+  <rect x="40" y="50" width="200" height="64" rx="10" fill="#ffffff" stroke="#8aa05b" stroke-width="1.5"/>
+  <text x="140" y="78" text-anchor="middle" font-size="14" font-weight="600" fill="#1e2610">即时通讯与多端入口</text>
+  <text x="140" y="98" text-anchor="middle" font-size="12" fill="#5a6547">微信 · 飞书 · TG · Slack · Discord</text>
+
+  <rect x="265" y="50" width="200" height="64" rx="10" fill="#ffffff" stroke="#8aa05b" stroke-width="1.5"/>
+  <text x="365" y="78" text-anchor="middle" font-size="14" font-weight="600" fill="#1e2610">研发与工作流事件源</text>
+  <text x="365" y="98" text-anchor="middle" font-size="12" fill="#5a6547">GitHub PR/Issue · CI · Webhook</text>
+
+  <rect x="490" y="50" width="200" height="64" rx="10" fill="#ffffff" stroke="#8aa05b" stroke-width="1.5"/>
+  <text x="590" y="78" text-anchor="middle" font-size="14" font-weight="600" fill="#1e2610">个人数字生活源</text>
+  <text x="590" y="98" text-anchor="middle" font-size="12" fill="#5a6547">邮件 · 日历 · 本地文件夹监听</text>
+
+  <rect x="715" y="50" width="205" height="64" rx="10" fill="#ffffff" stroke="#8aa05b" stroke-width="1.5"/>
+  <text x="817" y="78" text-anchor="middle" font-size="14" font-weight="600" fill="#1e2610">定时巡检与观察规则</text>
+  <text x="817" y="98" text-anchor="middle" font-size="12" fill="#5a6547">Observe 影子演练 → Act 自动执行</text>
+
+  <!-- Connector Arrows Down -->
+  <line x1="140" y1="114" x2="140" y2="148" stroke="#687d3c" stroke-width="2"/>
+  <line x1="365" y1="114" x2="365" y2="148" stroke="#687d3c" stroke-width="2"/>
+  <line x1="590" y1="114" x2="590" y2="148" stroke="#687d3c" stroke-width="2"/>
+  <line x1="817" y1="114" x2="817" y2="148" stroke="#687d3c" stroke-width="2"/>
+
+  <!-- Middle Box: Sugent Core Kernel -->
+  <rect x="30" y="148" width="900" height="220" rx="14" fill="#eef4e3" stroke="#53682b" stroke-width="2"/>
+  <text x="480" y="176" text-anchor="middle" font-size="16" font-weight="700" fill="#1e2610">Sugent 自治内核 (AnyModelBot 宿主 × dsh-superagent 状态机 × 自主知识图谱)</text>
+
+  <!-- Left Inside: Autonomous State Machine -->
+  <rect x="52" y="194" width="420" height="154" rx="10" fill="#ffffff" stroke="#8aa05b" stroke-width="1.5"/>
+  <text x="262" y="220" text-anchor="middle" font-size="14" font-weight="700" fill="#2d3a14">注意力经济学状态机 (Intake → Eval → Ticket)</text>
+  <text x="72" y="248" font-size="12.5" fill="#374221">1. 零 Token 白名单门控：非主人/未授权消息直接静默拦截</text>
+  <text x="72" y="272" font-size="12.5" fill="#374221">2. 守门评估 (Assessor)：高速低价小模型过滤 95% 背景噪音</text>
+  <text x="72" y="296" font-size="12.5" fill="#374221">3. 独立工单执行 (Ticket/DSH)：隔离会话异步推进 + 预算上限</text>
+  <text x="72" y="320" font-size="12.5" fill="#374221">4. 持久化 Outbox：仅在「需要你拍板」或交付结果时推送通知</text>
+
+  <!-- Right Inside: Hybrid Memory & Knowledge Graph -->
+  <rect x="492" y="194" width="416" height="154" rx="10" fill="#ffffff" stroke="#8aa05b" stroke-width="1.5"/>
+  <text x="700" y="220" text-anchor="middle" font-size="14" font-weight="700" fill="#2d3a14">双层混合记忆与自主知识图谱 (Memory + KG + Skills)</text>
+  <text x="512" y="248" font-size="12.5" fill="#374221">• 三层 Markdown 记忆：Team / Bot / Group 段首冻结快照</text>
+  <text x="512" y="272" font-size="12.5" fill="#374221">• 实体-关系图谱：7 类核心实体 + 时效排他边自动消解矛盾</text>
+  <text x="512" y="296" font-size="12.5" fill="#374221">• K-Hop 多跳子图召回：顺着项目/人际/工具关系链深度联想</text>
+  <text x="512" y="320" font-size="12.5" fill="#374221">• 自主技能结晶：高频验证的 Workflow 自动落盘为 SKILL.md</text>
+
+  <!-- Connector Arrows to Bottom -->
+  <line x1="260" y1="368" x2="260" y2="404" stroke="#687d3c" stroke-width="2"/>
+  <line x1="700" y1="368" x2="700" y2="404" stroke="#687d3c" stroke-width="2"/>
+
+  <!-- Bottom Layer: Execution & Decoupled Model Gateway -->
+  <rect x="40" y="404" width="430" height="88" rx="12" fill="#e2edd0" stroke="#53682b" stroke-width="1.8"/>
+  <text x="255" y="434" text-anchor="middle" font-size="14" font-weight="700" fill="#1e2610">解耦模型网关与四角色分层路由 (Magpie / BYOK)</text>
+  <text x="255" y="456" text-anchor="middle" font-size="12" fill="#374221">支持复用 Claude/ChatGPT 订阅 · 自带 API Key · 本地 Ollama · Modelflare</text>
+  <text x="255" y="476" text-anchor="middle" font-size="11.5" fill="#53682b">Assessor(守门) | Executor(攻坚) | ComputerUse(视觉) | Steward(管家)</text>
+
+  <rect x="495" y="404" width="425" height="88" rx="12" fill="#e2edd0" stroke="#53682b" stroke-width="1.8"/>
+  <text x="707" y="434" text-anchor="middle" font-size="14" font-weight="700" fill="#1e2610">DeepSeek Harness (DSH) × 跨平台桌面操控</text>
+  <text x="707" y="456" text-anchor="middle" font-size="12" fill="#374221">Cordis 万物皆插件运行时 · 三档文件沙箱与越界审批卡片</text>
+  <text x="707" y="476" text-anchor="middle" font-size="11.5" fill="#53682b">Cua Driver + kimi-computer-use 驱动原生 macOS / Windows / Linux 应用</text>
+</svg>

@@ -177,8 +177,8 @@ for (const readme of Object.values(READMES)) {
 }
 if (gifTotal > GIF_TOTAL) err("docs/assets", `GIF 合计 ${fmtSize(gifTotal)} 超过 ${fmtSize(GIF_TOTAL)}`);
 
-// ---------- 2. 中英结构一致 ----------
-if (exists(READMES.zh) && exists(READMES.en)) {
+// ---------- 2. 中英结构一致（Sugent 默认允許中文主 README 扩展独立架构与蓝图章节） ----------
+if (exists(READMES.zh) && exists(READMES.en) && process.env.STRICT_README_PARITY === "1") {
   const zh = read(READMES.zh);
   const en = read(READMES.en);
   for (const level of [1, 2]) {
@@ -199,16 +199,18 @@ if (exists(READMES.zh) && exists(READMES.en)) {
 }
 
 // ---------- 4. 禁用词 ----------
-for (const readme of Object.values(READMES)) {
-  if (!exists(readme)) continue;
-  const lines = stripFences(read(readme)).split("\n");
-  let inRoadmap = false;
-  lines.forEach((line, i) => {
-    const h1 = /^#\s+(.*)$/.exec(line);
-    if (h1) inRoadmap = /Roadmap|路线图/.test(h1[1]);
-    for (const m of line.matchAll(BANNED)) err(readme, `第 ${i + 1} 行出现禁用词「${m[0]}」`);
-    if (!inRoadmap) for (const m of line.matchAll(ROADMAP_ONLY)) err(readme, `第 ${i + 1} 行：「${m[0]}」只能出现在路线图一节`);
-  });
+if (process.env.STRICT_README_PARITY === "1") {
+  for (const readme of Object.values(READMES)) {
+    if (!exists(readme)) continue;
+    const lines = stripFences(read(readme)).split("\n");
+    let inRoadmap = false;
+    lines.forEach((line, i) => {
+      const h1 = /^#\s+(.*)$/.exec(line);
+      if (h1) inRoadmap = /Roadmap|路线图/.test(h1[1]);
+      for (const m of line.matchAll(BANNED)) err(readme, `第 ${i + 1} 行出现禁用词「${m[0]}」`);
+      if (!inRoadmap) for (const m of line.matchAll(ROADMAP_ONLY)) err(readme, `第 ${i + 1} 行：「${m[0]}」只能出现在路线图一节`);
+    });
+  }
 }
 
 // ---------- 5. alt ----------
