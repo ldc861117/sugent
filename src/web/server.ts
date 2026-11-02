@@ -1054,6 +1054,7 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
         const merged = normalizeSettings({
           ...cur,
           ...(b.permission !== undefined ? { permission: b.permission } : {}),
+          ...(b.selfEvolution !== undefined ? { selfEvolution: { ...cur.selfEvolution, ...b.selfEvolution } } : {}),
           ...(b.utilityModel !== undefined ? { utilityModel: b.utilityModel } : {}),
           ...(b.avatar !== undefined ? { avatar: b.avatar } : {}),
           ...(b.computerUse !== undefined ? { computerUse: { ...cur.computerUse, ...b.computerUse } } : {}),

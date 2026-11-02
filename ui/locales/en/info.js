@@ -104,4 +104,13 @@ export default {
     activity: "Activity",
   },
   tasks: "Tasks",
+  selfEvo: {
+    head: "Self-evolution",
+    promptTitle: "Enable self-evolution & code autonomy",
+    promptSub: "Bind the relative repository root (./) in one click with built-in self-dev skills and safety gates",
+    enableBtn: "Enable",
+    activeTitle: "Self-evolution active (./)",
+    activeSub: "Bound to own repository root with verify:sugent gate",
+    enabledToast: "Self-evolution enabled (workspace bound to ./)",
+  },
 };

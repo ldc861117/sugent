@@ -15,6 +15,13 @@ export interface BotSettings {
    * full = 完全权限：命令不进沙箱、不再请求提权，以用户身份读写任何文件，只有递归删除仍要用户确认
    */
   permission: PermissionPreset;
+  /**
+   * 标准化「自我迭代与代码自治（Self-Evolution）」能力：
+   * 开启后，机器人工作区自动通过相对路径绑定到 Sugent 自身源码目录（./），并自动挂载 sugent-self-dev 技能与安全围栏，无需用户手动查找目录。
+   */
+  selfEvolution: {
+    enabled: boolean;
+  };
   memory: {
     enabled: boolean;
     /** 回合结束后自动整理记忆 */
@@ -62,6 +69,7 @@ export interface BotSettings {
 
 export const DEFAULT_SETTINGS: BotSettings = {
   permission: "workspace",
+  selfEvolution: { enabled: false },
   memory: { enabled: true, review: true, teamWrite: false },
   steward: { enabled: true },
   computerUse: { enabled: true, backend: "cua", approval: "auto" },
@@ -77,6 +85,7 @@ export const DEFAULT_SETTINGS: BotSettings = {
 
 export function normalizeSettings(raw: unknown): BotSettings {
   const r = (raw && typeof raw === "object" ? raw : {}) as any;
+  const se = r.selfEvolution && typeof r.selfEvolution === "object" ? r.selfEvolution : {};
   const m = r.memory && typeof r.memory === "object" ? r.memory : {};
   const st = r.steward && typeof r.steward === "object" ? r.steward : {};
   const cu = r.computerUse && typeof r.computerUse === "object" ? r.computerUse : {};
@@ -88,6 +97,9 @@ export function normalizeSettings(raw: unknown): BotSettings {
   const b = (v: unknown, d: boolean) => (typeof v === "boolean" ? v : d);
   return {
     permission: r.permission === "readonly" || r.permission === "full" ? r.permission : "workspace",
+    selfEvolution: {
+      enabled: b(se.enabled, DEFAULT_SETTINGS.selfEvolution.enabled),
+    },
     memory: {
       enabled: b(m.enabled, DEFAULT_SETTINGS.memory.enabled),
       review: b(m.review, DEFAULT_SETTINGS.memory.review),

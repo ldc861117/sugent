@@ -197,6 +197,9 @@ export function BotSettingsScreen({ bot, section, models, modelsError, reloadMod
             title=${t("botSettings.perm.title")}>
             <${Seg} label=${t("botSettings.perm.name")} value=${s.permission} onChange=${pickPerm} options=${[["workspace", t("botSettings.perm.workspace")], ["readonly", t("botSettings.perm.readonly")], ["full", t("botSettings.perm.full")]]} />
           <//>
+          <${Row} id="self-evolution" name=${t("botSettings.perm.selfEvo")} sub=${t("botSettings.perm.selfEvoSub")}>
+            <${Switch} label=${t("botSettings.perm.selfEvo")} value=${!!(s.selfEvolution && s.selfEvolution.enabled)} onChange=${(v) => put({ selfEvolution: { enabled: v } })} />
+          <//>
         </div>
         ${s.permission === "full" && html`<${Notice} tone="red">${fullWarning()}<//>`}
 

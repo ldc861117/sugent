@@ -110,4 +110,13 @@ export default {
     activity: "处理过程",
   },
   tasks: "任务",
+  selfEvo: {
+    head: "自我迭代",
+    promptTitle: "开启自我迭代与代码自治",
+    promptSub: "一键将相对源码目录 (./) 挂载为工作区，自动加载自演进技能与安全门禁",
+    enableBtn: "一键开启",
+    activeTitle: "自我迭代已开启 (./)",
+    activeSub: "已绑定自身源码根目录并启用 verify:sugent 门禁",
+    enabledToast: "已开启自我迭代模式（工作区已绑定至 ./）",
+  },
 };

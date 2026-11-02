@@ -17,6 +17,7 @@ import { DEFAULT_SETTINGS, permissionMode, type BotSettings } from "./settings.j
 import type { AccountService } from "./accounts.js";
 import { acceptsImages } from "../llm/client.js";
 import { CUA_SKILL, MEDIA_SKILL, TASK_RULES, agentPersona, botPrompt } from "./prompts/index.js";
+import { prepareSelfEvolutionWorkspace, resolveSelfEvolutionRoot } from "../sugent/self-evolution.js";
 import { t, t as tr } from "../i18n/index.js";
 import { dirBytes, taskSessionDirs } from "../tasks/retention.js";
 
@@ -666,6 +667,9 @@ export class AgentHost {
     return path.join(this.o.dataDir, "dsh", this.o.botId);
   }
   get workspace(): string {
+    if (this.settings().selfEvolution?.enabled) {
+      return resolveSelfEvolutionRoot(this.o.dataDir);
+    }
     return path.join(this.o.dataDir, "workspaces", this.o.botId);
   }
   private get pidFile(): string {
@@ -722,6 +726,7 @@ export class AgentHost {
     const plugin = path.join(this.o.runtimeDir, "plugins", "amb-bridge.mjs");
     const memory = path.join(this.o.runtimeDir, "plugins", "amb-memory.mjs");
     this.writeMediaSkill();
+    this.writeSelfEvolutionSkill();
     const cuOn = !!this.computerUseActive();
     const text = [
       "# 由 anymodel bot 每次启动生成；请勿手改。",
@@ -815,6 +820,20 @@ export class AgentHost {
       }
     } catch (e) {
       log.warn("media skill setup failed", { err: String(e) });
+    }
+  }
+
+  /** 自我迭代技能：开启 selfEvolution.enabled 时自动挂载 sugent-self-dev 技能并绑定相对源码目录 ./ */  
+  private writeSelfEvolutionSkill(): void {
+    const dir = path.join(this.home, "skills", "sugent-self-dev");
+    try {
+      if (!this.settings().selfEvolution?.enabled) {
+        fs.rmSync(dir, { recursive: true, force: true });
+      } else {
+        prepareSelfEvolutionWorkspace(this.o.dataDir, this.home);
+      }
+    } catch (e) {
+      log.warn("self-evolution skill setup failed", { err: String(e) });
     }
   }
 

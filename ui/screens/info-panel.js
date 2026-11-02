@@ -131,6 +131,26 @@ export function InfoPanel({ bot, leaving, onClose, onOpenBotSettings, onOpenChat
     </div>
     <div class="panel-body">
       ${detail?.bot?.settings?.paused && html`<${PausedLine} onResume=${async () => (await api(`/bots/${bot.id}/settings`, { method: "PUT", body: { paused: false } }), reloadDetail())} />`}
+      <div class="list-head">${t("info.selfEvo.head")}</div>
+      <div class="list">
+        ${detail?.bot?.settings?.selfEvolution?.enabled
+          ? html`<div class="row">
+              <div class="who"><div class="name">${t("info.selfEvo.activeTitle")}</div><div class="sub">${t("info.selfEvo.activeSub")}</div></div>
+              <span class="dot ok"></span>
+            </div>`
+          : html`<div class="row">
+              <div class="who"><div class="name">${t("info.selfEvo.promptTitle")}</div><div class="sub">${t("info.selfEvo.promptSub")}</div></div>
+              <button type="button" class="btn primary sm" onClick=${async () => {
+                try {
+                  await api(`/bots/${bot.id}/settings`, { method: "PUT", body: { selfEvolution: { enabled: true } } });
+                  toast(t("info.selfEvo.enabledToast"));
+                  reloadDetail();
+                } catch (e) {
+                  failed(e);
+                }
+              }}>${t("info.selfEvo.enableBtn")}</button>
+            </div>`}
+      </div>
       <div class="list-head">${t("info.channels")}</div>
       <div class="list">
         ${mine.map((a) => html`<div key=${`${a.channel}-${a.key}`} class="row clickable" role="button" tabindex="0" onClick=${onOpenConnections} onKeyDown=${(e) => e.key === "Enter" && onOpenConnections()}>

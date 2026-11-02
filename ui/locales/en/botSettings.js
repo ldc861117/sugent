@@ -41,6 +41,8 @@ export default {
     workspace: "Workspace write",
     readonly: "Read-only",
     full: "Full access",
+    selfEvo: "Self-evolution & code autonomy",
+    selfEvoSub: "Automatically binds the relative repository root (./) as workspace with self-dev skills and safety guardrails",
   },
   memory: {
     head: "Memory",

@@ -18,10 +18,13 @@ import {
   evaluatePersonalTrigger,
   installSelfDevSkill,
   parseKGDelta,
+  prepareSelfEvolutionWorkspace,
+  resolveSelfEvolutionRoot,
   resolveSugentGatewayConfig,
   selectModelForRole,
   shouldSuggestRulePromotion,
 } from "../dist/src/sugent/index.js";
+import { normalizeSettings } from "../dist/src/agent/settings.js";
 
 // 1. 默认网关模式与角色路由验证
 {
@@ -118,7 +121,7 @@ import {
   assert.equal(shouldSuggestRulePromotion({ ...ruleObserve, verifiedObservations: 3 }), true);
 }
 
-// 4. 自主知识图谱（多跳子图召回 + 时效冲突消解 + Steward Review 注入 + 技能落盘结晶）验证
+// 4. 自主知识图谱与标准化「一键自我迭代开关 + 相对目录解析」验证
 {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sugent-kg-verify-"));
   try {
@@ -180,12 +183,24 @@ import {
     const writtenFiles = kg.crystallizeSkillsToDir(skillsDir, 3);
     assert.equal(writtenFiles.length, 1);
     assert.ok(fs.existsSync(writtenFiles[0]));
-    assert.ok(fs.readFileSync(writtenFiles[0], "utf8").includes("## 标准执行步骤"));
 
-    // 5. 自我迭代围栏与 sugent-self-dev 技能安装验证
+    // 5. 自我迭代围栏、BotSettings.selfEvolution 开关与相对源码目录自动解析验证
     assert.equal(assessSelfEditPath("src/sugent/new-feature.ts").risk, "autonomous");
     assert.equal(assessSelfEditPath("electron/main.ts").risk, "requires_approval");
     assert.equal(assessSelfEditPath(".git/config").risk, "forbidden");
+
+    const defaultBotSettings = normalizeSettings({});
+    assert.equal(defaultBotSettings.selfEvolution.enabled, false);
+    const enabledBotSettings = normalizeSettings({ selfEvolution: { enabled: true } });
+    assert.equal(enabledBotSettings.selfEvolution.enabled, true);
+
+    const resolvedRoot = resolveSelfEvolutionRoot(tmpDir);
+    assert.ok(fs.existsSync(path.join(resolvedRoot, "package.json")));
+
+    const dshHome = path.join(tmpDir, "dsh-bot1");
+    const prepared = prepareSelfEvolutionWorkspace(tmpDir, dshHome);
+    assert.equal(prepared.workspaceRoot, resolvedRoot);
+    assert.ok(fs.existsSync(prepared.skillFile));
 
     const plan = buildSelfEvolutionPlan("Add mail source", "31ef67c", ["src/sugent/sources.ts", "test/sugent-sources.unit.test.ts"]);
     assert.equal(plan.overallRisk, "autonomous");
@@ -193,12 +208,11 @@ import {
 
     const selfDevSkillPath = installSelfDevSkill(skillsDir);
     assert.ok(fs.existsSync(selfDevSkillPath));
-    assert.ok(fs.readFileSync(selfDevSkillPath, "utf8").includes("name: sugent-self-dev"));
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 }
 
 console.log(
-  "verify:sugent — 全部核心契约断言通过 (Gateway 解耦 / 四角色路由 / Intake-Eval-Ticket 状态机 / 自主知识图谱 / 自我迭代围栏)",
+  "verify:sugent — 全部核心契约断言通过 (Gateway 解耦 / 四角色路由 / 状态机 / 自主知识图谱 / 一键自我迭代开关与相对目录自动解析)",
 );

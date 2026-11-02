@@ -41,6 +41,8 @@ export default {
     workspace: "工作区可写",
     readonly: "只读",
     full: "完全权限",
+    selfEvo: "自我迭代与代码自治",
+    selfEvoSub: "自动将相对源码目录 (./) 挂载为工作区并注入自演进技能与安全围栏，无需手动查找目录",
   },
   memory: {
     head: "记忆",
