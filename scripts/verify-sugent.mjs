@@ -12,8 +12,11 @@ import {
   DEFAULT_ROLE_ROUTING,
   PersonalSourceRegistry,
   SugentKnowledgeGraph,
+  assessSelfEditPath,
   buildMagpieEnvOverrides,
+  buildSelfEvolutionPlan,
   evaluatePersonalTrigger,
+  installSelfDevSkill,
   parseKGDelta,
   resolveSugentGatewayConfig,
   selectModelForRole,
@@ -52,7 +55,6 @@ import {
   const registry = new PersonalSourceRegistry();
   assert.equal(registry.listKinds().length, 3);
 
-  // 3a. 陌生人消息拦截（不调用模型）
   const strangerTrigger = registry.ingest(
     "im_channel",
     "wx-default",
@@ -69,7 +71,6 @@ import {
   assert.equal(strangerDecision.outcome, "ignore_noise");
   assert.equal(strangerDecision.reasonCode, "unlisted_sender");
 
-  // 3b. 主人显式指令立项 + 同线程追问自动归并
   const ownerTrigger = registry.ingest(
     "im_channel",
     "wx-default",
@@ -90,7 +91,6 @@ import {
   assert.equal(followupDecision.outcome, "attach_ticket");
   assert.equal(followupDecision.targetTicketId, "ticket-100");
 
-  // 3c. 定时/GitHub 未点名事件走观察模式 -> 满 3 次提议转正
   const ghTrigger = registry.ingest(
     "github",
     "gh-sugent",
@@ -149,7 +149,6 @@ import {
       "2026-11-01T10:00:00.000Z",
     );
 
-    // 排他关系更新：model:new 自动取代 model:old
     kg.applyDelta(
       {
         edges: [{ from: "proj:sugent", relation: "uses_model", to: "model:new", source: "t2", exclusive: true }],
@@ -165,7 +164,6 @@ import {
     assert.ok(ids.includes("wf:sync"));
     assert.ok(!ids.includes("model:old"));
 
-    // 验证 Steward ReviewOps 自动注入与 JSON 解析
     const syncRes = kg.ingestMemoryReviewOps(
       { add: [{ text: "发布流程：先运行 npm run verify:sugent；再执行 git push", topic: "devops" }], remove: [] },
       "bot:default",
@@ -178,17 +176,29 @@ import {
     assert.equal(parsedDelta.nodes?.length, 1);
     assert.equal(parsedDelta.edges?.length, 1);
 
-    // 验证技能自动落盘生成 SKILL.md
     const skillsDir = path.join(tmpDir, "skills");
     const writtenFiles = kg.crystallizeSkillsToDir(skillsDir, 3);
     assert.equal(writtenFiles.length, 1);
     assert.ok(fs.existsSync(writtenFiles[0]));
     assert.ok(fs.readFileSync(writtenFiles[0], "utf8").includes("## 标准执行步骤"));
+
+    // 5. 自我迭代围栏与 sugent-self-dev 技能安装验证
+    assert.equal(assessSelfEditPath("src/sugent/new-feature.ts").risk, "autonomous");
+    assert.equal(assessSelfEditPath("electron/main.ts").risk, "requires_approval");
+    assert.equal(assessSelfEditPath(".git/config").risk, "forbidden");
+
+    const plan = buildSelfEvolutionPlan("Add mail source", "31ef67c", ["src/sugent/sources.ts", "test/sugent-sources.unit.test.ts"]);
+    assert.equal(plan.overallRisk, "autonomous");
+    assert.equal(plan.verificationCommand, "npm run verify:sugent");
+
+    const selfDevSkillPath = installSelfDevSkill(skillsDir);
+    assert.ok(fs.existsSync(selfDevSkillPath));
+    assert.ok(fs.readFileSync(selfDevSkillPath, "utf8").includes("name: sugent-self-dev"));
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 }
 
 console.log(
-  "verify:sugent — 全部核心契约断言通过 (Gateway 解耦 / 四角色路由 / Intake-Eval-Ticket 状态机 / 自主知识图谱与技能落盘结晶)",
+  "verify:sugent — 全部核心契约断言通过 (Gateway 解耦 / 四角色路由 / Intake-Eval-Ticket 状态机 / 自主知识图谱 / 自我迭代围栏)",
 );

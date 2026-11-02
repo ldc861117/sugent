@@ -48,7 +48,7 @@ function showWindow(): void {
   win.focus();
 }
 
-const PRODUCT = "AnyModelBot";
+const PRODUCT = process.env.SUGENT_PRODUCT_NAME || "Sugent";
 const canAutostart = process.platform === "darwin" || process.platform === "win32";
 
 // Windows：也不要系统标题栏，侧栏顶部那一行就是标题栏——左上角是应用图标 + 名称（Windows 的习惯；macOS 那里是红绿灯），

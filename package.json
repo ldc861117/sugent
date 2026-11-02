@@ -31,8 +31,10 @@
     "bundle:dsh": "node scripts/bundle-dsh.mjs",
     "test:dsh-bundle": "node scripts/test-dsh-bundle.mjs",
     "fetch:cua": "node scripts/fetch-cua-driver.mjs",
-    "test:sugent": "vitest run test/sugent.unit.test.ts test/sugent-sources.unit.test.ts",
+    "test:sugent": "vitest run test/sugent.unit.test.ts test/sugent-sources.unit.test.ts test/sugent-kg.unit.test.ts",
     "verify:sugent": "npm run typecheck && npm run build && node scripts/verify-sugent.mjs && npm run docs:check",
+    "sugent:bootstrap": "npm run build && node scripts/bootstrap-self-dev.mjs",
+    "build:icons": "node scripts/build-sugent-icons.mjs",
     "sync:upstreams": "node scripts/sync-upstreams.mjs --check",
     "sync:upstreams:merge": "node scripts/sync-upstreams.mjs --merge"
   },
