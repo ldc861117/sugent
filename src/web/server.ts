@@ -1066,6 +1066,12 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
           steward: { ...cur.steward, ...(b.steward ?? {}) },
         });
         app.store.updateBot(id, { settings: merged });
+        // 切换「自我迭代」开关时工作区 origin 改变：清理该机器人绑定的旧 DSH session（使下一条消息自动以新工作区 origin 建会话并注入首条记忆上下文）
+        if (cur.selfEvolution.enabled !== merged.selfEvolution.enabled) {
+          for (const c of app.store.listConversations(id)) {
+            app.store.clearAgentSession(c.id);
+          }
+        }
         // 暂停 / 恢复后台工作：恢复时排着的 run、主动消息要放出来，经任务服务改
         if (typeof b.paused === "boolean") app.tasks.setPaused(id, b.paused, "web");
         try {
