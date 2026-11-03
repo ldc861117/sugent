@@ -17,7 +17,14 @@ import { DEFAULT_SETTINGS, permissionMode, type BotSettings } from "./settings.j
 import type { AccountService } from "./accounts.js";
 import { acceptsImages } from "../llm/client.js";
 import { CUA_SKILL, MEDIA_SKILL, TASK_RULES, agentPersona, botPrompt } from "./prompts/index.js";
-import { listSelfEvolutionPlugins, prepareSelfEvolutionWorkspace, resolveSelfEvolutionRoot } from "../sugent/self-evolution.js";
+import {
+  buildSelfEvolutionPromptSection,
+  discoverLocalSourceRepo,
+  getOverlayRepoDir,
+  listSelfEvolutionPlugins,
+  prepareSelfEvolutionWorkspace,
+  resolveSelfEvolutionRoot,
+} from "../sugent/self-evolution.js";
 import { t, t as tr } from "../i18n/index.js";
 import { dirBytes, taskSessionDirs } from "../tasks/retention.js";
 
@@ -624,6 +631,7 @@ export class AgentHost {
   private harness: SdkHarness | undefined;
   private starting: Promise<SdkHarness> | undefined;
   private opened = new Set<string>();
+  private sessionCwds = new Map<string, string>();
   private active = 0;
   private failures = 0;
   private nextStartAt = 0;
@@ -970,13 +978,22 @@ exec "$REAL" "$@"
   private env(sysProxy: Record<string, string> = {}): Record<string, string> {
     const shim = this.writeBwrapShim();
     const basePath = process.env.PATH || "/usr/local/bin:/usr/bin:/bin";
+    const allowRead = [
+      path.resolve(this.workspace),
+      path.resolve(this.home),
+      getOverlayRepoDir(this.o.dataDir),
+    ];
+    const localRepo = discoverLocalSourceRepo();
+    if (localRepo) allowRead.push(path.resolve(localRepo));
+    const rawPerm = this.settings().permission;
+    const effectivePerm = this.settings().selfEvolution?.enabled && rawPerm === "readonly" ? "workspace" : rawPerm;
     const env: Record<string, string> = {
       PATH: shim ? `${shim}${path.delimiter}${basePath}` : basePath,
       AMB_DENY_READ: JSON.stringify([path.resolve(this.o.dataDir)]),
-      AMB_ALLOW_READ: JSON.stringify([path.resolve(this.workspace), path.resolve(this.home)]),
+      AMB_ALLOW_READ: JSON.stringify([...new Set(allowRead)]),
       HOME: this.home,
       LANG: "C.UTF-8",
-      DSH_PERMISSION_MODE: permissionMode(this.settings().permission),
+      DSH_PERMISSION_MODE: permissionMode(effectivePerm),
       AMB_MEMORY: this.settings().memory.enabled ? "1" : "0",
       AMB_CONNECTIONS: this.connectionsEnv(),
       AMB_CU_APPROVAL: this.settings().computerUse.approval,
@@ -1024,7 +1041,8 @@ exec "$REAL" "$@"
    */
   private settingsSig(pwsh = pwshProbe.cachedDshPath): string {
     const st = this.settings();
-    return `${st.permission}|${st.memory.enabled}|${st.computerUse.enabled}|${st.computerUse.backend}|${st.computerUse.approval}|${this.connectionsEnv()}|${pwsh ?? ""}`;
+    const selfEvo = st.selfEvolution?.enabled ? `self:${this.workspace}` : "self:off";
+    return `${st.permission}|${st.memory.enabled}|${st.computerUse.enabled}|${st.computerUse.backend}|${st.computerUse.approval}|${selfEvo}|${this.connectionsEnv()}|${pwsh ?? ""}`;
   }
   private sig = "";
 
@@ -1068,7 +1086,11 @@ exec "$REAL" "$@"
   syncPrompt(force = false): void {
     const bot = this.o.store.getBot(this.o.botId);
     const others = this.o.store.listBots().filter((b) => b.id !== this.o.botId).map((b) => ({ name: b.name, persona: b.systemPrompt }));
-    const text = botPrompt({ name: bot?.name ?? "", persona: bot?.systemPrompt ?? "", memory: this.settings().memory.enabled, others });
+    const st = this.settings();
+    let text = botPrompt({ name: bot?.name ?? "", persona: bot?.systemPrompt ?? "", memory: st.memory.enabled, others });
+    if (st.selfEvolution?.enabled) {
+      text += "\n\n" + buildSelfEvolutionPromptSection(this.workspace);
+    }
     if (!force && text === this.promptText) return;
     try {
       fs.mkdirSync(path.dirname(this.promptFile), { recursive: true, mode: 0o700 });
@@ -1316,6 +1338,7 @@ exec "$REAL" "$@"
         if (this.harness !== harness) return;
         this.harness = undefined;
         this.opened.clear();
+        this.sessionCwds.clear();
         this.taskSessions.clear();
         this.taskBusy.clear();
         this.control.close();
@@ -1383,6 +1406,7 @@ exec "$REAL" "$@"
     const h = this.harness;
     this.harness = undefined;
     this.opened.clear();
+    this.sessionCwds.clear();
     this.taskSessions.clear();
     this.taskBusy.clear();
     this.control.close(tr("agent.processRestarted"));
@@ -1400,22 +1424,42 @@ exec "$REAL" "$@"
     }
   }
 
-  /** 会话 → DSH session（重启后从 sqlite resume；resume 失败则开新 session）。 */
+  /** 会话 → DSH session（重启后从 sqlite resume；resume 失败或工作区 origin 已切换则开新 session，因为 DSH session 的沙箱 origin 在创建时固化）。 */
   private async sessionFor(h: SdkHarness, conversationId: string): Promise<SdkSession> {
+    const targetWs = path.resolve(this.workspace);
     const stored = this.o.store.getAgentSession(conversationId);
-    if (stored && this.opened.has(stored)) return h.session(stored);
-    if (stored) {
+    const storedOrigin = stored ? this.o.store.getKV(`sess_origin:${stored}`) : undefined;
+    const originChanged = !!stored && !!storedOrigin && path.resolve(storedOrigin) !== targetWs;
+    let s: SdkSession | undefined;
+    if (stored && !originChanged && this.opened.has(stored)) {
+      s = h.session(stored);
+    } else if (stored && !originChanged) {
       try {
-        const s = await h.resumeSession(stored);
+        s = await h.resumeSession(stored);
         this.opened.add(stored);
-        return s;
       } catch (e) {
         log.warn("session resume failed, starting new", { message: (e as Error).message.slice(0, 200) });
       }
     }
-    const s = h.session();
-    this.o.store.setAgentSession(conversationId, this.o.botId, s.id);
-    this.opened.add(s.id);
+    if (s && this.sessionCwds.get(s.id) !== targetWs) {
+      try {
+        await s.setWorkingDirectory(targetWs);
+        this.sessionCwds.set(s.id, targetWs);
+        this.o.store.setKV(`sess_origin:${s.id}`, targetWs);
+      } catch {
+        // 旧会话的固化 origin 不允许切换到新的工作区（例如从 workspaces/default 切到 self-repo）：必须新建绑定新 origin 的 DSH session
+        log.info("recreating dsh session for new workspace origin", { bot: this.o.botId, conversationId, workspace: targetWs });
+        s = undefined;
+      }
+    }
+    if (!s) {
+      s = h.session();
+      await s.setWorkingDirectory(targetWs).catch(() => undefined);
+      this.sessionCwds.set(s.id, targetWs);
+      this.o.store.setKV(`sess_origin:${s.id}`, targetWs);
+      this.o.store.setAgentSession(conversationId, this.o.botId, s.id);
+      this.opened.add(s.id);
+    }
     return s;
   }
 

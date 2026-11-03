@@ -1068,6 +1068,12 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
         app.store.updateBot(id, { settings: merged });
         // 暂停 / 恢复后台工作：恢复时排着的 run、主动消息要放出来，经任务服务改
         if (typeof b.paused === "boolean") app.tasks.setPaused(id, b.paused, "web");
+        try {
+          app.agent.host(id).syncPrompt(true);
+        } catch {
+          /* ignore */
+        }
+        void app.agent.refreshIdle();
         const next = app.store.getBot(id)!;
         return send(res, 200, { settings: next.settings, computerUse: app.agent.computerUse(id) });
       }

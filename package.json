@@ -75,6 +75,9 @@
     "files": [
       "dist/**",
       "ui/**",
+      "src/sugent/**",
+      "ARCHITECTURE.md",
+      "AGENTS.md",
       "assets/**",
       "!assets/icon.icns",
       "!assets/icons{,/**}",

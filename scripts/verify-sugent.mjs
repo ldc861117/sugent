@@ -15,6 +15,8 @@ import {
   assessSelfEditPath,
   buildMagpieEnvOverrides,
   buildSelfEvolutionPlan,
+  buildSelfEvolutionPromptSection,
+  discoverLocalSourceRepo,
   ensureSelfEvolutionOverlay,
   evaluatePersonalTrigger,
   installSelfDevSkill,
@@ -202,10 +204,22 @@ import { normalizeSettings } from "../dist/src/agent/settings.js";
     const resolvedRoot = resolveSelfEvolutionRoot(tmpDir);
     assert.ok(fs.existsSync(path.join(resolvedRoot, "package.json")));
 
-    // 模拟打包态 (app.asar) 下自动回退到 <dataDir>/self-repo 热覆盖层
+    // 模拟打包态 (app.asar) 下自动回退到 <dataDir>/self-repo 热覆盖层，并验证核心代码镜像、文档与提示词强感知
     const packagedRoot = resolveSelfEvolutionRoot(tmpDir, "/Applications/Sugent.app/Contents/Resources/app.asar");
     assert.equal(packagedRoot, path.join(tmpDir, "self-repo"));
     assert.ok(fs.existsSync(path.join(packagedRoot, "README_SELF_EVOLUTION.md")));
+    assert.ok(fs.existsSync(path.join(packagedRoot, "src", "sugent", "self-evolution.ts")));
+    assert.ok(fs.existsSync(path.join(packagedRoot, "ui", "main.js")));
+
+    const fullPrompt = buildSelfEvolutionPromptSection(resolvedRoot);
+    assert.ok(fullPrompt.includes("Self-Evolution Mode 已开启"));
+    assert.ok(fullPrompt.includes(resolvedRoot));
+    assert.ok(fullPrompt.includes("Full-Source Git Mode"));
+
+    const overlayPrompt = buildSelfEvolutionPromptSection(packagedRoot);
+    assert.ok(overlayPrompt.includes("Hot-Overlay Mode"));
+    assert.ok(overlayPrompt.includes(packagedRoot));
+    assert.ok(discoverLocalSourceRepo()?.endsWith("sugent"));
 
     // 验证 UI Copy-on-Write 热覆盖与回退
     const builtinUi = path.join(resolvedRoot, "ui");
