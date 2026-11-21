@@ -1,8 +1,16 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
-import { SugentKnowledgeGraph } from "../src/sugent/index.js";
+import { afterEach, describe, expect, it } from "vitest";
+import { AgentManager } from "../src/agent/manager.js";
+import { Store } from "../src/store/db.js";
+import { REVIEW_SYSTEM } from "../src/agent/steward.js";
+import { SugentKnowledgeGraph, resolveUnifiedKnowledgeGraphDir } from "../src/sugent/knowledge-graph.js";
+
+let reviewDir: string;
+afterEach(() => {
+  if (reviewDir) fs.rmSync(reviewDir, { recursive: true, force: true });
+});
 
 describe("Sugent Autonomous Knowledge Graph & Skill Crystallization", () => {
   it("supports multi-hop subgraph recall, exclusive temporal edge superseding, and skill crystallization", () => {
@@ -67,6 +75,73 @@ describe("Sugent Autonomous Knowledge Graph & Skill Crystallization", () => {
       expect(skills[0].markdown).toContain("npm run verify:sugent");
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("writes workflows crystallized during memory review into the current bot's DSH skills root", async () => {
+    reviewDir = fs.mkdtempSync(path.join(os.tmpdir(), "sugent-review-"));
+    const store = new Store(":memory:");
+    store.createBot({ id: "b", name: "b" });
+    store.ensureConversation("b", "web", "console");
+    const workflow = "Release workflow: first run npm run verify:sugent; then run git push";
+    const mgr = new AgentManager({
+      store,
+      dataDir: reviewDir,
+      runtimeDir: "/rt",
+      upstream: () => ({ baseUrl: "", apiKey: "" }),
+      enabled: true,
+      complete: async (_bot, _model, system) => system === REVIEW_SYSTEM
+        ? JSON.stringify({ add: [{ text: workflow, topic: "devops" }], remove: [] })
+        : "",
+    });
+
+    for (let i = 0; i < 3; i++) {
+      store.addMessage("b:web:console", "user", `review ${i}`);
+      store.addMessage("b:web:console", "assistant", `done ${i}`);
+      await mgr.review("b", "b:web:console", "m");
+    }
+
+    const skillsRoot = path.join(reviewDir, "dsh", "b", "skills");
+    const skillDirs = fs.readdirSync(skillsRoot, { withFileTypes: true }).filter((entry) => entry.isDirectory());
+    expect(skillDirs).toHaveLength(1);
+    const skillFile = path.join(skillsRoot, skillDirs[0]!.name, "SKILL.md");
+    expect(fs.readFileSync(skillFile, "utf8")).toContain("npm run verify:sugent");
+    expect(fs.existsSync(path.join(reviewDir, "dsh", "skills"))).toBe(false);
+    store.close();
+  });
+
+  it("migrates legacy <dataDir>/knowledge-graph into unified sugent-kg and executes ops.remove", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "sugent-kg-unified-"));
+    try {
+      const legacy = new SugentKnowledgeGraph(path.join(tmp, "knowledge-graph"));
+      legacy.applyDelta({
+        nodes: [{ id: "mem:general:old", kind: "preference", name: "Old", summary: "legacy preference", tags: [] }],
+        edges: [{ from: "scope:b", relation: "remembers", to: "mem:general:old", source: "legacy" }],
+      });
+
+      const unifiedDir = resolveUnifiedKnowledgeGraphDir(tmp);
+      expect(unifiedDir).toBe(path.join(tmp, "sugent-kg"));
+      const unifiedKg = new SugentKnowledgeGraph(unifiedDir);
+      expect(unifiedKg.getNode("mem:general:old")?.summary).toBe("legacy preference");
+
+      const res1 = unifiedKg.ingestMemoryReviewOps(
+        { add: [{ text: "回复先给结论再给背景", topic: "style" }], remove: [] },
+        "b",
+        "2026-11-21T10:00:00.000Z",
+      );
+      expect(res1.upsertedEdges).toBe(1);
+      expect(unifiedKg.activeEdges().some((e) => e.from === "scope:b" && e.relation === "has_style")).toBe(true);
+
+      const res2 = unifiedKg.ingestMemoryReviewOps(
+        { add: [], remove: ["先给结论"] },
+        "b",
+        "2026-11-21T11:00:00.000Z",
+      );
+      expect(res2.removedEdges).toBe(1);
+      const reloaded = new SugentKnowledgeGraph(unifiedDir);
+      expect(reloaded.activeEdges().some((e) => e.from === "scope:b" && e.relation === "has_style")).toBe(false);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
     }
   });
 });

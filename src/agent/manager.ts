@@ -30,7 +30,7 @@ import {
   stewardRequest,
   type Line,
 } from "./steward.js";
-import { KG_EXTRACTION_SYSTEM, SugentKnowledgeGraph, parseKGDelta } from "../sugent/knowledge-graph.js";
+import { KG_EXTRACTION_SYSTEM, SugentKnowledgeGraph, parseKGDelta, resolveUnifiedKnowledgeGraphDir } from "../sugent/knowledge-graph.js";
 
 const log = logger("agent");
 
@@ -40,6 +40,7 @@ const AUTO_REJECT = "auto-reject:";
 export interface AgentManagerOptions {
   store: Store;
   dataDir: string;
+  knowledgeGraph?: SugentKnowledgeGraph;
   runtimeDir: string | undefined;
   upstream: () => { baseUrl: string; apiKey: string };
   enabled: boolean;
@@ -215,7 +216,7 @@ export class AgentManager {
       },
     });
     this.memory = new MemoryStore(path.join(o.dataDir, "memory"));
-    this.knowledgeGraph = new SugentKnowledgeGraph(path.join(o.dataDir, "knowledge-graph"));
+    this.knowledgeGraph = o.knowledgeGraph ?? new SugentKnowledgeGraph(resolveUnifiedKnowledgeGraphDir(o.dataDir));
     this.apiFallbacks = new ApiFallbacks(path.join(o.dataDir, "dsh", "api-fallback.json"));
   }
 
@@ -650,7 +651,9 @@ export class AgentManager {
       }
     }
     try {
-      const skillsDir = path.join(this.o.dataDir, "dsh", "skills", "crystallized");
+      // DSH discovers direct skill children under each bot's own home/skills root.
+      // Keep crystallized skills bot-scoped so one bot's catalog cannot leak into another.
+      const skillsDir = path.join(this.o.dataDir, "dsh", botId, "skills");
       this.knowledgeGraph.ingestMemoryReviewOps(ops, this.memory.key(scope));
       if (process.env.SUGENT_KG_DEEP_EXTRACT === "1") {
         const kgOut = await this.o.complete(botId, this.utilityModel(botId, model), KG_EXTRACTION_SYSTEM, recentTranscript(lines, 12_000));

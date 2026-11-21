@@ -11,7 +11,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { SugentKnowledgeGraph, installSelfDevSkill } from "../dist/src/sugent/index.js";
+import { SugentKnowledgeGraph, resolveUnifiedKnowledgeGraphDir } from "../dist/src/sugent/knowledge-graph.js";
+import { installSelfDevSkill } from "../dist/src/sugent/self-evolution.js";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -25,10 +26,12 @@ function targetDataDirs() {
 }
 
 for (const dataDir of targetDataDirs()) {
-  const skillsDir = path.join(dataDir, "dsh", "skills", "crystallized");
+  // The bootstrap script seeds the built-in default bot. Runtime reviews use the
+  // same per-bot DSH home layout for crystallized skills.
+  const skillsDir = path.join(dataDir, "dsh", "default", "skills");
   const skillFile = installSelfDevSkill(skillsDir);
 
-  const kgDir = path.join(dataDir, "knowledge-graph");
+  const kgDir = resolveUnifiedKnowledgeGraphDir(dataDir);
   const kg = new SugentKnowledgeGraph(kgDir);
   kg.applyDelta({
     nodes: [

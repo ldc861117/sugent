@@ -125,6 +125,39 @@ export function parseKGDelta(raw: string): KGDelta {
   }
 }
 
+/**
+ * 统一解析知识图谱根目录（`<dataDir>/sugent-kg`）：
+ * 若目标目录尚无 `knowledge-graph.json`，而旧版 `<dataDir>/knowledge-graph/` 已有档案，
+ * 则自动将旧图谱与流水迁移到统一目录，彻底消除 `App` 与 `AgentManager` 双库分裂。
+ */
+export function resolveUnifiedKnowledgeGraphDir(dataDir: string): string {
+  const base = path.resolve(dataDir);
+  const targetDir = path.join(base, "sugent-kg");
+  const legacyDir = path.join(base, "knowledge-graph");
+  fs.mkdirSync(targetDir, { recursive: true, mode: 0o700 });
+  const targetGraph = path.join(targetDir, "knowledge-graph.json");
+  const legacyGraph = path.join(legacyDir, "knowledge-graph.json");
+  if (!fs.existsSync(targetGraph) && fs.existsSync(legacyGraph)) {
+    fs.copyFileSync(legacyGraph, targetGraph);
+    try {
+      fs.chmodSync(targetGraph, 0o600);
+    } catch {
+      /* ignore */
+    }
+    const legacyJournal = path.join(legacyDir, "kg-journal.jsonl");
+    const targetJournal = path.join(targetDir, "kg-journal.jsonl");
+    if (fs.existsSync(legacyJournal) && !fs.existsSync(targetJournal)) {
+      fs.copyFileSync(legacyJournal, targetJournal);
+      try {
+        fs.chmodSync(targetJournal, 0o600);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+  return targetDir;
+}
+
 export class SugentKnowledgeGraph {
   private nodes = new Map<string, KGNode>();
   private edges = new Map<string, KGEdge>();
@@ -234,15 +267,27 @@ export class SugentKnowledgeGraph {
   }
 
   /**
+   * 显式将指定活跃边标记为已取代（用于知识清理、记忆园丁修剪与 ReviewOps 移除）。
+   */
+  removeEdge(edgeId: string, now = new Date().toISOString()): boolean {
+    const existing = this.edges.get(edgeId);
+    if (!existing || existing.supersededAt) return false;
+    existing.supersededAt = now;
+    this.appendJournal({ op: "remove_edge", id: edgeId, source: existing.source });
+    this.save();
+    return true;
+  }
+
+  /**
    * 将上下文管家（steward.ts REVIEW_SYSTEM）产出的 ReviewOps 自动同步沉淀至知识图谱：
    * - 将新增条目转化为 `preference` 或 `concept` 节点，并与对应的 `scope` 及 `topic` 建立语义边；
-   * - 将删除条目对应的关联节点执行弱化或移除。
+   * - 将删除条目对应的关联活跃边标记为 supersededAt 并落盘。
    */
   ingestMemoryReviewOps(
     ops: { add: Array<{ text: string; topic?: string }>; remove: string[] },
     scopeKey: string,
     now = new Date().toISOString(),
-  ): { upsertedNodes: number; upsertedEdges: number } {
+  ): { upsertedNodes: number; upsertedEdges: number; removedEdges: number } {
     const delta: KGDelta = { nodes: [], edges: [] };
     const scopeNodeId = `scope:${scopeKey}`;
     delta.nodes!.push({
@@ -280,8 +325,28 @@ export class SugentKnowledgeGraph {
       });
     }
 
-    if (!delta.nodes!.length && !delta.edges!.length) return { upsertedNodes: 0, upsertedEdges: 0 };
-    return this.applyDelta(delta, now);
+    let removedEdges = 0;
+    const removeTerms = (ops.remove ?? []).map((r) => String(r ?? "").trim().toLowerCase()).filter(Boolean);
+    if (removeTerms.length > 0) {
+      for (const edge of this.edges.values()) {
+        if (edge.supersededAt || edge.from !== scopeNodeId) continue;
+        const targetNode = this.nodes.get(edge.to);
+        const hay = `${edge.to} ${targetNode?.name ?? ""} ${targetNode?.summary ?? ""}`.toLowerCase();
+        if (removeTerms.some((term) => hay.includes(term))) {
+          edge.supersededAt = now;
+          removedEdges++;
+          this.appendJournal({ op: "remove_edge", id: edge.id, source: "steward_review" });
+        }
+      }
+    }
+
+    const applied = delta.nodes!.length > 1 || delta.edges!.length > 0
+      ? this.applyDelta(delta, now)
+      : { upsertedNodes: 0, upsertedEdges: 0 };
+    if (removedEdges > 0 && applied.upsertedNodes === 0 && applied.upsertedEdges === 0) {
+      this.save();
+    }
+    return { ...applied, removedEdges };
   }
 
   getNode(id: string): KGNode | undefined {
@@ -297,10 +362,26 @@ export class SugentKnowledgeGraph {
    * 先通过关键词匹配种子实体，再沿活跃关系边向外扩展 `maxHops` 跳，生成结构化上下文快照。
    */
   recallSubgraph(query: string, maxHops = 2, maxNodes = 20): SubgraphSnapshot {
-    const terms = query
-      .toLowerCase()
-      .split(/\s+/)
-      .filter(Boolean);
+    const rawLower = query.toLowerCase().trim();
+    const terms: string[] = [];
+    if (rawLower) {
+      for (const tok of rawLower.split(/[\s,.;:!?，。；：！？、()（）【】\[\]"'“”‘’]+/).filter(Boolean)) {
+        const asciiMatches = tok.match(/[a-z0-9_-]{2,}/g) ?? [];
+        terms.push(...asciiMatches);
+        const cjkClean = tok.replace(
+          /(请问|一下|什么情况|是什么|怎么|情况|目前|现在|关于|能不能|可以|帮我|的|了|吗|呢|啊|吧)/g,
+          " ",
+        );
+        for (const seg of cjkClean.split(/\s+/).filter(Boolean)) {
+          const chars = Array.from(seg).filter((ch) => /\p{Script=Han}/u.test(ch));
+          if (chars.length === 1) terms.push(chars[0]!);
+          for (let i = 0; i + 1 < chars.length; i++) {
+            terms.push(chars[i]! + chars[i + 1]!);
+          }
+        }
+        if (terms.length === 0) terms.push(tok);
+      }
+    }
 
     const visited = new Set<string>();
     let frontier = new Set<string>();
@@ -402,5 +483,21 @@ export class SugentKnowledgeGraph {
       this.appendJournal({ op: "crystallize_skill", skillName: item.skillName, file, reinforcements: item.node.reinforcements });
     }
     return writtenPaths;
+  }
+
+  allNodes(): KGNode[] {
+    return Array.from(this.nodes.values());
+  }
+
+  allEdges(): KGEdge[] {
+    return Array.from(this.edges.values());
+  }
+
+  replaceAll(nodes: readonly KGNode[], edges: readonly KGEdge[]): void {
+    this.nodes.clear();
+    this.edges.clear();
+    for (const n of nodes) this.nodes.set(n.id, n);
+    for (const e of edges) this.edges.set(e.id, e);
+    this.save();
   }
 }
