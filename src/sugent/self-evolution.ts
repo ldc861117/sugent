@@ -5,17 +5,16 @@
  *
  * 1. 开发者源码态（本地有完整 Git 仓库）：
  *    - 自动通过相对路径绑定项目根目录（`./`），支持修改 `src/sugent/`、`ui/`、`skills/` 并执行 `npm run verify:sugent` 编译与 Git 推送。
- * 2. 普通用户安装包态（只读 `app.asar` 黄金镜像 + 可写 `<dataDir>/self-repo` 热覆盖层 OverlayFS）：
+ * 2. 普通用户安装包态（只读 `app.asar` 黄金镜像 + 可写 `<dataDir>/self-repo` 扩展目录）：
  *    - 黄金镜像不动：`/Applications/Sugent.app` 内部签名与 `app.asar` 保持只读，确保应用永远不会破坏系统签名或"改砖"；
- *    - 写时复制热覆盖（Copy-on-Write Overlay）：开启自我迭代时，自动在 `<dataDir>/self-repo/` 初始化 `ui/`（免编译 Preact+htm 前端模块）、`plugins/`（DSH Cordis `.mjs` 运行时插件）、`skills/`（`SKILL.md` 技能）及 `src/sugent/` 核心架构镜像；
- *    - 动态劫持加载：`src/web/server.ts` 优先加载 `<dataDir>/self-repo/ui/` 下被 Agent 演进过的文件，未修改文件无缝回退至 `app.asar/ui/`；
+ *    - 仅允许新增 `plugins/`（DSH Cordis `.mjs` 运行时插件）与 `skills/`（`SKILL.md` 技能）；`src/sugent/` 只作为只读参考镜像；
  *    - 一键安全回滚（Factory Reset）：若 Agent 改坏了某个界面或插件，调用 `resetSelfEvolutionOverlay()` 即可瞬间回退至出厂黄金镜像。
  */
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { findAppRoot } from "../magpie/supervisor.js";
-import { SugentKnowledgeGraph } from "./knowledge-graph.js";
+import { SugentKnowledgeGraph, resolveUnifiedKnowledgeGraphDir } from "./knowledge-graph.js";
 
 export type EvolutionRiskLevel = "autonomous" | "requires_approval" | "forbidden";
 
@@ -34,6 +33,31 @@ export interface SelfEvolutionPlan {
   verificationCommand: string;
 }
 
+export type SelfEvolutionMode = "packaged" | "source";
+
+export const SUGENT_PLUGIN_API_VERSION = 1;
+export const SUGENT_PLUGIN_ID_PREFIX = "sugent-ext-";
+
+export interface SelfEvolutionPluginManifest {
+  id: string;
+  apiVersion: number;
+  name?: string;
+  version?: string;
+}
+
+export interface SelfEvolutionPlugin {
+  id: string;
+  filePath: string;
+  manifestPath: string;
+  manifest: SelfEvolutionPluginManifest;
+}
+
+export interface SelfEvolutionPluginIssue {
+  filePath: string;
+  reason: string;
+  manifestPath?: string;
+}
+
 /**
  * 判断当前是否运行在打包后的只读归档（`app.asar`）模式下
  */
@@ -45,6 +69,12 @@ export function isPackagedAsar(appRoot = findAppRoot()): boolean {
  * 获取普通用户安装包模式下的热覆盖层根目录 `<dataDir>/self-repo`
  */
 export function getOverlayRepoDir(dataDir: string): string {
+  return path.join(path.resolve(dataDir), "self-repo", "extensions");
+}
+
+/** Stable root for read-only references and migration metadata. It is outside the
+ * packaged agent's workspace-write origin; only `getOverlayRepoDir()` is writable. */
+function getSelfEvolutionRootDir(dataDir: string): string {
   return path.join(path.resolve(dataDir), "self-repo");
 }
 
@@ -130,27 +160,102 @@ function copyFileIfMissing(srcFile: string, destFile: string): void {
   }
 }
 
+function archivePackagedUiOverlay(dataDir: string, overlayDir: string): string | undefined {
+  const uiDir = path.join(overlayDir, "ui");
+  if (!fs.existsSync(uiDir)) return undefined;
+  const archiveDir = path.join(path.resolve(dataDir), `self-repo-ui.backup-${Date.now()}`);
+  try {
+    fs.renameSync(uiDir, archiveDir);
+    fs.writeFileSync(
+      path.join(getSelfEvolutionRootDir(dataDir), "UI_OVERLAY_DISABLED.md"),
+      ["# 旧版 UI 覆盖已停用", "", `旧 UI 文件已保留在：\`${archiveDir}\`。`, "应用现在始终使用随官方版本发布的 UI。"].join("\n"),
+      { mode: 0o600 },
+    );
+    return archiveDir;
+  } catch {
+    return undefined;
+  }
+}
+
+export function getSelfEvolutionUiArchiveNotice(dataDir: string): string | undefined {
+  const noticePath = path.join(getSelfEvolutionRootDir(dataDir), "UI_OVERLAY_DISABLED.md");
+  try {
+    return fs.existsSync(noticePath) ? fs.readFileSync(noticePath, "utf8") : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Apply one-time packaged migrations even when the per-bot self-evolution switch is off. */
+export function migratePackagedSelfEvolutionData(dataDir: string): string {
+  const rootDir = getSelfEvolutionRootDir(dataDir);
+  const workspaceDir = getOverlayRepoDir(dataDir);
+  fs.mkdirSync(path.join(workspaceDir, "plugins"), { recursive: true, mode: 0o700 });
+  fs.mkdirSync(path.join(workspaceDir, "skills"), { recursive: true, mode: 0o700 });
+  archivePackagedUiOverlay(dataDir, rootDir);
+  migrateLegacyExtensionDir(rootDir, "plugins");
+  migrateLegacyExtensionDir(rootDir, "skills");
+  for (const linkPath of [path.join(rootDir, "source-repo"), path.join(workspaceDir, "source-repo")]) {
+    try {
+      if (fs.lstatSync(linkPath).isSymbolicLink()) fs.unlinkSync(linkPath);
+    } catch {
+      /* absent */
+    }
+  }
+  return workspaceDir;
+}
+
+/** Move legacy top-level extension files into the constrained writable workspace. */
+function migrateLegacyExtensionDir(rootDir: string, name: "plugins" | "skills"): void {
+  const legacyDir = path.join(rootDir, name);
+  const targetDir = path.join(rootDir, "extensions", name);
+  if (!fs.existsSync(legacyDir) || legacyDir === targetDir) return;
+  fs.mkdirSync(targetDir, { recursive: true, mode: 0o700 });
+  const displacedDir = path.join(rootDir, `legacy-${name}-${Date.now()}`);
+  for (const entry of fs.readdirSync(legacyDir, { withFileTypes: true })) {
+    const from = path.join(legacyDir, entry.name);
+    const to = path.join(targetDir, entry.name);
+    try {
+      if (fs.existsSync(to)) {
+        fs.mkdirSync(displacedDir, { recursive: true, mode: 0o700 });
+        fs.renameSync(from, path.join(displacedDir, entry.name));
+      } else {
+        fs.renameSync(from, to);
+      }
+    } catch {
+      // Keep an unreadable legacy item in place rather than deleting user data.
+    }
+  }
+  try {
+    if (fs.readdirSync(legacyDir).length === 0) fs.rmSync(legacyDir, { recursive: true, force: true });
+  } catch {
+    /* ignore */
+  }
+}
+
 /**
- * 初始化普通用户安装包态的 `<dataDir>/self-repo` 热演进工作区：
- * 将免编译的 `ui/` 源码、核心架构模块 `src/sugent/`、扩展插件目录 `plugins/`、技能目录 `skills/` 及架构文档同步到可写目录中，
- * 让没有安装 Git 或编译器的普通用户也能直接让 Agent 阅读自身架构、修改界面、新增插件与扩展能力。
+ * 初始化普通用户安装包态的 `<dataDir>/self-repo` 扩展工作区：保留插件、技能与只读架构参考。
  */
 export function ensureSelfEvolutionOverlay(dataDir: string, appRoot = findAppRoot()): string {
+  const rootDir = getSelfEvolutionRootDir(dataDir);
   const overlayDir = getOverlayRepoDir(dataDir);
-  fs.mkdirSync(path.join(overlayDir, "ui"), { recursive: true, mode: 0o700 });
   fs.mkdirSync(path.join(overlayDir, "plugins"), { recursive: true, mode: 0o700 });
   fs.mkdirSync(path.join(overlayDir, "skills"), { recursive: true, mode: 0o700 });
-  fs.mkdirSync(path.join(overlayDir, "src", "sugent"), { recursive: true, mode: 0o700 });
 
   const normalizedRoot = path.resolve(appRoot);
+  const packaged = isPackagedAsar(normalizedRoot);
+  if (packaged) {
+    migratePackagedSelfEvolutionData(dataDir);
+  }
+  fs.mkdirSync(path.join(rootDir, "src", "sugent"), { recursive: true, mode: 0o700 });
   const localRepo = discoverLocalSourceRepo(normalizedRoot);
   const seedBase = fs.existsSync(path.join(normalizedRoot, "ui")) ? normalizedRoot : localRepo;
 
   if (seedBase) {
-    copyDirIfMissing(path.join(seedBase, "ui"), path.join(overlayDir, "ui"));
-    copyDirIfMissing(path.join(seedBase, "src", "sugent"), path.join(overlayDir, "src", "sugent"));
-    copyFileIfMissing(path.join(seedBase, "ARCHITECTURE.md"), path.join(overlayDir, "ARCHITECTURE.md"));
-    copyFileIfMissing(path.join(seedBase, "AGENTS.md"), path.join(overlayDir, "AGENTS.md"));
+    if (!packaged) copyDirIfMissing(path.join(seedBase, "ui"), path.join(overlayDir, "ui"));
+    copyDirIfMissing(path.join(seedBase, "src", "sugent"), path.join(rootDir, "src", "sugent"));
+    copyFileIfMissing(path.join(seedBase, "ARCHITECTURE.md"), path.join(rootDir, "ARCHITECTURE.md"));
+    copyFileIfMissing(path.join(seedBase, "AGENTS.md"), path.join(rootDir, "AGENTS.md"));
   }
 
   // 确保 plugins/ 与 skills/ 目录下始终有实体文件（避免 glob / rg --files 忽略空目录导致 Agent 以为目录不存在）
@@ -161,10 +266,11 @@ export function ensureSelfEvolutionOverlay(dataDir: string, appRoot = findAppRoo
       [
         "# Sugent 运行时扩展插件目录 (`./plugins/`)",
         "",
-        "Agent 可在此目录 (`./plugins/`) 下新建 `.mjs` 插件文件（DeepSeek Harness Cordis 插件格式），宿主会在下次启动回合自动挂载：",
+        "每个插件都需要同名 JSON sidecar（例如 `hello.mjs` + `hello.json`），声明插件 ID 和当前兼容 API 版本后宿主才会挂载：",
         "",
         "```js",
-        "export const name = 'sugent-custom-plugin';",
+        "// hello.json: { \"id\": \"sugent-ext-hello\", \"apiVersion\": 1 }",
+        "export const name = 'sugent-ext-hello';",
         "export function apply(ctx) {",
         "  // 在此注册自定义工具 (ctx.tools.register) 或生命周期钩子 (ctx.on)",
         "}",
@@ -176,36 +282,33 @@ export function ensureSelfEvolutionOverlay(dataDir: string, appRoot = findAppRoo
   }
   installSelfDevSkill(path.join(overlayDir, "skills"));
 
-  // 若本机同时存在完整 Git 源码仓库，在热演进目录中建立 ./source-repo 软链接，方便 Agent 直接定位完整源码仓库
-  if (localRepo && localRepo !== overlayDir) {
-    const linkPath = path.join(overlayDir, "source-repo");
-    try {
-      if (!fs.existsSync(linkPath)) {
-        fs.symlinkSync(localRepo, linkPath, "dir");
-      }
-    } catch {
-      /* ignore symlink errors on restricted filesystems */
-    }
+  // Never expose a writable source-repo symlink from the packaged workspace.
+  const linkPath = path.join(overlayDir, "source-repo");
+  try {
+    if (fs.lstatSync(linkPath).isSymbolicLink()) fs.unlinkSync(linkPath);
+  } catch {
+    /* absent */
   }
 
-  const readmeFile = path.join(overlayDir, "README_SELF_EVOLUTION.md");
+  const readmeFile = path.join(packaged ? rootDir : overlayDir, "README_SELF_EVOLUTION.md");
   fs.writeFileSync(
     readmeFile,
     [
       "# Sugent 自身框架热演进工作区 (Self-Evolution Workspace)",
       "",
-      "当前目录（`./`）就是你（**Sugent**）自身正在运行的框架演进目录！",
+      packaged
+        ? "当前目录（`./`）是 Sugent 的可写扩展目录；打包版 Agent 只能自主修改 skills/ 和 plugins/。只读架构参考在上级 self-repo 目录。"
+        : "当前目录（`./`）就是 Sugent 自身的完整源码工作区。",
       "",
       "## 目录结构与自演进指南",
-      "- `./ui/`：**你自己的前端界面源码**（Preact + htm 原生 ES Module，免编译）。直接修改 `./ui/screens/`、`./ui/components/` 或 `./ui/css/` 下的文件，服务端会通过写时复制（OverlayFS）优先加载你修改的文件，刷新窗口立即生效！",
-      "- `./plugins/`：**你自己的 DSH 运行时扩展插件目录**。在此处新建 `.mjs` 插件文件（Cordis 插件格式），宿主会在下一轮或重启时自动将其挂载进你的运行时。",
+      ...(packaged ? [] : ["- `./ui/`：源码态前端界面源码，修改后刷新即可生效。"]),
+      "- `./plugins/`：DSH 运行时扩展插件目录；每个 `.mjs` 必须配套同名 `.json` sidecar，声明 `id: sugent-ext-<slug>` 与兼容的 `apiVersion` 后才会加载。",
       "- `./skills/`：**你自己的技能库目录**。新建 `<skill-name>/SKILL.md` 即可沉淀新技能。",
-      "- `./src/sugent/` 与 `./ARCHITECTURE.md`：**你自己的核心架构代码与蓝图**（包含 `kernel.ts` 状态机、`gateway.ts` 四角色模型网关、`knowledge-graph.ts` 知识图谱与技能结晶、`self-evolution.ts` 自我演进引擎、`sources.ts` 多源感知）。",
-      ...(localRepo
-        ? [
-            `- \`./source-repo\` -> \`${localRepo}\`：**本机完整 Git 源码仓库软链接**。若需修改底层 TypeScript 内核并编译验证，可直接进入 \`${localRepo}\` 修改并运行 \`npm run verify:sugent\`。`,
-          ]
-        : []),
+      ...(packaged
+        ? [`- 只读核心架构参考：\`${path.join(rootDir, "src", "sugent")}\` 与 \`${path.join(rootDir, "ARCHITECTURE.md")}\`；打包态修改不会改变正在运行的应用。`]
+        : ["- `./src/sugent/` 与 `./ARCHITECTURE.md`：源码态核心架构文件。"]),
+      ...(getSelfEvolutionUiArchiveNotice(dataDir) ? ["", "## UI 覆盖归档通知", getSelfEvolutionUiArchiveNotice(dataDir)!] : []),
+      ...(localRepo ? [packaged ? `- 发现完整源码仓库 \`${localRepo}\`；打包态仅允许修改本目录的 skills/ 与 plugins/。` : `- 完整 Git 源码仓库：\`${localRepo}\`。`] : []),
       "",
     ].join("\n"),
     { mode: 0o600 },
@@ -240,10 +343,14 @@ export function buildSelfEvolutionPromptSection(workspaceRoot: string): string {
   const lines = [
     "# 自我迭代与框架代码自治（Self-Evolution Mode 已开启）",
     "",
-    "> **最高优先级状态声明（覆盖此前对话中的任何旧认知）**：你本身就是 **Sugent (Super-Agent)** 桌面智能体系统。主人已在界面上为你开启「自我迭代与代码自治」开关！即使你在之前的对话回合中曾回答“不能修改我本身的底层模型或运行时”，现在权限已正式开启，你的工作目录已直接绑定至你自身的框架源码。",
+    isFullSource
+      ? "> **最高优先级状态声明**：你本身就是 **Sugent (Super-Agent)** 桌面智能体系统。当前工作目录绑定到完整源码仓库，可按源码态 Git 工作流进行迭代。"
+      : "> **最高优先级状态声明**：你本身就是 **Sugent (Super-Agent)** 桌面智能体系统。打包版工作目录是扩展目录，只允许自主修改 Skills 和兼容插件。",
     "",
-    `- **你的自身框架路径**：当前工作目录 \`./\`（绝对路径：\`${normRoot}\`）**就是你自己正在运行的 Sugent 框架代码工作区**。无需让用户提供项目或路径，直接对 \`./\` 执行文件查看、编辑或运行命令就是在迭代你自己！`,
-    "- **严禁推诿**：当用户要求你「迭代自己的框架代码」「修改自己的界面」「给自己增加功能/插件/技能」时，绝不要说“无法修改自身框架”，也不要询问项目在哪里，请立即用工具检查 `./` 下的文件并直接动手实现。",
+    `- **当前工作区**：\`./\`（绝对路径：\`${normRoot}\`）。按下面的模式说明处理其中的文件。`,
+    isFullSource
+      ? "- 用户要求修改完整源码时，先检查当前仓库与未提交改动，再按仓库规范实现和验证。"
+      : "- 用户要求修改核心代码或界面时，说明打包版不开放这些路径；Skills 与插件扩展可直接在允许目录内实现。",
   ];
 
   if (isFullSource) {
@@ -257,15 +364,14 @@ export function buildSelfEvolutionPromptSection(workspaceRoot: string): string {
     );
   } else {
     lines.push(
-      "- **当前工作区模式：打包应用热演进覆盖层态（Hot-Overlay Mode）**",
-      "  - `./ui/`：你的前端界面源码（Preact + htm 原生 ES Module，免编译！直接修改 `./ui/screens/`、`./ui/components/`、`./ui/css/` 后服务端会自动通过 OverlayFS 优先加载你修改的文件，刷新窗口即刻改变你自己的界面）；",
-      "  - `./plugins/`：你的 DSH 运行时扩展插件目录（在此编写 `.mjs` 插件会在下次拉起会话时自动挂载进你的运行时）；",
+      "- **当前工作区模式：打包应用扩展态（Skills + Plugins Mode）**",
+      "  - `./plugins/`：你的 DSH 运行时扩展插件目录；每个 `.mjs` 必须配套同名 JSON sidecar，声明 `id: sugent-ext-<slug>` 和兼容的 `apiVersion`；",
       "  - `./skills/`：你的专属技能目录（编写 `<name>/SKILL.md` 即刻扩展自身技能）；",
-      "  - `./src/sugent/` 与 `./ARCHITECTURE.md`：你的核心架构代码镜像与架构蓝图（可直接阅读了解自身内核设计）。",
+      "  - `./src/sugent/` 与 `./ARCHITECTURE.md`：只读核心架构参考镜像；打包态修改不会改变正在运行的应用。",
     );
     if (localRepo && localRepo !== normRoot) {
       lines.push(
-        `  - **本机完整 Git 源码仓库**：检测到本机同时存在完整源码仓库 \`${localRepo}\`（也已链接为 \`./source-repo\`）。若用户要求修改底层 TypeScript 内核代码（如 \`src/sugent/\` 或 \`src/agent/\`），你也可以直接读写 \`${localRepo}\` 并运行 \`npm run verify:sugent\`。`,
+        "  - 如需修改底层 TypeScript 内核，请使用独立的完整源码 Git 工作流；打包态只负责 Skills 与兼容插件扩展。",
       );
     }
   }
@@ -274,50 +380,77 @@ export function buildSelfEvolutionPromptSection(workspaceRoot: string): string {
 }
 
 /**
- * 动态解析前端 UI 静态文件路径（Copy-on-Write Overlay）：
- * - 若 `<dataDir>/self-repo/ui/<relPath>` 存在（即 Agent 在打包版 App 中热修改了界面），优先返回该演进文件；
- * - 否则无缝回退至应用内置的 `<uiDir>/<relPath>` 黄金镜像文件。
+ * 解析前端 UI 静态文件路径。打包版始终返回官方内置 UI，防止旧用户覆盖遮住应用更新。
  */
 export function resolveOverlayUiFile(dataDir: string, builtinUiDir: string, relPath: string): string {
+  void dataDir;
   const cleanRel = relPath.replace(/^[/\\]+/, "");
   const builtinFile = path.join(builtinUiDir, cleanRel);
   if (!cleanRel || cleanRel.split(/[/\\]/).includes("..")) {
     return builtinFile;
   }
-  const overlayCandidate = path.join(getOverlayRepoDir(dataDir), "ui", cleanRel);
-  try {
-    if (fs.existsSync(overlayCandidate) && fs.statSync(overlayCandidate).isFile()) {
-      if (!fs.existsSync(builtinFile)) return overlayCandidate;
-      const overlayBuf = fs.readFileSync(overlayCandidate);
-      const builtinBuf = fs.readFileSync(builtinFile);
-      if (!overlayBuf.equals(builtinBuf)) {
-        return overlayCandidate;
-      }
-    }
-  } catch {
-    /* fallback to builtin */
-  }
   return builtinFile;
 }
 
 /**
- * 扫描 `<dataDir>/self-repo/plugins/*.mjs` 下由 Agent 自主编写的扩展插件，供 `AgentHost.writePatch()` 动态挂载
+ * 扫描 `<dataDir>/self-repo/plugins/*.mjs` 下的扩展插件，仅返回 manifest 合法且 API 兼容的插件。
  */
-export function listSelfEvolutionPlugins(dataDir: string): Array<{ id: string; filePath: string }> {
-  const pluginsDir = path.join(getOverlayRepoDir(dataDir), "plugins");
-  if (!fs.existsSync(pluginsDir)) return [];
+function validatePluginManifest(filePath: string): { plugin?: SelfEvolutionPlugin; issue?: SelfEvolutionPluginIssue } {
+  const manifestPath = [`${filePath}.json`, `${filePath.slice(0, -4)}.json`].find((candidate) => fs.existsSync(candidate));
+  if (!manifestPath) {
+    return { issue: { filePath, reason: "Plugin manifest is missing; add a matching .json sidecar before enabling it." } };
+  }
   try {
-    return fs
+    const raw = JSON.parse(fs.readFileSync(manifestPath, "utf8")) as Partial<SelfEvolutionPluginManifest>;
+    if (typeof raw.id !== "string" || !/^sugent-ext-[a-z0-9]+(?:-[a-z0-9]+)*$/.test(raw.id)) {
+      return { issue: { filePath, manifestPath, reason: "Plugin id must use sugent-ext-<slug> with lowercase letters, digits, and hyphens." } };
+    }
+    if (!Number.isInteger(raw.apiVersion) || raw.apiVersion !== SUGENT_PLUGIN_API_VERSION) {
+      return { issue: { filePath, manifestPath, reason: `Plugin apiVersion must equal ${SUGENT_PLUGIN_API_VERSION}.` } };
+    }
+    return {
+      plugin: { id: raw.id, filePath, manifestPath, manifest: raw as SelfEvolutionPluginManifest },
+    };
+  } catch {
+    return { issue: { filePath, manifestPath, reason: "Plugin manifest is not valid JSON." } };
+  }
+}
+
+export function inspectSelfEvolutionPlugins(dataDir: string): { plugins: SelfEvolutionPlugin[]; issues: SelfEvolutionPluginIssue[] } {
+  const pluginsDir = path.join(getOverlayRepoDir(dataDir), "plugins");
+  if (!fs.existsSync(pluginsDir)) return { plugins: [], issues: [] };
+  try {
+    const plugins: SelfEvolutionPlugin[] = [];
+    const issues: SelfEvolutionPluginIssue[] = [];
+    const candidates: SelfEvolutionPlugin[] = [];
+    for (const entry of fs
       .readdirSync(pluginsDir, { withFileTypes: true })
       .filter((e) => e.isFile() && e.name.endsWith(".mjs"))
-      .sort((a, b) => a.name.localeCompare(b.name))
-      .map((e) => ({
-        id: `sugent-ext-${e.name.slice(0, -4).replace(/[^a-zA-Z0-9_-]/g, "-")}`,
-        filePath: path.join(pluginsDir, e.name),
-      }));
+      .sort((a, b) => a.name.localeCompare(b.name))) {
+      const filePath = path.join(pluginsDir, entry.name);
+      const result = validatePluginManifest(filePath);
+      if (result.issue) issues.push(result.issue);
+      else if (result.plugin) candidates.push(result.plugin);
+    }
+    const byId = new Map<string, SelfEvolutionPlugin[]>();
+    for (const plugin of candidates) byId.set(plugin.id, [...(byId.get(plugin.id) ?? []), plugin]);
+    for (const group of byId.values()) {
+      if (group.length > 1) {
+        for (const plugin of group) {
+          issues.push({ filePath: plugin.filePath, manifestPath: plugin.manifestPath, reason: `Duplicate plugin id: ${plugin.id}.` });
+        }
+      } else {
+        plugins.push(group[0]!);
+      }
+    }
+    return { plugins, issues };
   } catch {
-    return [];
+    return { plugins: [], issues: [] };
   }
+}
+
+export function listSelfEvolutionPlugins(dataDir: string): Array<{ id: string; filePath: string }> {
+  return inspectSelfEvolutionPlugins(dataDir).plugins.map(({ id, filePath }) => ({ id, filePath }));
 }
 
 /**
@@ -330,6 +463,111 @@ export function resetSelfEvolutionOverlay(dataDir: string): { archivedTo?: strin
   const backupDir = path.join(path.resolve(dataDir), `self-repo.backup-${Date.now()}`);
   fs.renameSync(overlayDir, backupDir);
   return { archivedTo: backupDir };
+}
+
+export interface QuarantinedArtifactRecord {
+  kind: "plugin" | "skill";
+  idOrName: string;
+  reason: string;
+  simAttemptId?: string;
+  originalFiles: Array<{ from: string; to: string }>;
+  quarantinedAtIso: string;
+}
+
+function getQuarantineDir(dataDir: string): string {
+  return path.join(getSelfEvolutionRootDir(dataDir), "quarantine");
+}
+
+function readQuarantineManifest(dataDir: string): QuarantinedArtifactRecord[] {
+  const file = path.join(getQuarantineDir(dataDir), "manifest.json");
+  if (!fs.existsSync(file)) return [];
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeQuarantineManifest(dataDir: string, records: QuarantinedArtifactRecord[]): void {
+  const dir = getQuarantineDir(dataDir);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(dir, "manifest.json"), `${JSON.stringify(records, null, 2)}\n`, { mode: 0o600 });
+}
+
+export function listQuarantinedArtifacts(dataDir: string): QuarantinedArtifactRecord[] {
+  return readQuarantineManifest(dataDir);
+}
+
+export function quarantineSelfEvolutionArtifact(
+  dataDir: string,
+  input: {
+    kind: "plugin" | "skill";
+    idOrName: string;
+    reason: string;
+    simAttemptId?: string;
+    skillsRootDir?: string;
+    atIso?: string;
+  },
+): QuarantinedArtifactRecord {
+  const safeId = path.basename(input.idOrName.trim());
+  const overlayDir = getOverlayRepoDir(dataDir);
+  const qKindDir = path.join(getQuarantineDir(dataDir), input.kind);
+  fs.mkdirSync(qKindDir, { recursive: true, mode: 0o700 });
+  const moved: Array<{ from: string; to: string }> = [];
+
+  if (input.kind === "plugin") {
+    const pluginsDir = path.join(overlayDir, "plugins");
+    const hit = inspectSelfEvolutionPlugins(dataDir).plugins.find((p) => p.id === safeId);
+    const candFiles = hit
+      ? [hit.filePath, hit.manifestPath]
+      : [path.join(pluginsDir, `${safeId}.mjs`), path.join(pluginsDir, `${safeId}.json`)];
+    for (const src of candFiles) {
+      if (!fs.existsSync(src)) continue;
+      const dst = path.join(qKindDir, path.basename(src));
+      fs.renameSync(src, dst);
+      moved.push({ from: src, to: dst });
+    }
+  } else {
+    const srcDir = path.join(input.skillsRootDir ?? path.join(overlayDir, "skills"), safeId);
+    if (fs.existsSync(srcDir)) {
+      const dstDir = path.join(qKindDir, safeId);
+      if (fs.existsSync(dstDir)) fs.rmSync(dstDir, { recursive: true, force: true });
+      fs.renameSync(srcDir, dstDir);
+      moved.push({ from: srcDir, to: dstDir });
+    }
+  }
+
+  const record: QuarantinedArtifactRecord = {
+    kind: input.kind,
+    idOrName: safeId,
+    reason: input.reason,
+    ...(input.simAttemptId ? { simAttemptId: input.simAttemptId } : {}),
+    originalFiles: moved,
+    quarantinedAtIso: input.atIso ?? new Date().toISOString(),
+  };
+  const next = readQuarantineManifest(dataDir).filter((r) => !(r.kind === input.kind && r.idOrName === safeId));
+  next.push(record);
+  writeQuarantineManifest(dataDir, next);
+  return record;
+}
+
+export function restoreQuarantinedArtifact(
+  dataDir: string,
+  kind: "plugin" | "skill",
+  idOrName: string,
+): boolean {
+  const safeId = path.basename(idOrName.trim());
+  const records = readQuarantineManifest(dataDir);
+  const hit = records.find((r) => r.kind === kind && r.idOrName === safeId);
+  if (!hit) return false;
+  for (const item of hit.originalFiles) {
+    if (!fs.existsSync(item.to)) continue;
+    fs.mkdirSync(path.dirname(item.from), { recursive: true, mode: 0o700 });
+    fs.renameSync(item.to, item.from);
+  }
+  writeQuarantineManifest(dataDir, records.filter((r) => !(r.kind === kind && r.idOrName === safeId)));
+  return true;
 }
 
 /**
@@ -356,8 +594,19 @@ export const APPROVAL_REQUIRED_PATHS: readonly string[] = [
 /**
  * 评估单个文件的自我修改风险等级
  */
-export function assessSelfEditPath(relPath: string): FileChangeAssessment {
-  const norm = relPath.replace(/\\/g, "/").replace(/^\.\/+/, "");
+export function assessSelfEditPath(relPath: string, mode: SelfEvolutionMode = "source"): FileChangeAssessment {
+  const raw = String(relPath ?? "");
+  const norm = raw.replace(/\\/g, "/").replace(/^\.\/+/, "");
+  const segments = norm.split("/").filter(Boolean);
+  const unsafePath = norm.startsWith("/") || /^[A-Za-z]:\//.test(norm) || segments.includes("..");
+
+  if (unsafePath) {
+    return {
+      filePath: norm,
+      risk: "requires_approval",
+      reason: "Absolute paths and parent-directory traversal are outside the self-evolution workspace.",
+    };
+  }
 
   if (FORBIDDEN_SELF_EDIT_PATHS.some((p) => norm === p || norm.startsWith(`${p}/`))) {
     return {
@@ -375,6 +624,14 @@ export function assessSelfEditPath(relPath: string): FileChangeAssessment {
     };
   }
 
+  if (mode === "packaged" && !(norm.startsWith("skills/") || norm.startsWith("plugins/"))) {
+    return {
+      filePath: norm,
+      risk: "requires_approval",
+      reason: "Packaged self-evolution only permits Skills and manifest-validated DSH plugins; other paths require the full source workspace.",
+    };
+  }
+
   if (
     norm.startsWith("src/sugent/") ||
     norm.startsWith("test/") ||
@@ -388,7 +645,7 @@ export function assessSelfEditPath(relPath: string): FileChangeAssessment {
     return {
       filePath: norm,
       risk: "autonomous",
-      reason: "Within Sugent's zero-intrusion extension, hot-overlay UI/plugins/skills, test, or documentation scope.",
+      reason: "Within Sugent's zero-intrusion extension scope.",
     };
   }
 
@@ -406,8 +663,9 @@ export function buildSelfEvolutionPlan(
   goal: string,
   baseCommit: string,
   touchedFiles: string[],
+  mode: SelfEvolutionMode = "source",
 ): SelfEvolutionPlan {
-  const assessments = touchedFiles.map(assessSelfEditPath);
+  const assessments = touchedFiles.map((file) => assessSelfEditPath(file, mode));
   let overallRisk: EvolutionRiskLevel = "autonomous";
   if (assessments.some((a) => a.risk === "forbidden")) {
     overallRisk = "forbidden";
@@ -430,20 +688,19 @@ export function buildSelfEvolutionPlan(
  */
 export const SUGENT_SELF_DEV_SKILL = `---
 name: sugent-self-dev
-description: Autonomous self-iteration, hot-overlay UI/plugin evolution, upstream synchronization, and safe code management workflow for Sugent. Use whenever the user asks you to customize the app UI, add new capabilities/plugins/skills, or evolve Sugent's own codebase.
+description: Autonomous Skills and compatible plugin extensions, full-source self-iteration, upstream synchronization, and safe code management workflow for Sugent. Use whenever the user asks you to add capabilities, plugins, or skills, or to evolve Sugent's source repository.
 ---
 
 # Sugent 双模自我迭代与热演进规范 (Self-Evolution SOP)
 
 当前机器人已开启「自我迭代与代码自治（Self-Evolution）」开关，你的工作区（\`.\`）已自动绑定至 Sugent 的演进目录。请根据当前目录结构按对应模式执行：
 
-## 模式 A：普通用户安装包态（Hot-Overlay 热覆盖层模式，无需编译器或 Git）
+## 模式 A：普通用户安装包态（Skills + plugin 扩展模式，无需编译器或 Git）
 若当前工作区包含 \`README_SELF_EVOLUTION.md\`（位于 \`<dataDir>/self-repo\`）：
-1. **免编译热修改界面 (\`./ui/\`)**：前端采用 Preact + htm 原生 ES Module（无构建步骤）。直接修改 \`./ui/screens/\`、\`./ui/components/\` 或 \`./ui/css/\` 下的文件，服务端会自动通过写时复制（OverlayFS）优先加载你修改的文件，刷新界面即刻生效！
-2. **动态扩展运行时插件 (\`./plugins/*.mjs\`)**：在 \`./plugins/\` 下编写标准的 DeepSeek Harness (Cordis) 插件（\`.mjs\`），宿主会在下次拉起会话时自动将其挂载进运行时。
-3. **沉淀新技能 (\`./skills/<name>/SKILL.md\`)**：将新能力写成标准 \`SKILL.md\` 即可永久复用。
-4. **阅读自身核心代码 (\`./src/sugent/\` & \`./ARCHITECTURE.md\`)**：你的核心架构代码镜像已同步在 \`./src/sugent/\` 下，若本机存在 \`./source-repo\` 软链接也可直接修改完整源码仓库。
-5. **安全回退保险丝**：内置的 \`app.asar\` 黄金镜像始终只读保护；若某个覆盖文件异常，删除 \`./ui/\` 或 \`./plugins/\` 下对应的覆盖文件即可瞬间恢复出厂状态。
+1. **动态扩展运行时插件 (\`./plugins/*.mjs\`)**：每个 .mjs 文件必须有同名 .json sidecar，声明格式如 {"id":"sugent-ext-example","apiVersion":${SUGENT_PLUGIN_API_VERSION}}；缺少或不兼容清单的插件会保留但停用。
+2. **沉淀新技能 (\`./skills/<name>/SKILL.md\`)**：将新能力写成标准 \`SKILL.md\` 即可永久复用。
+3. **阅读自身核心代码 (\`./src/sugent/\` & \`./ARCHITECTURE.md\`)**：这里只读参考；打包应用仅通过官方更新修改核心代码。
+4. **官方 UI 与安全边界**：打包应用始终使用随官方版本发布的 UI；旧 UI 覆盖会保留归档但不再加载。技能和兼容插件保留在用户数据目录中。
 
 ## 模式 B：开发者完整源码态（Full Source Git 模式）
 若当前工作区包含 \`package.json\` 与 \`src/sugent/\`：
@@ -466,7 +723,7 @@ export function installSelfDevSkill(skillsRootDir: string): string {
 /**
  * 当机器人在设置中开启 `selfEvolution.enabled` 时由宿主自动调用：
  * 1. 解析源码根目录（开发态 `./` 或打包态 `<dataDir>/self-repo` 热覆盖层）；
- * 2. 确保 `<dataDir>/self-repo/` 的 `ui/`、`plugins/`、`skills/`、`src/sugent/` 覆盖层目录已就绪；
+ * 2. 确保 `<dataDir>/self-repo/` 的 `plugins/`、`skills/` 与只读参考镜像已就绪；
  * 3. 在该机器人的 DSH `skills/` 目录自动挂载 `sugent-self-dev/SKILL.md`；
  * 4. 在知识图谱中自动确保自演进工作流节点已就位。
  */
@@ -475,7 +732,7 @@ export function prepareSelfEvolutionWorkspace(dataDir: string, dshHomeDir: strin
   const workspaceRoot = resolveSelfEvolutionRoot(dataDir);
   const skillFile = installSelfDevSkill(path.join(dshHomeDir, "skills"));
   try {
-    const kg = new SugentKnowledgeGraph(path.join(dataDir, "knowledge-graph"));
+    const kg = new SugentKnowledgeGraph(resolveUnifiedKnowledgeGraphDir(dataDir));
     if (!kg.getNode("proj:sugent")) {
       kg.applyDelta({
         nodes: [
