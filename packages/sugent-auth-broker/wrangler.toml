@@ -1,0 +1,6 @@
+name = "sugent-auth-broker"
+main = "src/index.ts"
+compatibility_date = "2026-11-01"
+
+[vars]
+BROKER_SIGNING_KID = "sugent-es256-v1"

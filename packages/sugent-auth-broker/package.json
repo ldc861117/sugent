@@ -1,0 +1,19 @@
+{
+  "name": "@sugent/auth-broker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Zero-dependency Stateless Edge & Node OIDC Auth Broker for Sugent Desktop",
+  "exports": {
+    ".": "./src/index.ts",
+    "./app": "./src/app.ts",
+    "./node": "./src/node-server.ts"
+  },
+  "scripts": {
+    "start:node": "node --experimental-strip-types src/node-server.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  }
+}
