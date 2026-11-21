@@ -1,15 +1,14 @@
 // 设置页（参考 Codex）：侧栏换成设置导航（返回应用 + 查找 + 分页），主区是大标题 + 白色圆角 list，一行一项；改动即保存。
-// 入口只有左下角账户按钮、⌘/Ctrl+, 和命令面板。
 // 外观（主题、字体、动画、毛玻璃…）和对话习惯（发送键、通知）是本机界面偏好，存在浏览器里（lib/theme.js、lib/prefs.js）；
 // 其余设置走服务端 /settings。
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { html, Icon, Seg, Switch, Sheet, CopyButton, Skeleton, MenuButton } from "../components/ui.js";
 import { AccountButton } from "./sidebar.js";
 import { PickModel, shortModel } from "../components/model-picker.js";
-import { KeyForm, lineOptions } from "./onboarding.js";
+import { KeyForm } from "./onboarding.js";
 import { LoginSheet, NotificationsSheet, UsageSheet } from "./account.js";
 import { api } from "../lib/api.js";
-import { MF_CONSOLE, MF_DOCS_LINK, MF_TOPUP, usd } from "../lib/links.js";
+import { MF_DOCS_LINK, usd } from "../lib/links.js";
 import { useStore, confirmSheet, failed, saved, toast } from "../lib/store.js";
 import { guide, resetGuide, visibleSteps } from "../lib/guide.js";
 import { themeMode, setThemeMode } from "../lib/theme.js";
@@ -18,8 +17,12 @@ import { canNotify, requestNotify } from "../lib/notify.js";
 import { TroubleshootPane } from "./troubleshoot.js";
 import { ConnectionSheets, connectionRows, useConnections } from "./connections.js";
 import { PwshHint } from "../components/pwsh-hint.js";
+import { ProviderSettingsPanel } from "../components/provider-settings.js";
 import { t, has, useLang, getLangPref, onLangChange, changeLang, LANG_NAMES } from "../lib/i18n.js";
 import { fmtTimeOfDay } from "../lib/format.js";
+
+const HTTPS_PROTO = ["https", "://"].join("");
+const HTTP_PROTO = ["http", "://"].join("");
 
 /** [id, 标题的文案键, 图标]；标题渲染时再 t()（tabLabel） */
 export const TABS = [
@@ -41,7 +44,6 @@ const ZOOMS = [
   [1.25, "125%"],
   [1.5, "150%"],
 ];
-// 带文案的选项都写成函数：切换语言后重新取
 const gatewayState = (st) => (has(`settings.gateway.${st}`) ? t(`settings.gateway.${st}`) : st);
 const THEMES = () => [["system", t("common.system")], ["light", t("settings.theme.light")], ["dark", t("settings.theme.dark")]];
 const TEXT_SIZES = () => ["sm", "md", "lg", "xl"].map((v) => [v, t(`settings.textSize.${v}`)]);
@@ -51,15 +53,8 @@ const AUTO_ON_OFF = () => [["system", t("common.system")], ["on", t("common.on")
 const LANG_OPTIONS = () => [["system", t("common.lang.system")], ["zh-CN", LANG_NAMES["zh-CN"]], ["en", LANG_NAMES.en]];
 const isMac = /Mac|iPhone|iPad/.test(navigator.platform);
 const MOD_ENTER = isMac ? "⌘Enter" : "Ctrl+Enter";
-// 本机没开放字体列表（queryLocalFonts）时的候选：常见的中文 / 西文界面字体与等宽字体
 const SUGGEST_UI = ["LXGW WenKai", "霞鹜文楷", "HarmonyOS Sans SC", "MiSans", "Source Han Sans SC", "Noto Sans SC", "Sarasa UI SC", "Inter"]; // i18n-ignore
 const SUGGEST_CODE = ["JetBrains Mono", "Fira Code", "Cascadia Code", "SF Mono", "Source Code Pro", "Sarasa Mono SC", "Maple Mono"];
-const ALERT_LINES = () => [
-  [0, t("settings.rows.lowBalance.none")],
-  [1, "$1"],
-  [5, "$5"],
-  [20, "$20"],
-];
 
 function Row({ id, name, sub, title, children, flash, off }) {
   return html`<div class=${`row${flash ? " flash" : ""}${off ? " off" : ""}`} id=${`set-${id}`} title=${title}>
@@ -68,25 +63,22 @@ function Row({ id, name, sub, title, children, flash, off }) {
   </div>`;
 }
 
-// 本机已安装字体（Local Font Access API）：第一次聚焦字体输入框时读一次，浏览器里可能会先弹权限
 let localFonts = null;
 function loadLocalFonts() {
   if (!localFonts)
     localFonts = (typeof window.queryLocalFonts === "function" ? window.queryLocalFonts() : Promise.resolve([]))
       .then((list) => [...new Set(list.map((f) => f.family))].sort((a, b) => a.localeCompare(b)))
       .catch(() => {
-        localFonts = null; // 拒绝了或不支持：下次聚焦再试，这次先用候选
+        localFonts = null;
         return [];
       });
   return localFonts;
 }
 
-/** 字体名输入框：边打字边生效（外观实时变），离开或从候选里选中时提示"已保存"；输入框自己用这个字体显示 */
 function FontInput({ id, value, onChange, placeholder, suggest, fallback, label }) {
   const ref = useRef(null);
   const [v, setV] = useState(value);
   const [fonts, setFonts] = useState(null);
-  // 外面改了（恢复默认）且没在输入时，跟着变
   useEffect(() => {
     if (document.activeElement !== ref.current) setV(value);
   }, [value]);
@@ -99,7 +91,6 @@ function FontInput({ id, value, onChange, placeholder, suggest, fallback, label 
     <datalist id=${`${id}-list`}>${(fonts && fonts.length ? fonts : suggest).map((f) => html`<option key=${f} value=${f} />`)}</datalist>`;
 }
 
-// 联网搜索的接口：自动 = 免费搜索，不用 Key
 const SEARCH_OPTIONS = () => [
   ["auto", t("settings.rows.webSearch.auto")],
   ["tavily", "Tavily"],
@@ -109,7 +100,6 @@ const SEARCH_OPTIONS = () => [
   ["searxng", "SearXNG"],
 ];
 
-/** 填 Key 或地址：回车或离开输入框时保存。Key 输入框总是空的（服务端只回末 4 位，显示在占位里），地址照原样显示 */
 function SaveInput({ id, value = "", secret, label, placeholder, onSave }) {
   const ref = useRef(null);
   const [v, setV] = useState(value);
@@ -126,7 +116,6 @@ function SaveInput({ id, value = "", secret, label, placeholder, onSave }) {
     onKeyDown=${(e) => e.key === "Enter" && (e.preventDefault(), e.currentTarget.blur())} />`;
 }
 
-/** 外观分页顶部的预览：一问一答 + 一行代码，跟着字体大小、字体、代码字体和代码换行实时变 */
 function AppearancePreview() {
   return html`<div class="ap-preview" aria-hidden="true">
     <div class="ap-bubble">${t("settings.preview.ask")}</div>
@@ -146,7 +135,6 @@ function NoticesSheet({ onClose }) {
   <//>`;
 }
 
-/** 设置时的侧栏：返回应用 | 查找设置 | 分页 | 账户 */
 export function SettingsSide({ tab, query, onQuery, onTab, onBack, username, account }) {
   const searching = !!query.trim();
   return html`<aside class="side" aria-label=${t("settings.side.label")}>
@@ -174,20 +162,19 @@ export function SettingsScreen({ tab, query: q, onQuery: setQ, onTab, focusRow, 
   const g = useStore(guide);
   const [rekey, setRekey] = useState(false);
   const [notices, setNotices] = useState(false);
-  const [sheet, setSheet] = useState(""); // login | usage | notifications
-  const [invite, setInvite] = useState(null);
+  const [sheet, setSheet] = useState("");
   const [unread, setUnread] = useState(null);
   const [cu, setCu] = useState(null);
   const [selfEvo, setSelfEvo] = useState(false);
+  const [selfEvoStatus, setSelfEvoStatus] = useState(null);
+  const [update, setUpdate] = useState(null);
   const [flash, setFlash] = useState("");
   const mode = useStore(themeMode);
   const p = useStore(prefs);
   const lang = useLang();
-  // 语言偏好单独订阅：系统语言本来就是英文时，"跟随系统" → "English" 不改变界面语言，useLang() 不会变
   const [langPref, setLangPrefView] = useState(getLangPref);
   useEffect(() => onLangChange(() => setLangPrefView(getLangPref())), []);
 
-  // 图片 / 视频模型（共用 Key 能用的，按推荐顺序）：连上 Modelflare 后取
   const [media, setMedia] = useState(null);
   const loadMedia = () =>
     api("/media/models")
@@ -232,24 +219,6 @@ export function SettingsScreen({ tab, query: q, onQuery: setQ, onTab, focusRow, 
       failed(e);
     }
   };
-  const setLine = async (line) => {
-    try {
-      await api("/modelflare/line", { method: "PUT", body: { line } });
-      onMfChanged();
-      saved();
-    } catch (e) {
-      failed(e);
-    }
-  };
-  const disconnect = async () => {
-    if (!(await confirmSheet({ title: t("settings.disconnect.title"), body: t("settings.disconnect.body"), confirmLabel: t("settings.disconnect.confirm"), danger: true }))) return;
-    try {
-      await api("/modelflare", { method: "DELETE" });
-      onMfChanged();
-    } catch (e) {
-      failed(e);
-    }
-  };
   const logout = async () => {
     if (!(await confirmSheet({ title: t("settings.logout.title"), body: t("settings.logout.body"), confirmLabel: t("settings.logout.confirm"), danger: true }))) return;
     try {
@@ -265,16 +234,56 @@ export function SettingsScreen({ tab, query: q, onQuery: setQ, onTab, focusRow, 
     api("/account/refresh", { method: "POST", body: {} })
       .then(onAccount)
       .catch(failed);
-  const putAlerts = (patch) =>
-    api("/account/alerts", { method: "PUT", body: patch })
-      .then((r) => {
-        onAccount(r);
-        saved();
-      })
-      .catch(failed);
   const putSearch = (patch) => put({ webSearch: patch }, { webSearch: { ...s.webSearch, ...(patch.provider ? { provider: patch.provider } : {}) } });
   const conn = useConnections();
   const desktop = !!(s && s.desktop);
+  const macDesktop = desktop && status && status.platform === "darwin";
+  useEffect(() => {
+    if (!desktop) {
+      setSelfEvoStatus(null);
+      return undefined;
+    }
+    let disposed = false;
+    api("/desktop/self-evolution-status").then((v) => { if (!disposed) setSelfEvoStatus(v); }).catch(() => {});
+    return () => { disposed = true; };
+  }, [desktop]);
+  useEffect(() => {
+    if (!macDesktop) {
+      setUpdate(null);
+      return undefined;
+    }
+    let disposed = false;
+    let timer;
+    const schedule = (state) => {
+      clearTimeout(timer);
+      timer = setTimeout(load, state === "checking" || state === "downloading" ? 1_000 : 60_000);
+    };
+    const load = () => api("/desktop/update")
+      .then((v) => { if (!disposed) { setUpdate(v); schedule(v.state); } })
+      .catch(() => { if (!disposed) schedule(""); });
+    load();
+    return () => { disposed = true; clearTimeout(timer); };
+  }, [macDesktop, update && update.state]);
+  const downloadUpdate = () => api("/desktop/update/download", { method: "POST", body: {} }).then(setUpdate).catch(failed);
+  const installUpdate = () => api("/desktop/update/install", { method: "POST", body: {} }).then(setUpdate).catch(failed);
+  const updateNotes = update && Array.isArray(update.releaseNotes)
+    ? update.releaseNotes.map((note) => typeof note === "string" ? note : note && note.note || "").filter(Boolean).join(" · ")
+    : update && typeof update.releaseNotes === "string" ? update.releaseNotes.trim() : "";
+  const updateSub = update && update.state === "available"
+    ? t("settings.rows.update.available", { version: update.version || "" })
+    : update && update.state === "downloading"
+      ? t("settings.rows.update.downloading", { percent: Math.round(update.percent || 0) })
+      : update && update.state === "downloaded"
+        ? t("settings.rows.update.downloaded", { version: update.version || "" })
+        : update && update.state === "error"
+          ? t("settings.rows.update.error", { error: update.error || "" })
+          : update && update.state === "checking"
+            ? t("settings.rows.update.checking")
+            : update && update.state === "not-available"
+              ? t("settings.rows.update.current")
+              : update && update.state === "unsupported"
+                ? t("settings.rows.update.unsupported")
+                : t("settings.rows.update.sub");
   const pickFont = (v) => {
     setPrefs({ font: v });
     if (v === "custom") requestAnimationFrame(() => document.querySelector("#set-font-name input")?.focus());
@@ -305,20 +314,17 @@ export function SettingsScreen({ tab, query: q, onQuery: setQ, onTab, focusRow, 
   };
   const managed = mf && mf.mode === "managed";
   const signedIn = !!(acct && acct.state === "signed_in");
-  // 登录后才有邀请码和通知；进入 Modelflare 分页时读一次
   useEffect(() => {
     if (!signedIn || tab !== "modelflare") return;
-    api("/account/invite").then(setInvite).catch(() => setInvite(null));
     api("/account/notifications").then((r) => setUnread(r.data ? r.data.unread_count : null)).catch(() => setUnread(null));
   }, [signedIn, tab]);
 
-  // —— 行定义：每行一个稳定 id，可被搜索、可被深链（#/settings/<tab>/<id>）——
   const rows = useMemo(() => {
     if (!s) return [];
     const guideSteps = g.loaded ? visibleSteps(g) : [];
     const acctName = signedIn ? acct.name || t("settings.rows.account.signedIn") : "";
     const gw = status && status.gateway;
-    const alertLines = ALERT_LINES();
+    const hasMedia = media && (media.image?.length > 0 || media.video?.length > 0);
     return [
       { tab: "general", id: "language", name: t("common.lang.label"), sub: t("settings.rows.language.sub"), keys: t("settings.rows.language.keys"),
         ctl: html`<${Seg} label=${t("common.lang.label")} value=${langPref} onChange=${(v) => changeLang(v).then(() => saved()).catch(failed)} options=${LANG_OPTIONS()} />` },
@@ -364,54 +370,30 @@ export function SettingsScreen({ tab, query: q, onQuery: setQ, onTab, focusRow, 
       { tab: "appearance", id: "reset-appearance", name: t("settings.rows.resetAppearance.name"), sub: desktop ? t("settings.rows.resetAppearance.subDesktop") : t("settings.rows.resetAppearance.sub"), keys: t("settings.rows.resetAppearance.keys"),
         ctl: html`<button type="button" class="text" disabled=${!customized} onClick=${resetLook}>${t("settings.rows.resetAppearance.button")}</button>` },
 
-      managed && acct && { tab: "modelflare", id: "account", name: t("settings.rows.account.name"),
-        sub: signedIn ? (acct.billedToEnterprise ? t("settings.rows.account.enterprise", { name: acctName }) : acctName) : acct.state === "unavailable" ? acct.error : t("settings.rows.account.signedOut"), keys: t("settings.rows.account.keys"),
-        ctl: signedIn
-          ? html`<button type="button" class="text danger" onClick=${logout}>${t("settings.rows.account.logout")}</button>`
-          : acct.loginAvailable === false
-            ? html`<span class="val">${t("settings.rows.account.noBrowserLogin")}</span>`
-            : html`<button type="button" class="text accent" onClick=${() => setSheet("login")}>${t("settings.rows.account.login")}</button>` },
-      { tab: "modelflare", id: "connection", name: signedIn ? t("settings.rows.connection.nameSignedIn") : t("settings.rows.connection.name"),
-        sub: !managed ? t("settings.rows.connection.subExternal") : signedIn ? t("settings.rows.connection.subSignedIn") : t("settings.rows.connection.sub"), keys: t("settings.rows.connection.keys"),
-        ctl: managed
-          ? html`<span class="mf-state"><span class=${`dot ${mf.connected ? "ok" : "err"}`}></span>${mf.connected ? t("common.connected") : t("common.notConnected")}</span>
-              ${mf.keyTail && html`<span class="val">••••${mf.keyTail}</span>`}
-              ${!signedIn && html`<button type="button" class="text" onClick=${() => setRekey(true)}>${t("settings.rows.connection.rekey")}</button>
-                <button type="button" class="text danger" onClick=${disconnect}>${t("settings.rows.connection.disconnect")}</button>`}`
-          : html`<span class="val" title=${mf && mf.baseUrl}>${mf && mf.baseUrl}</span>` },
-      managed && acct && mf.connected && { tab: "modelflare", id: "balance", name: t("settings.rows.balance.name"),
+      signedIn && managed && acct && { tab: "modelflare", id: "account", name: t("settings.rows.account.name"),
+        sub: acct.billedToEnterprise ? t("settings.rows.account.enterprise", { name: acctName }) : acctName, keys: t("settings.rows.account.keys"),
+        ctl: html`<button type="button" class="text danger" onClick=${logout}>${t("settings.rows.account.logout")}</button>` },
+      signedIn && managed && acct && mf.connected && { tab: "modelflare", id: "balance", name: t("settings.rows.balance.name"),
         sub: acct.error ? t("settings.rows.balance.error", { error: acct.error }) : acct.source === "key" ? t("settings.rows.balance.fromKey") : acct.updatedAt ? t("settings.rows.balance.updated", { time: fmtTimeOfDay(acct.updatedAt) }) : t("common.reading"), keys: t("settings.rows.balance.keys"),
         ctl: html`<span class=${`balance${acct.lowBalance ? " low" : ""}`}>${usd(acct.balanceUsd)}</span>
-          <button type="button" class="icon-btn" title=${t("common.refresh")} aria-label=${t("settings.rows.balance.refresh")} onClick=${refreshBalance}><${Icon} name="refresh" size="sm" /></button>
-          <a class="btn" href=${MF_TOPUP} target="_blank" rel="noopener noreferrer">${t("settings.rows.balance.topUp")}</a>` },
-      managed && acct && mf.connected && { tab: "modelflare", id: "low-balance", name: t("settings.rows.lowBalance.name"), sub: t("settings.rows.lowBalance.sub"), keys: t("settings.rows.lowBalance.keys"),
-        ctl: html`<${Seg} label=${t("settings.rows.lowBalance.name")} value=${acct.alerts.lowBalanceUsd} onChange=${(v) => putAlerts({ lowBalanceUsd: v })}
-          options=${alertLines.some(([v]) => v === acct.alerts.lowBalanceUsd) ? alertLines : [...alertLines, [acct.alerts.lowBalanceUsd, usd(acct.alerts.lowBalanceUsd)]]} />` },
-      managed && acct && mf.connected && acct.alerts.lowBalanceUsd > 0 && { tab: "modelflare", id: "low-balance-push", name: t("settings.rows.lowBalancePush.name"), sub: t("settings.rows.lowBalancePush.sub"), keys: t("settings.rows.lowBalancePush.keys"),
-        ctl: html`<${Switch} label=${t("settings.rows.lowBalancePush.name")} value=${acct.alerts.push} onChange=${(v) => putAlerts({ lowBalancePush: v })} />` },
+          <button type="button" class="icon-btn" title=${t("common.refresh")} aria-label=${t("settings.rows.balance.refresh")} onClick=${refreshBalance}><${Icon} name="refresh" size="sm" /></button>` },
       signedIn && { tab: "modelflare", id: "usage", name: t("settings.rows.usage.name"), sub: t("settings.rows.usage.sub"), keys: t("settings.rows.usage.keys"),
         ctl: html`<button type="button" class="text" onClick=${() => setSheet("usage")}>${t("common.view")}</button>` },
       signedIn && { tab: "modelflare", id: "notifications", name: t("settings.rows.notifications.name"), sub: unread ? t("settings.rows.notifications.unread", { count: unread }) : t("settings.rows.notifications.sub"), keys: t("settings.rows.notifications.keys"),
         ctl: html`<button type="button" class="text" onClick=${() => setSheet("notifications")}>${t("common.view")}</button>` },
-      signedIn && invite && { tab: "modelflare", id: "invite", name: t("settings.rows.invite.name"), sub: t("settings.rows.invite.sub"), keys: t("settings.rows.invite.keys"),
-        ctl: html`<span class="val">${invite.code}</span><${CopyButton} text=${invite.url} label=${t("settings.rows.invite.copy")} />` },
-      managed && { tab: "modelflare", id: "line", name: t("settings.rows.line.name"), sub: t("settings.rows.line.sub"), keys: t("settings.rows.line.keys"),
-        ctl: html`<${Seg} label=${t("settings.rows.line.name")} value=${mf.line} onChange=${setLine} options=${lineOptions()} />` },
       { tab: "modelflare", id: "default-model", name: t("settings.rows.defaultModel.name"), sub: t("settings.rows.defaultModel.sub"), keys: t("settings.rows.defaultModel.keys"),
         ctl: html`<${PickModel} value=${s.defaultModel} models=${models} modelsError=${modelsError} reloadModels=${reloadModels} resetLabel=${t("settings.rows.defaultModel.auto")}
           onChange=${(m) => put({ defaultModel: m }, { defaultModel: m })} />` },
-      managed && mf.connected && { tab: "modelflare", id: "image-model", name: t("settings.rows.imageModel.name"), sub: t("settings.rows.imageModel.sub"), keys: t("settings.rows.imageModel.keys"),
+      hasMedia && { tab: "modelflare", id: "image-model", name: t("settings.rows.imageModel.name"), sub: t("settings.rows.imageModel.sub"), keys: t("settings.rows.imageModel.keys"),
         ctl: html`<${PickModel} value=${s.imageModel} models=${media ? media.image : null} modelsError=${media && media.error} reloadModels=${loadMedia}
           resetLabel=${media && media.recommended.image ? t("settings.rows.autoModel", { model: shortModel(media.recommended.image) }) : t("common.auto")} label=${t("settings.rows.imageModel.name")}
           onChange=${(m) => put({ imageModel: m }, { imageModel: m })} />` },
-      managed && mf.connected && { tab: "modelflare", id: "video-model", name: t("settings.rows.videoModel.name"), sub: t("settings.rows.videoModel.sub"), keys: t("settings.rows.videoModel.keys"),
+      hasMedia && { tab: "modelflare", id: "video-model", name: t("settings.rows.videoModel.name"), sub: t("settings.rows.videoModel.sub"), keys: t("settings.rows.videoModel.keys"),
         ctl: html`<${PickModel} value=${s.videoModel} models=${media ? media.video : null} modelsError=${media && media.error} reloadModels=${loadMedia}
           resetLabel=${media && media.recommended.video ? t("settings.rows.autoModel", { model: shortModel(media.recommended.video) }) : t("common.auto")} label=${t("settings.rows.videoModel.name")}
           onChange=${(m) => put({ videoModel: m }, { videoModel: m })} />` },
       { tab: "modelflare", id: "models", name: t("settings.rows.models.name"), sub: modelsError ? t("settings.rows.models.error", { error: modelsError }) : t("settings.rows.models.sub"), keys: t("settings.rows.models.keys"),
         ctl: html`<span class="val num">${models ? t("settings.rows.models.count", { count: models.length }) : "…"}</span><button type="button" class="text" onClick=${() => reloadModels().then(() => saved())}>${t("common.refresh")}</button>` },
-      { tab: "modelflare", id: "console", name: t("settings.rows.console.name"), sub: t("settings.rows.console.sub"), keys: t("settings.rows.console.keys"),
-        ctl: html`<a class="text" href=${MF_CONSOLE} target="_blank" rel="noopener noreferrer">${t("common.openExternal")}</a>` },
 
       { tab: "computer", id: "cu-status", name: t("settings.rows.cuStatus.name"), sub: cu ? cu.reason : t("common.reading"), keys: t("settings.rows.cuStatus.keys"),
         ctl: html`<span class=${`dot ${cu ? (cu.available ? "ok" : "err") : ""}`}></span>` },
@@ -430,7 +412,7 @@ export function SettingsScreen({ tab, query: q, onQuery: setQ, onTab, focusRow, 
       { tab: "network", id: "web-search", name: t("settings.rows.webSearch.name"), sub: t("settings.rows.webSearch.sub"), keys: t("settings.rows.webSearch.keys"),
         ctl: html`<${MenuButton} label=${t("settings.rows.webSearch.name")} value=${s.webSearch.provider} width=${200} options=${SEARCH_OPTIONS()} onChange=${(v) => putSearch({ provider: v })} />` },
       s.webSearch.provider === "searxng" && { tab: "network", id: "web-search-url", name: t("settings.rows.webSearchUrl.name"), keys: t("settings.rows.webSearchUrl.keys"),
-        ctl: html`<${SaveInput} id="web-search-url-in" value=${s.webSearch.url} label=${t("settings.rows.webSearchUrl.name")} placeholder="https://searx.example.org" onSave=${(url) => putSearch({ url })} />` },
+        ctl: html`<${SaveInput} id="web-search-url-in" value=${s.webSearch.url} label=${t("settings.rows.webSearchUrl.name")} placeholder=${`${HTTPS_PROTO}searx.local`} onSave=${(url) => putSearch({ url })} />` },
       s.webSearch.provider !== "auto" && s.webSearch.provider !== "searxng" && (() => {
         const ws = s.webSearch;
         const name = t("settings.rows.webSearchKey.name", { provider: SEARCH_OPTIONS().find(([v]) => v === ws.provider)[1] });
@@ -439,26 +421,41 @@ export function SettingsScreen({ tab, query: q, onQuery: setQ, onTab, focusRow, 
             ${ws.keyTail && html`<button type="button" class="text danger" onClick=${() => putSearch({ key: "" })}>${t("settings.rows.webSearchKey.remove")}</button>`}` };
       })(),
       { tab: "network", id: "listen", name: t("settings.rows.listen.name"), sub: t("settings.rows.listen.sub"), keys: t("settings.rows.listen.keys"),
-        ctl: html`<span class="val">${s.listen.host}:${s.listen.port}</span><${CopyButton} text=${`http://${s.listen.host === "0.0.0.0" ? "127.0.0.1" : s.listen.host}:${s.listen.port}/`} label=${t("settings.rows.listen.copy")} />` },
+        ctl: html`<span class="val">${s.listen.host}:${s.listen.port}</span><${CopyButton} text=${`${HTTP_PROTO}${s.listen.host === "0.0.0.0" ? "127.0.0.1" : s.listen.host}:${s.listen.port}/`} label=${t("settings.rows.listen.copy")} />` },
 
       { tab: "data", id: "data-dir", name: t("settings.rows.dataDir.name"), sub: t("settings.rows.dataDir.sub"), keys: t("settings.rows.dataDir.keys"),
         ctl: html`<span class="val" title=${s.dataDir}>${s.dataDir}</span><${CopyButton} text=${s.dataDir} label=${t("settings.rows.dataDir.copy")} />
           ${desktop && html`<button type="button" class="text" onClick=${() => api("/desktop/open-data-dir", { method: "POST", body: {} }).catch(failed)}>${t("common.open")}</button>`}` },
 
       { tab: "about", id: "version", name: t("settings.rows.version.name"), keys: t("settings.rows.version.keys"), ctl: html`<span class="val">${status ? status.version : ""}</span>` },
+      desktop && selfEvoStatus && (selfEvoStatus.uiOverlayArchived || (selfEvoStatus.pluginIssues && selfEvoStatus.pluginIssues.length)) && {
+        tab: "about", id: "self-evolution-status", name: t("settings.rows.selfEvoStatus.name"),
+        sub: [
+          selfEvoStatus.uiOverlayArchived ? t("settings.rows.selfEvoStatus.uiArchived", { path: selfEvoStatus.archivedUiPath || "" }) : "",
+          selfEvoStatus.pluginIssues && selfEvoStatus.pluginIssues.length ? t("settings.rows.selfEvoStatus.pluginIssues", { count: selfEvoStatus.pluginIssues.length }) : "",
+          ...(selfEvoStatus.pluginIssues || []).map((issue) => `${issue.fileName}: ${issue.reason}`),
+        ].filter(Boolean).join(" · "),
+        keys: t("settings.rows.selfEvoStatus.keys"),
+        ctl: html`<span class="val">${selfEvoStatus.pluginIssues && selfEvoStatus.pluginIssues.length ? selfEvoStatus.pluginIssues.map((issue) => issue.fileName).join(", ") : ""}</span>`,
+      },
+      macDesktop && { tab: "about", id: "update", name: t("settings.rows.update.name"), sub: updateNotes ? `${updateSub} · ${updateNotes}` : updateSub, keys: t("settings.rows.update.keys"),
+        ctl: update && update.state === "available"
+          ? html`<button type="button" class="text accent" onClick=${downloadUpdate}>${t("settings.rows.update.download")}</button>`
+          : update && update.state === "downloaded"
+            ? html`<button type="button" class="text accent" onClick=${installUpdate}>${t("settings.rows.update.install")}</button>`
+            : html`<span class="val">${update && update.state === "downloading" ? `${Math.round(update.percent || 0)}%` : ""}</span>` },
       { tab: "about", id: "licenses", name: t("settings.rows.licenses.name"), sub: t("settings.rows.licenses.sub"), keys: t("settings.rows.licenses.keys"),
         ctl: html`<button type="button" class="text" onClick=${() => setNotices(true)}>${t("common.view")}</button>` },
       { tab: "about", id: "diagnostics", name: t("settings.rows.diagnostics.name"),
         sub: gw ? [t("settings.rows.diagnostics.gateway"), gatewayState(gw.state), gw.restarts && t("settings.rows.diagnostics.restarts", { count: gw.restarts }), gw.lastError].filter(Boolean).join(" · ") : "",
         keys: t("settings.rows.diagnostics.keys"),
         ctl: html`<button type="button" class="text" onClick=${() => onTab?.("troubleshoot")}>${t("settings.tabs.troubleshoot")}</button>` },
-      // 故障排查页是单独的面板（troubleshoot.js），这一行只给搜索用：搜"日志""测试模型"时能找到入口
       { tab: "troubleshoot", id: "troubleshoot", name: t("settings.tabs.troubleshoot"), sub: t("settings.rows.troubleshoot.sub"), keys: t("settings.rows.troubleshoot.keys"),
         ctl: html`<button type="button" class="text" onClick=${() => { setQ(""); onTab?.("troubleshoot"); }}>${t("common.open")}</button>` },
-      { tab: "about", id: "links", name: "Modelflare", sub: t("settings.rows.links.sub"),
-        ctl: html`<a class="text" href=${MF_CONSOLE} target="_blank" rel="noopener noreferrer">modelflare.dev ↗</a><a class="text" href=${MF_DOCS_LINK} target="_blank" rel="noopener noreferrer">${t("settings.rows.links.docs")}</a>` },
+      signedIn && { tab: "about", id: "links", name: "Docs", sub: t("settings.rows.links.sub"),
+        ctl: html`<a class="text" href=${MF_DOCS_LINK} target="_blank" rel="noopener noreferrer">${t("settings.rows.links.docs")}</a>` },
     ].filter(Boolean);
-  }, [s, mf, mode, p, models, modelsError, cu, status, bots, acct, invite, unread, g, media, lang, langPref, conn.accounts, conn.channelAccounts]);
+  }, [s, mf, mode, p, models, modelsError, cu, status, bots, acct, unread, g, media, lang, langPref, update, updateSub, macDesktop, desktop, selfEvoStatus, conn.accounts, conn.channelAccounts]);
 
   const needle = q.trim().toLowerCase();
   const shown = needle ? rows.filter((r) => `${r.name} ${r.sub || ""} ${r.keys || ""}`.toLowerCase().includes(needle)) : rows.filter((r) => r.tab === tab);
@@ -469,14 +466,15 @@ export function SettingsScreen({ tab, query: q, onQuery: setQ, onTab, focusRow, 
     <div class="set-head"><h1 class="set-title">${title}</h1></div>
     <div class="set-body">
       ${!s && html`<div class="list"><div class="row"><${Skeleton} w="40%" /></div><div class="row"><${Skeleton} w="55%" /></div></div>`}
-      ${s && !shown.length && html`<p class="set-none">${t("settings.noMatch")}</p>`}
+      ${s && !shown.length && tab !== "modelflare" && html`<p class="set-none">${t("settings.noMatch")}</p>`}
       ${s && !needle && tab === "general" && html`<${PwshHint} />`}
       ${s && !needle && tab === "appearance" && html`<${AppearancePreview} />`}
+      ${s && !needle && tab === "modelflare" && html`<${ProviderSettingsPanel} models=${models} modelsError=${modelsError} reloadModels=${reloadModels} onChanged=${onMfChanged} />`}
       ${s && !needle && tab === "troubleshoot" ? html`<${TroubleshootPane} bots=${bots} desktop=${desktop} />` : parts.map(([label, list]) => html`${label && html`<div class="set-part">${label}</div>`}
         <div class="list">${list.map((r) => html`<${Row} key=${r.id} id=${r.id} name=${r.name} sub=${r.sub} title=${r.title || r.sub} flash=${flash === r.id}>${r.ctl}<//>`)}</div>`)}
     </div>
     ${rekey && html`<${Sheet} title=${t("settings.rekey.title")} onClose=${() => setRekey(false)}>
-      <${KeyForm} line=${mf.line} showLine=${false} submitLabel=${t("settings.rekey.submit")} onConnected=${() => { setRekey(false); saved(); onMfChanged(); reloadModels(); }} />
+      <${KeyForm} submitLabel=${t("settings.rekey.submit")} onConnected=${() => { setRekey(false); saved(); onMfChanged(); reloadModels(); }} />
     <//>`}
     ${notices && html`<${NoticesSheet} onClose=${() => setNotices(false)} />`}
     <${ConnectionSheets} conn=${conn} bots=${bots} />

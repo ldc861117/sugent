@@ -20,8 +20,12 @@ import { CUA_SKILL, MEDIA_SKILL, TASK_RULES, agentPersona, botPrompt } from "./p
 import {
   buildSelfEvolutionPromptSection,
   discoverLocalSourceRepo,
+  getSelfEvolutionUiArchiveNotice,
   getOverlayRepoDir,
+  inspectSelfEvolutionPlugins,
+  isPackagedAsar,
   listSelfEvolutionPlugins,
+  migratePackagedSelfEvolutionData,
   prepareSelfEvolutionWorkspace,
   resolveSelfEvolutionRoot,
 } from "../sugent/self-evolution.js";
@@ -664,12 +668,30 @@ export class AgentHost {
   private staleSince = 0;
   /** 正在问子进程空不空（换新的子进程之前） */
   private recycling = false;
+  private selfEvolutionUiNoticeLogged = false;
+  private selfEvolutionPluginIssuesLogged = new Set<string>();
   /** 空闲时换掉的那个子进程（它的退出不用恢复什么） */
   private recycledPid: number | undefined;
   /** 空闲时换过几次子进程（不算重启：用户看不到） */
   recycles = 0;
 
-  constructor(private o: AgentHostOptions) {}
+  constructor(private o: AgentHostOptions) {
+    if (isPackagedAsar()) {
+      try {
+        migratePackagedSelfEvolutionData(this.o.dataDir);
+        const notice = getSelfEvolutionUiArchiveNotice(this.o.dataDir);
+        if (notice) {
+          log.warn("legacy self-evolution UI overlay has been archived and disabled", {
+            bot: this.o.botId,
+            notice: notice.trim(),
+          });
+          this.selfEvolutionUiNoticeLogged = true;
+        }
+      } catch (e) {
+        log.warn("packaged self-evolution migration failed", { bot: this.o.botId, err: String(e) });
+      }
+    }
+  }
 
   get home(): string {
     return path.join(this.o.dataDir, "dsh", this.o.botId);
@@ -763,6 +785,12 @@ export class AgentHost {
       // 已有会话也跟随机器人的权限预设（DSH 默认只对新会话生效）
       "    - id: amb-permission",
       `      name: ${yamlStr(path.join(this.o.runtimeDir, "plugins", "amb-permission.mjs"))}`,
+      ...(this.settings().selfEvolution?.enabled
+        ? [
+            "    - id: amb-self-edit-gate",
+            `      name: ${yamlStr(path.join(this.o.runtimeDir, "plugins", "amb-self-edit-gate.mjs"))}`,
+          ]
+        : []),
       "    - id: amb-memory",
       `      name: ${yamlStr(memory)}`,
       // 生图 / 生视频：宿主带着本机器人的 Key 调 Modelflare，文件存进工作区 media/；技能说明在 skills/media
@@ -802,7 +830,7 @@ export class AgentHost {
    * 必须跟在插件 insert 列表的最后：后面两条是顶层的行补丁。
    */
   private fullAccessLines(): string[] {
-    if (this.settings().permission !== "full") return [];
+    if (this.settings().permission !== "full" || (this.settings().selfEvolution?.enabled && isPackagedAsar())) return [];
     return [
       "    - id: amb-delete-gate",
       `      name: ${yamlStr(path.join(this.o.runtimeDir, "plugins", "amb-delete-gate.mjs"))}`,
@@ -837,9 +865,18 @@ export class AgentHost {
     const dir = path.join(this.home, "skills", "sugent-self-dev");
     try {
       if (!this.settings().selfEvolution?.enabled) {
+        if (isPackagedAsar()) migratePackagedSelfEvolutionData(this.o.dataDir);
         fs.rmSync(dir, { recursive: true, force: true });
       } else {
         prepareSelfEvolutionWorkspace(this.o.dataDir, this.home);
+        const notice = getSelfEvolutionUiArchiveNotice(this.o.dataDir);
+        if (notice && !this.selfEvolutionUiNoticeLogged) {
+          log.warn("legacy self-evolution UI overlay has been archived and disabled", {
+            bot: this.o.botId,
+            notice: notice.trim(),
+          });
+          this.selfEvolutionUiNoticeLogged = true;
+        }
       }
     } catch (e) {
       log.warn("self-evolution skill setup failed", { err: String(e) });
@@ -850,6 +887,18 @@ export class AgentHost {
   private selfEvolutionPluginLines(): string[] {
     if (!this.settings().selfEvolution?.enabled) return [];
     const out: string[] = [];
+    const report = inspectSelfEvolutionPlugins(this.o.dataDir);
+    for (const issue of report.issues) {
+      const key = `${issue.filePath}:${issue.reason}`;
+      if (!this.selfEvolutionPluginIssuesLogged.has(key)) {
+        log.warn("self-evolution plugin was skipped", {
+          bot: this.o.botId,
+          plugin: path.basename(issue.filePath),
+          reason: issue.reason,
+        });
+        this.selfEvolutionPluginIssuesLogged.add(key);
+      }
+    }
     for (const p of listSelfEvolutionPlugins(this.o.dataDir)) {
       out.push(`    - id: ${p.id}`, `      name: ${yamlStr(p.filePath)}`);
     }
@@ -982,11 +1031,13 @@ exec "$REAL" "$@"
       path.resolve(this.workspace),
       path.resolve(this.home),
       getOverlayRepoDir(this.o.dataDir),
+      path.dirname(getOverlayRepoDir(this.o.dataDir)),
     ];
     const localRepo = discoverLocalSourceRepo();
     if (localRepo) allowRead.push(path.resolve(localRepo));
     const rawPerm = this.settings().permission;
-    const effectivePerm = this.settings().selfEvolution?.enabled && rawPerm === "readonly" ? "workspace" : rawPerm;
+    const selfEvolutionEnabled = this.settings().selfEvolution?.enabled;
+    const effectivePerm = selfEvolutionEnabled && (rawPerm === "readonly" || isPackagedAsar()) ? "workspace" : rawPerm;
     const env: Record<string, string> = {
       PATH: shim ? `${shim}${path.delimiter}${basePath}` : basePath,
       AMB_DENY_READ: JSON.stringify([path.resolve(this.o.dataDir)]),
@@ -1007,6 +1058,10 @@ exec "$REAL" "$@"
       // 任务会话的系统提示词段（amb-tasks 插件加在机器人段之后）
       AMB_TASK_RULES: TASK_RULES,
     };
+    if (selfEvolutionEnabled) {
+      env.AMB_SELF_EVOLUTION_ROOT = path.resolve(this.workspace);
+      env.AMB_SELF_EVOLUTION_MODE = isPackagedAsar() ? "packaged" : "source";
+    }
     // 时区：本进程设了 TZ 才传下去；没设就不设，子进程用系统时区（各平台都是，Windows 上 TZ 也只认 POSIX 写法）
     if (process.env.TZ) env.TZ = process.env.TZ;
     // 代理与证书（用户自己的网络设置，不是密钥）：命令里的 pip、npm、git、curl 和用户平时一样联网；回环地址永远不走代理（proxy-env.ts）

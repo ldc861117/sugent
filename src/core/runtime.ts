@@ -103,6 +103,8 @@ export interface RuntimeOptions {
   route?: (botId: string, model: string) => string;
   /** 谁能和机器人对话（主人 + 允许名单）；缺省不限制 */
   access?: AccessControl;
+  /** P1 幕僚耳麦与明牌数字助理入站钩子（未开启时返回 undefined，零侵入保留原行为） */
+  conciergeIntercept?: (ev: InboundEvent) => { handled: boolean; ack?: string } | undefined;
   /**
    * 模型请求失败后调用：核对 Key 是否已失效（例如在 Modelflare 控制台被删）并重新签发。
    * 返回 true = 换了 Key，这条消息自动再试一次（只在还没有任何输出时）。缺省不重试。
@@ -463,6 +465,8 @@ export class BotRuntime {
    * handled=false 但带 ack：前一条还在处理，渠道先把 ack 发出去，消息照常入队。
    */
   interceptReply(ev: InboundEvent): { handled: boolean; ack?: string } {
+    const conc = this.opts.conciergeIntercept?.(ev);
+    if (conc?.handled) return conc;
     // 准入：不在允许名单里的人只收到一句提示（限频），不进队列、不碰模型；主人可以用「同意 1234」处理使用请求
     const gate = this.opts.access?.admit(ev);
     if (gate && !gate.ok) return { handled: true, ack: gate.reply };

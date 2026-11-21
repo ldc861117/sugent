@@ -44,6 +44,8 @@
 .bot-face[data-char="red"] { --bf-eye: var(--bot-red-eye); --bf-glow: var(--bot-red-glow); }
 .bot-face[data-char="purple"] { --bf-eye: var(--bot-purple-eye); --bf-glow: var(--bot-purple-glow); }
 .bot-face[data-char="orange"] { --bf-eye: var(--bot-orange-eye); --bf-glow: var(--bot-orange-glow); }
+.bot-face[data-char="sugent-core"] { --bf-eye: var(--bot-core-eye); --bf-glow: var(--bot-core-glow); }
+.bot-face[data-motion-personality="calm"] { --bf-breathe: 4.8s; --bf-bob: 1.5s; --bf-ponder: 3.4s; }
 .bot-face.pokeable { cursor: pointer; }
 .bot-face.neutral { filter: grayscale(1) contrast(.85) brightness(1.06); opacity: .5; }
 
@@ -64,7 +66,7 @@
 .bf-ear-r .bf-glow { background-position-x: calc(600% / 7); }
 .bf-top .bf-glow { background-position-x: 100%; }
 .bf-glow { opacity: 0; mix-blend-mode: plus-lighter; filter: drop-shadow(0 0 calc(var(--s) * .03) var(--bf-glow)); }
-.bot-face:not([data-char="red"], [data-char="purple"]) .bf-glow { display: none; }   /* 只有哒哒、晶晶有发光层 */
+.bot-face:not([data-char="red"], [data-char="purple"], [data-has-glow="1"]) .bf-glow { display: none; }   /* 只有带发光层的角色显示 */
 .bf-ear-l, .bf-ear-l .bf-pin { transform-origin: var(--o-el); }
 .bf-ear-r, .bf-ear-r .bf-pin { transform-origin: var(--o-er); }
 .bf-top, .bf-top .bf-pin, .bf-top .bf-img { transform-origin: var(--o-top); }
@@ -108,6 +110,7 @@
 }
 .bf-eyes .line { fill: none; stroke: var(--bf-eye); stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; }
 .bf-eyes .thin { stroke-width: 1.15; }
+.bf-eyes .e-glint { fill: var(--bot-glint); }
 .bot-face[data-eyes="open"] .e-open,
 .bot-face[data-eyes="happy"] .e-happy,
 .bot-face[data-eyes="closed"] .e-closed,
@@ -363,6 +366,22 @@
 @keyframes bf-scan { from { transform: translate(-2.6px, -.3px); } to { transform: translate(2.6px, -.3px); } }
 @keyframes bf-glint { 0%, 55% { translate: -110% 0; } 85%, 100% { translate: 110% 0; } }
 
+/* 方向 B 旗舰与定制面罩：工作时缝隙辉光呼吸、信标轻晃；完成时三连闪；最小动效性格仅保留眼神与状态提示 */
+.bot-face[data-has-glow="1"]:not([data-char="red"], [data-char="purple"]):is([data-state="thinking"], [data-state="replying"], [data-state="working"]) .bf-glow {
+  animation: bf-neon var(--bf-float) var(--ease-in-out) infinite alternate;
+}
+.bot-face[data-has-glow="1"]:not([data-char="red"], [data-char="purple"]):is([data-shot="done"], [data-shot="hello"]) .bf-glow {
+  animation: bf-flash3 var(--bot-done) linear both;
+}
+.bot-face[data-has-glow="1"]:not([data-char="red"], [data-char="purple"])[data-shot="error"] .bf-glow {
+  animation: bf-flicker var(--bot-error) steps(1) both;
+}
+.bot-face[data-char="sugent-core"]:is([data-state="thinking"], [data-state="replying"], [data-state="working"]) .bf-top {
+  animation: bf-sway var(--bf-sway) var(--ease-in-out) infinite alternate;
+}
+.bot-face[data-motion-personality="minimal"] .bf-body { animation: none; }
+.bot-face[data-motion-personality="minimal"] .bf-top { animation: none; }
+
 /* —— 粒子（≥ 36px 才画） —— */
 .bot-face .fx, .bot-face .fx i { position: absolute; display: block; pointer-events: none; }
 .fx-rings { left: var(--tip-x); top: var(--tip-y); }
@@ -511,3 +530,56 @@
   background: var(--accent-solid); color: var(--on-accent); box-shadow: inset 0 0 0 1px var(--accent-line);   /* 描边：黄绿在白底上只有 1.15:1，要一道墨色细边 */
 }
 .app-mark svg { width: 56%; height: 56%; }
+
+/* —— v2 双尺度全身舞台与小尺寸特写 —— */
+.comp-stage {
+  position: relative;
+  flex: none;
+  width: var(--s);
+  height: var(--s);
+  -webkit-user-select: none;
+  user-select: none;
+}
+.comp-stage-canvas,
+.comp-stage-fallback {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.bot-portrait {
+  position: relative;
+  flex: none;
+  width: var(--s);
+  height: var(--s);
+  border-radius: 50%;
+  background: var(--well);
+  overflow: hidden;
+  -webkit-user-select: none;
+  user-select: none;
+}
+.bot-portrait.neutral { filter: grayscale(1) contrast(.88); opacity: .55; }
+.bp-img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: 50% 25%;
+}
+.bp-ring {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  border: var(--hairline) solid var(--line-2);   /* 描边：小尺寸头像轻边界环 */
+  pointer-events: none;
+  transition: border-color var(--dur-base) var(--ease-out);
+}
+.bot-portrait[data-state="working"] .bp-ring,
+.bot-portrait[data-state="replying"] .bp-ring,
+.bot-portrait[data-state="thinking"] .bp-ring {
+  border-color: var(--accent-solid);   /* 描边：活跃工作状态指示环 */
+}
+.bot-portrait[data-state="waiting"] .bp-ring {
+  border-color: var(--amber);   /* 描边：待拍板提示环 */
+}

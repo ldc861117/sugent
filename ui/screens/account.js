@@ -14,9 +14,14 @@ const notifLink = (link) => {
 };
 
 export function LoginSheet({ onClose, onSignedIn }) {
-  return html`<${Sheet} title=${t("account.login.title")} onClose=${onClose}>
-    <p class="hint">${t("account.login.hint")}</p>
-    <${AccountLogin} onSignedIn=${(s) => { onSignedIn(s); onClose(); }} />
+  const [auth, setAuth] = useState(null);
+  useEffect(() => {
+    api("/auth/status").then(setAuth).catch(() => {});
+  }, []);
+  const isGoogle = auth?.mode === "google";
+  return html`<${Sheet} title=${isGoogle ? t("onboarding.enterprise.googleTitle") : t("account.login.title")} onClose=${onClose}>
+    <p class="hint">${isGoogle ? t("onboarding.enterprise.googleSub") : t("account.login.hint")}</p>
+    <${AccountLogin} label=${isGoogle ? t("onboarding.enterprise.googleBtn") : undefined} onSignedIn=${(s) => { onSignedIn(s); onClose(); }} />
   <//>`;
 }
 

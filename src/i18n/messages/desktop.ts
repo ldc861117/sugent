@@ -3,6 +3,8 @@ import type { Catalog } from "../types.js";
 
 export const zh = {
   trayOpen: "打开 {product}",
+  trayCompanionToggle: "显示 / 隐藏桌面浮标",
+  trayQuickBar: "呼出快捷幕僚 (⌥Space)",
   trayOpenInBrowser: "在浏览器中打开",
   trayAutostart: "开机自启",
   trayOpenDataDir: "打开数据目录",
@@ -17,6 +19,8 @@ export const zh = {
 
 export const en: Catalog<typeof zh> = {
   trayOpen: "Open {product}",
+  trayCompanionToggle: "Toggle Floating Companion",
+  trayQuickBar: "Quick Steward Bar (⌥Space)",
   trayOpenInBrowser: "Open in browser",
   trayAutostart: "Launch at login",
   trayOpenDataDir: "Open data folder",

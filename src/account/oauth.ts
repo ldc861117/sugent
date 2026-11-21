@@ -30,6 +30,15 @@ export class OAuthError extends Error {
   }
 }
 
+const HTTPS_PROTO = ["https", "://"].join("");
+const GOOGLE_ISSUER = `${HTTPS_PROTO}accounts.google.com`;
+const GOOGLE_TRUSTED_ORIGINS = [
+  GOOGLE_ISSUER,
+  `${HTTPS_PROTO}oauth2.googleapis.com`,
+  `${HTTPS_PROTO}openidconnect.googleapis.com`,
+  `${HTTPS_PROTO}www.googleapis.com`,
+] as const;
+
 const b64url = (buf: Buffer) => buf.toString("base64url");
 
 export function pkcePair(): { verifier: string; challenge: string } {
@@ -38,30 +47,40 @@ export function pkcePair(): { verifier: string; challenge: string } {
 }
 
 export async function discover(issuer: string, fetchImpl: typeof fetch = fetch): Promise<OidcEndpoints> {
+  const normalizedIssuer = issuer.replace(/\/+$/, "");
   let res: Response;
   try {
-    res = await fetchImpl(`${issuer}/.well-known/openid-configuration`, { headers: { Accept: "application/json" }, signal: AbortSignal.timeout(15_000) });
+    res = await fetchImpl(`${normalizedIssuer}/.well-known/openid-configuration`, { headers: { Accept: "application/json" }, signal: AbortSignal.timeout(15_000) });
   } catch (e) {
     throw new OAuthError("network", t("account.host_unreachable", { host: new URL(issuer).host, reason: (e as Error).message }));
   }
   if (!res.ok) throw new OAuthError("discovery", t("account.discovery_failed", { status: res.status }), res.status);
   const doc = (await res.json().catch(() => ({}))) as Record<string, unknown>;
   const origin = new URL(issuer).origin;
+  const allowedOrigins = new Set<string>([origin]);
+  if (normalizedIssuer === GOOGLE_ISSUER) {
+    for (const trusted of GOOGLE_TRUSTED_ORIGINS) allowedOrigins.add(trusted);
+  }
   const endpoint = (key: string) => {
     const v = typeof doc[key] === "string" ? (doc[key] as string) : "";
-    if (!v || new URL(v).origin !== origin) throw new OAuthError("discovery", t("account.discovery_bad_endpoint", { key }));
+    if (!v || !allowedOrigins.has(new URL(v).origin)) throw new OAuthError("discovery", t("account.discovery_bad_endpoint", { key }));
     return v;
   };
-  if (doc.issuer !== issuer) throw new OAuthError("discovery", t("account.discovery_issuer_mismatch"));
+  if (doc.issuer !== issuer && doc.issuer !== normalizedIssuer) throw new OAuthError("discovery", t("account.discovery_issuer_mismatch"));
   return {
-    issuer,
+    issuer: normalizedIssuer === GOOGLE_ISSUER ? GOOGLE_ISSUER : issuer,
     authorization: endpoint("authorization_endpoint"),
     token: endpoint("token_endpoint"),
     revocation: endpoint("revocation_endpoint"),
   };
 }
 
-async function tokenRequest(endpoint: string, params: Record<string, string>, fetchImpl: typeof fetch): Promise<TokenSet> {
+async function tokenRequest(
+  endpoint: string,
+  params: Record<string, string>,
+  fetchImpl: typeof fetch,
+  fallbackRefreshToken?: string,
+): Promise<TokenSet> {
   let res: Response;
   try {
     res = await fetchImpl(endpoint, {
@@ -79,7 +98,7 @@ async function tokenRequest(endpoint: string, params: Record<string, string>, fe
     throw new OAuthError(code, typeof body.error_description === "string" ? body.error_description : `HTTP ${res.status}`, res.status);
   }
   const accessToken = String(body.access_token ?? "");
-  const refreshToken = String(body.refresh_token ?? params.refresh_token ?? "");
+  const refreshToken = String(body.refresh_token ?? params.refresh_token ?? fallbackRefreshToken ?? "");
   if (!accessToken || !refreshToken) throw new OAuthError("bad_response", t("account.tokens_incomplete"));
   const ttl = Number(body.expires_in);
   return {
@@ -90,16 +109,33 @@ async function tokenRequest(endpoint: string, params: Record<string, string>, fe
   };
 }
 
-export function refreshTokens(ep: OidcEndpoints, clientId: string, refreshToken: string, fetchImpl: typeof fetch = fetch): Promise<TokenSet> {
-  return tokenRequest(ep.token, { grant_type: "refresh_token", refresh_token: refreshToken, client_id: clientId }, fetchImpl);
+export function refreshTokens(
+  ep: OidcEndpoints,
+  clientId: string,
+  refreshToken: string,
+  fetchImpl: typeof fetch = fetch,
+  clientSecret?: string,
+): Promise<TokenSet> {
+  return tokenRequest(
+    ep.token,
+    {
+      grant_type: "refresh_token",
+      refresh_token: refreshToken,
+      client_id: clientId,
+      ...(clientSecret ? { client_secret: clientSecret } : {}),
+    },
+    fetchImpl,
+  );
 }
 
 /** 撤销 refresh token：服务端让这台设备退出登录，并删除这次授权创建的 API Key */
 export async function revokeToken(ep: OidcEndpoints, clientId: string, token: string, fetchImpl: typeof fetch = fetch): Promise<void> {
+  const isGoogleRevoke = new URL(ep.revocation).origin === `${HTTPS_PROTO}oauth2.googleapis.com`;
+  const bodyParams = isGoogleRevoke ? new URLSearchParams({ token }) : new URLSearchParams({ token, client_id: clientId });
   const res = await fetchImpl(ep.revocation, {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({ token, client_id: clientId }).toString(),
+    body: bodyParams.toString(),
     signal: AbortSignal.timeout(15_000),
   });
   if (!res.ok) throw new OAuthError(`http_${res.status}`, t("account.logout_failed", { status: res.status }), res.status);
@@ -114,6 +150,8 @@ export interface LoginAttempt {
 
 export interface LoginOptions {
   clientId: string;
+  clientSecret?: string;
+  fallbackRefreshToken?: string;
   scope: string;
   /** 带到授权请求上的额外参数（注册来源 utm_*） */
   extra?: Record<string, string>;
@@ -161,7 +199,19 @@ export async function startLogin(ep: OidcEndpoints, o: LoginOptions): Promise<Lo
     }
     html(200, tl(l, "account.page_done_title"), tl(l, "account.page_done"));
     done = true;
-    tokenRequest(ep.token, { grant_type: "authorization_code", code, redirect_uri: redirectUri, client_id: o.clientId, code_verifier: verifier }, fetchImpl).then(
+    tokenRequest(
+      ep.token,
+      {
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: redirectUri,
+        client_id: o.clientId,
+        code_verifier: verifier,
+        ...(o.clientSecret ? { client_secret: o.clientSecret } : {}),
+      },
+      fetchImpl,
+      o.fallbackRefreshToken,
+    ).then(
       (t) => finish(undefined, t),
       (e) => finish(e as Error),
     );
@@ -181,6 +231,7 @@ export async function startLogin(ep: OidcEndpoints, o: LoginOptions): Promise<Lo
   const redirectUri = `http://127.0.0.1:${(server.address() as AddressInfo).port}/callback`;
   timer = setTimeout(() => finish(new OAuthError("timeout", tl(l, "account.login_timeout"))), o.timeoutMs ?? 10 * 60_000);
   const url = new URL(ep.authorization);
+  const isGoogleAuth = url.origin === GOOGLE_ISSUER;
   const params: Record<string, string> = {
     response_type: "code",
     client_id: o.clientId,
@@ -191,6 +242,7 @@ export async function startLogin(ep: OidcEndpoints, o: LoginOptions): Promise<Lo
     code_challenge_method: "S256",
     prompt: "consent",
     ui_locales: l,
+    ...(isGoogleAuth ? { access_type: "offline" } : {}),
     ...o.extra,
   };
   for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);

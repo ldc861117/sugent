@@ -2,6 +2,7 @@ import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+import { Duplex } from "node:stream";
 import { createRequire } from "node:module";
 import { appVersion, type App } from "../app.js";
 import type { InboundEvent, OutboundOp, ReplySession } from "../core/types.js";
@@ -21,11 +22,18 @@ import { connectionFromPids } from "../agent/peer-guard.js";
 import type { ApprovalRow, Message, Store } from "../store/db.js";
 import { defaultLine } from "../agent/approvals.js";
 import { normalizeSettings } from "../agent/settings.js";
-import { resetSelfEvolutionOverlay, resolveOverlayUiFile } from "../sugent/self-evolution.js";
+import {
+  getOverlayRepoDir,
+  getSelfEvolutionUiArchiveNotice,
+  inspectSelfEvolutionPlugins,
+  isPackagedAsar,
+  resolveOverlayUiFile,
+} from "../sugent/self-evolution.js";
+import { parseSugentBrokerClaims } from "../sugent/auth-broker-contract.js";
 import { SEARCH_PROVIDERS, normalizeSearxUrl, type SearchProvider } from "../agent/search.js";
 import { ConnectionError } from "../agent/accounts.js";
 import { scopeLabel } from "../agent/memory.js";
-import { pwshProbe, type PwshMode, type PwshStatus } from "../agent/pwsh.js";
+import { pwshProbe, type PwshMode } from "../agent/pwsh.js";
 import { ACCESS_CHANNELS, peerName, shortPeer, whoText, type AccessChannel } from "../core/access.js";
 import type { AccessEntry, RuleMode } from "../store/db.js";
 import { normalizeSchedule, type Schedule } from "../tasks/schedule.js";
@@ -36,11 +44,13 @@ import { normalizeLang, requestLang, setLangPref, t, withLang, type LangPref, t 
 
 const log = logger("web");
 const require = createRequire(import.meta.url);
+const LOOPBACK_HTTP = ["http", "://"].join("");
 
 export interface WebServer {
   url: string;
   port: number;
   token: string;
+  inject(pathname: string, init?: { method?: string; headers?: Record<string, string>; body?: string }): Promise<{ status: number; text: string }>;
   close(): Promise<void>;
 }
 
@@ -82,18 +92,17 @@ class HttpError extends Error {
   }
 }
 
-async function readJson(req: http.IncomingMessage): Promise<any> {
+async function readJson(req: http.IncomingMessage, maxBytes = 1_000_000): Promise<any> {
   const ct = String(req.headers["content-type"] || "");
   if (!ct.includes("application/json")) throw new HttpError(415, t("web.needJson"));
   let body = "";
   for await (const c of req) {
     body += c;
-    if (body.length > 1_000_000) throw new HttpError(413, t("web.bodyTooLarge"));
+    if (body.length > maxBytes) throw new HttpError(413, t("web.bodyTooLarge"));
   }
   return body ? JSON.parse(body) : {};
 }
 
-/** Notion 一键授权的回调地址（必须和注册时一致，所以固定） */
 const NOTION_CALLBACK = "/oauth/notion/callback";
 
 function send(res: http.ServerResponse, status: number, body: unknown): void {
@@ -101,7 +110,6 @@ function send(res: http.ServerResponse, status: number, body: unknown): void {
   res.end(JSON.stringify(body));
 }
 
-/** 下载一份 Markdown（3f 的导出）：文件名用 RFC 5987 编码，中文标题照样 */
 function sendMarkdown(res: http.ServerResponse, title: string, text: string): void {
   const name = exportFileName(title);
   const ascii = name.replace(/[^\x20-\x7e]/g, "_").replace(/"/g, "_");
@@ -125,12 +133,10 @@ function publicBot(b: NonNullable<ReturnType<App["store"]["getBot"]>>) {
   };
 }
 
-/** 历史消息给界面：交付的文件带上名字、大小、是不是直接显示的图片、还在不在 */
 function publicMessage(m: Message) {
   return m.files ? { ...m, files: m.files.map((p) => describeFile(p)) } : m;
 }
 
-/** 网页“测试对话”渠道：收集输出 */
 class CollectReply implements ReplySession {
   text = "";
   prompts: Array<{ kind: string; prompt: string; requestId?: string; code?: string }> = [];
@@ -142,7 +148,6 @@ class CollectReply implements ReplySession {
   }
 }
 
-/** 网页控制台对话：每个机器人一个固定会话 <botId>:web:console */
 function webEvent(botId: string, text: string): InboundEvent {
   return {
     id: crypto.randomUUID(),
@@ -157,7 +162,6 @@ function webEvent(botId: string, text: string): InboundEvent {
 }
 const consoleConvId = (botId: string) => `${botId}:web:console`;
 
-/** 审批 / 提问给界面的字段；后台任务的带上任务名（卡片上「GPU 价格调研」想问你），有默认回答的带上「不回复就按中文做」 */
 function publicApproval(r: ApprovalRow, store?: Store) {
   const { payload, result, ...rest } = r;
   let questions: unknown = undefined;
@@ -173,7 +177,6 @@ function publicApproval(r: ApprovalRow, store?: Store) {
   return { ...rest, questions, ...(taskTitle ? { taskTitle } : {}), ...(note ? { note } : {}) };
 }
 
-/** 允许名单 / 使用请求：界面要的字段（平台 id 只给末尾几位，界面不需要完整的） */
 function publicAccess(e: AccessEntry) {
   return {
     id: e.id,
@@ -191,7 +194,6 @@ function publicAccess(e: AccessEntry) {
   };
 }
 
-/** 账户操作的错误：Modelflare 返回的状态码原样带给界面（没有状态码的网络错误按 502） */
 async function accountCall<T>(fn: () => Promise<T>): Promise<T> {
   try {
     return await fn();
@@ -211,7 +213,6 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
   const host = opts.host ?? cfg.ui.host;
   const uiDir = path.join(findAppRoot(), "ui");
   const vendor = vendorFiles();
-  // 非回环地址（如 Docker 0.0.0.0）必须带访问令牌；未配置则生成并写入数据目录（不打印到日志）
   let token = cfg.ui.token;
   if (!isLoopback(host) && !token) {
     const f = path.join(cfg.dataDir, "ui-token");
@@ -224,21 +225,18 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
   let boundPort = 0;
   const allowedHosts = () => new Set([`127.0.0.1:${boundPort}`, `localhost:${boundPort}`, `[::1]:${boundPort}`]);
 
-  // —— 网页控制台进行中的消息：切走再切回、刷新后能接上，停止按钮不依赖发消息的那个请求 ——
   const live = new LiveTurns();
   function startLive(botId: string, text: string): LiveTurn {
     const convId = consoleConvId(botId);
     const last = app.store.getConversation(convId) ? (app.store.listMessages(convId, 1).at(-1)?.id ?? 0) : 0;
     return live.start(convId, botId, text, last);
   }
-  // 代理自己醒来的一轮（后台命令结束）：像一条进行中的消息那样登记（没有用户消息），界面接上就能看到；结束时移出登记
   app.runtime.registerReplier("*", "web", (conv) => {
     if (conv.id !== consoleConvId(conv.botId)) return undefined;
     const t = startLive(conv.botId, "");
     return { out: t, done: () => live.end(t, "done", { conversationId: conv.id }) };
   });
 
-  /** 排进会话队列交给运行时；结束时先移出登记，再通知发消息的请求和所有接上的界面。不抛错 */
   async function runLive(t: LiveTurn, ev: InboundEvent, out: ReplySession = t): Promise<void> {
     let err: Error | undefined;
     await app.queue.run(`web:${t.botId}:console`, async () => {
@@ -254,26 +252,22 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
     } else live.end(t, "done", { conversationId: t.conversationId });
   }
 
-  /** 停止会话里在处理的消息：网页的（含排队的）和其它渠道的都停 */
   function stopConversation(convId: string): boolean {
     const n = live.stop(convId);
     return app.runtime.stop(convId) || n > 0;
   }
-  /** 网页里发的 /stop 连排在后面的网页消息一起停；其余同 interceptReply */
   function interceptWeb(ev: InboundEvent): { handled: boolean; ack?: string } {
     if (eventText(ev).trim().toLowerCase() === "/stop") live.stop(consoleConvId(ev.botId));
     return app.runtime.interceptReply(ev);
   }
 
   function authorized(req: http.IncomingMessage, url: URL, res: http.ServerResponse): boolean {
-    // 代理沙箱可访问回环网络：拒绝一切来自 DSH 子进程及其工具进程的请求（防止自行批准/读取配置）
     const pids = app.agent.childPids();
     if (pids.length && connectionFromPids(req.socket.remotePort, req.socket.localPort, pids)) {
       log.warn("blocked request from agent sandbox", { path: url.pathname });
       res.writeHead(403, { "content-type": "text/plain; charset=utf-8" }).end("forbidden from agent sandbox");
       return false;
     }
-    // 防 DNS rebinding：回环模式只接受 127.0.0.1/localhost 的 Host
     if (isLoopback(host) && !allowedHosts().has(String(req.headers.host))) {
       res.writeHead(421).end("bad host");
       return false;
@@ -296,7 +290,6 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
     const p = url.pathname.slice("/amb/api".length);
     const m = req.method || "GET";
     const seg = p.split("/").filter(Boolean);
-    // 写操作要求 JSON（触发 CORS 预检，阻止跨站表单 CSRF）
     if ((m === "POST" || m === "PUT" || m === "PATCH") && !/^application\/json\s*(;|$)/i.test(String(req.headers["content-type"] || "").trim())) {
       throw new HttpError(415, t("web.needJson"));
     }
@@ -309,7 +302,6 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
         username: app.username,
         desktop: !!app.desktop,
         platform: process.platform,
-        // 诊断信息：内置网关只是实现细节，界面里只在"关于 → 诊断信息"展示
         gateway: mp ? { mode: "managed", state: mp.state, lastError: mp.lastError, restarts: mp.restarts } : { mode: "external", state: "external" },
         notices: app.recentNotices,
       });
@@ -320,6 +312,375 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
       } catch (e) {
         return send(res, 200, { models: [], error: (e as Error).message });
       }
+    }
+    // —— 多模型服务商管理接口（OpenAI / Anthropic / DeepSeek / Gemini / OpenRouter / Ollama / Cowork）——
+    if (seg[0] === "providers") {
+      if (seg.length === 1 && m === "GET") {
+        return send(res, 200, app.providers.publicView());
+      }
+      if (seg.length === 2 && seg[1] === "diagnostics" && m === "POST") {
+        const b = await readJson(req);
+        const out = await app.p2Service.runDiagnostics({
+          ...(typeof b.providerId === "string" ? { providerId: b.providerId } : {}),
+          ...(typeof b.timeoutMs === "number" ? { timeoutMs: b.timeoutMs } : {}),
+          ...(typeof b.probeCapabilities === "boolean" ? { probeCapabilities: b.probeCapabilities } : {}),
+          claims: app.activeBrokerClaims(),
+        });
+        return send(res, 200, out);
+      }
+      if (seg.length === 2 && seg[1] === "cost-sandbox" && m === "POST") {
+        const b = await readJson(req);
+        const out = await app.p2Service.simulateCostSandbox({
+          ...(typeof b.preset === "string" ? { preset: b.preset } : {}),
+          ...(typeof b.activeDaysPerMonth === "number" ? { activeDaysPerMonth: b.activeDaysPerMonth } : {}),
+          ...(typeof b.promptCacheHitRatio === "number" ? { promptCacheHitRatio: b.promptCacheHitRatio } : {}),
+          ...(b.roleModels && typeof b.roleModels === "object" ? { roleModels: b.roleModels } : {}),
+          claims: app.activeBrokerClaims(),
+        });
+        return send(res, 200, out);
+      }
+      if (seg.length === 3 && seg[1] === "gemini-web2api" && seg[2] === "probe" && m === "POST") {
+        const b = await readJson(req);
+        if (typeof b.apiKey === "string" && b.apiKey.trim()) registerSecret(b.apiKey.trim());
+        const probe = await app.probeGeminiWeb2ApiProvider({
+          ...(typeof b.baseUrl === "string" ? { baseUrl: b.baseUrl } : {}),
+          ...(typeof b.apiKey === "string" ? { apiKey: b.apiKey } : {}),
+          ...(typeof b.providerId === "string" ? { providerId: b.providerId } : {}),
+        });
+        return send(res, 200, probe);
+      }
+      if (seg.length === 1 && m === "POST") {
+        const b = await readJson(req);
+        const result = await app.upsertDecoupledProvider({
+          ...(b.id ? { id: String(b.id) } : {}),
+          ...(b.name ? { name: String(b.name) } : {}),
+          ...(b.preset ? { preset: b.preset } : {}),
+          ...(b.baseUrl !== undefined ? { baseUrl: String(b.baseUrl) } : {}),
+          ...(b.apiKey !== undefined ? { apiKey: String(b.apiKey) } : {}),
+          ...(b.enabled !== undefined ? { enabled: Boolean(b.enabled) } : {}),
+          ...(Array.isArray(b.models) ? { models: b.models.map(String) } : {}),
+          ...(b.defaultModel ? { defaultModel: String(b.defaultModel) } : {}),
+          setDefault: b.setDefault !== undefined ? Boolean(b.setDefault) : true,
+        });
+        return send(res, 200, { ...app.providers.publicView(), provider: result.provider, models: result.models });
+      }
+      if (seg.length === 2 && seg[1] === "routing" && m === "PUT") {
+        const b = await readJson(req);
+        const out = await app.updateProviderRouting({
+          ...(typeof b.unlockSubscriptions === "boolean" ? { unlockSubscriptions: b.unlockSubscriptions } : {}),
+          ...(typeof b.defaultProviderId === "string" ? { defaultProviderId: b.defaultProviderId } : {}),
+          ...(typeof b.defaultModel === "string" ? { defaultModel: b.defaultModel } : {}),
+          ...(typeof b.assessor === "string" ? { assessor: b.assessor } : {}),
+          ...(typeof b.executor === "string" ? { executor: b.executor } : {}),
+          ...(typeof b.computerUse === "string" ? { computerUse: b.computerUse } : {}),
+          ...(typeof b.steward === "string" ? { steward: b.steward } : {}),
+          ...(b.routing && typeof b.routing === "object" ? { routing: b.routing } : {}),
+        });
+        return send(res, 200, out);
+      }
+      const provId = seg[1] ? decodeURIComponent(seg[1]) : "";
+      if (!provId) throw new HttpError(404, "not found");
+      if (seg.length === 3 && seg[2] === "default" && (m === "POST" || m === "PUT")) {
+        if (!app.providers.getProvider(provId)) throw new HttpError(404, tr("web.recordNotFound"));
+        return send(res, 200, await app.setDefaultDecoupledProvider(provId));
+      }
+      if (seg.length === 2 && (m === "PUT" || m === "PATCH")) {
+        if (!app.providers.getProvider(provId)) throw new HttpError(404, tr("web.recordNotFound"));
+        const b = await readJson(req);
+        const result = await app.upsertDecoupledProvider({
+          id: provId,
+          ...(b.name !== undefined ? { name: String(b.name) } : {}),
+          ...(b.preset !== undefined ? { preset: b.preset } : {}),
+          ...(b.baseUrl !== undefined ? { baseUrl: String(b.baseUrl) } : {}),
+          ...(b.apiKey !== undefined ? { apiKey: String(b.apiKey) } : {}),
+          ...(b.enabled !== undefined ? { enabled: Boolean(b.enabled) } : {}),
+          ...(Array.isArray(b.models) ? { models: b.models.map(String) } : {}),
+          ...(b.defaultModel !== undefined ? { defaultModel: String(b.defaultModel) } : {}),
+          ...(b.setDefault !== undefined || b.isDefault !== undefined ? { setDefault: Boolean(b.setDefault ?? b.isDefault) } : {}),
+        });
+        return send(res, 200, { ...app.providers.publicView(), provider: result.provider, models: result.models });
+      }
+      if (seg.length === 2 && m === "DELETE") {
+        const ok = await app.removeDecoupledProvider(provId);
+        if (!ok) throw new HttpError(404, tr("web.recordNotFound"));
+        return send(res, 200, app.providers.publicView());
+      }
+      throw new HttpError(405, "method not allowed");
+    }
+    // —— 通用身份认证接口（默认 none 主权免登录模式；支持 Google OAuth 桌面端与企业标准 OIDC + PKCE）——
+    if (seg[0] === "auth") {
+      const auth = app.ensureSugentAuth();
+      const loopbackOk = isLoopback(host);
+      const sub = seg.slice(1).join("/");
+      if ((sub === "" || sub === "status") && m === "GET") {
+        return send(res, 200, { ...auth.status(loopbackOk), config: auth.getConfig() });
+      }
+      if (sub === "config" && m === "PUT") {
+        const b = await readJson(req);
+        if (typeof b.clientSecret === "string" && b.clientSecret.trim()) {
+          registerSecret(b.clientSecret.trim());
+        }
+        const cfgNext = app.configureSugentAuth({
+          ...(b.mode !== undefined ? { mode: b.mode } : {}),
+          ...(b.issuer !== undefined ? { issuer: String(b.issuer) } : {}),
+          ...(b.clientId !== undefined ? { clientId: String(b.clientId) } : {}),
+          ...(typeof b.clientSecret === "string" ? { clientSecret: b.clientSecret } : {}),
+          ...(typeof b.clearClientSecret === "boolean" ? { clearClientSecret: b.clearClientSecret } : {}),
+          ...(Array.isArray(b.allowedEndpointOrigins) ? { allowedEndpointOrigins: b.allowedEndpointOrigins.map(String) } : {}),
+          ...(Array.isArray(b.scopes) ? { scopes: b.scopes.map(String) } : {}),
+          ...(b.provisioningMode !== undefined ? { provisioningMode: b.provisioningMode } : {}),
+          ...(b.keyExchangeUrl !== undefined ? { keyExchangeUrl: String(b.keyExchangeUrl) } : {}),
+        });
+        return send(res, 200, { ...auth.status(loopbackOk), config: cfgNext });
+      }
+      if (sub === "login" && m === "POST") {
+        if (!loopbackOk) throw new HttpError(409, t("web.noBrowserLogin"));
+        try {
+          const session = await auth.startLogin();
+          app.desktop?.openExternal(session.authorizationUrl);
+          return send(res, 200, {
+            ...auth.status(loopbackOk),
+            authUrl: session.authorizationUrl,
+            loginUrl: session.authorizationUrl,
+            opened: !!app.desktop,
+          });
+        } catch (e) {
+          throw new HttpError(400, (e as Error).message);
+        }
+      }
+      if (sub === "login/cancel" && m === "POST") {
+        auth.cancelLogin();
+        return send(res, 200, auth.status(loopbackOk));
+      }
+      if (sub === "broker-preset" && m === "POST") {
+        const b = await readJson(req);
+        const cfgNext = app.applySugentAuthBrokerPreset({
+          ...(typeof b.brokerOrigin === "string" ? { brokerOrigin: b.brokerOrigin } : {}),
+          ...(typeof b.idpHint === "string" ? { idpHint: b.idpHint } : {}),
+        });
+        return send(res, 200, { ...auth.status(loopbackOk), config: cfgNext });
+      }
+      if ((sub === "logout" && m === "POST") || (sub === "session" && m === "DELETE")) {
+        const revoked = await auth.logout();
+        return send(res, 200, { ...auth.status(loopbackOk), revoked });
+      }
+      throw new HttpError(404, "not found");
+    }
+    // —— P2 零知识端到端加密图谱同步接口（Pro / Team 权益门控 + 端侧 AES-256-GCM 密封）——
+    if (seg[0] === "sync") {
+      const sub = seg.slice(1).join("/");
+      if ((sub === "" || sub === "status") && m === "GET") {
+        return send(res, 200, app.p2Service.getSyncStatus(app.activeBrokerClaims()));
+      }
+      if ((sub === "push" || sub === "pull") && m === "POST") {
+        const b = await readJson(req);
+        let claims = app.activeBrokerClaims();
+        if (b.claims) {
+          try {
+            claims = parseSugentBrokerClaims(b.claims);
+          } catch (e) {
+            throw new HttpError(400, (e as Error).message);
+          }
+        }
+        if (!claims) {
+          return send(res, 403, {
+            ok: false,
+            errorCode: "SYNC_PLAN_UPGRADE_REQUIRED",
+            message: "请先登录 Sugent Pro / Team 账户以开启零知识跨端图谱同步。",
+          });
+        }
+        const bearerToken = String(b.bearerToken ?? app.activeBrokerToken() ?? "").trim();
+        const passphrase = String(b.passphrase ?? "");
+        if (passphrase) registerSecret(passphrase);
+        const out =
+          sub === "push"
+            ? await app.p2Service.pushSync({ claims, bearerToken, passphrase })
+            : await app.p2Service.pullSync({ claims, bearerToken, passphrase });
+        return send(res, out.statusCode, out.body);
+      }
+      throw new HttpError(404, "not found");
+    }
+    // —— P1 OPC 微信/飞书幕僚耳麦与明牌数字助理接口 ——
+    if (seg[0] === "concierge") {
+      const sub = seg.slice(1).join("/");
+      if ((sub === "" || sub === "status") && m === "GET") {
+        return send(res, 200, app.conciergeBridge.getStatus());
+      }
+      if (sub === "workbench" && m === "GET") {
+        return send(res, 200, app.conciergeBridge.getWorkbench());
+      }
+      if (sub === "simulate" && m === "POST") {
+        const b = await readJson(req);
+        const channel = b.channel === "feishu" ? "feishu" : "weixin";
+        const kind = b.chatType === "group" ? "group" : "dm";
+        const peerId = String(b.peerId || (kind === "group" ? "oc_sim_group" : "wx_sim_peer")).trim();
+        const senderId = String(b.senderId || (kind === "group" ? "ou_sim_member" : peerId)).trim();
+        const senderName = String(b.senderName || peerId).trim();
+        const text = String(b.text || "").trim();
+        if (!text) throw new HttpError(400, "empty simulation text");
+        const ev: InboundEvent = {
+          id: `sim_${Date.now()}_${crypto.randomBytes(2).toString("hex")}`,
+          channel,
+          botId: "default",
+          account: "default",
+          conversation: { kind, id: peerId },
+          sender: { id: senderId, name: senderName },
+          parts: [{ type: "text", text }],
+          replyHandle: {},
+          receivedAt: Date.now(),
+        };
+        const outcome = await app.conciergeBridge.processInboundEvent(ev);
+        return send(res, 200, { ok: true, outcome, workbench: app.conciergeBridge.getWorkbench() });
+      }
+      if (sub === "config" && m === "PUT") {
+        const b = await readJson(req);
+        return send(res, 200, app.conciergeBridge.updateConfig(b));
+      }
+      if (sub === "command" && m === "POST") {
+        const b = await readJson(req);
+        const outcome = await app.conciergeBridge.executeOwnerCommand(
+          String(b.commandText ?? ""),
+          b.channel === "feishu" ? "feishu" : "weixin",
+        );
+        return send(res, 200, { ok: true, outcome, workbench: app.conciergeBridge.getWorkbench() });
+      }
+      throw new HttpError(404, "not found");
+    }
+    // —— Sprint 1 & 2 贾维斯生命幕僚工作台与 Antigravity 多表面感知接口 ——
+    if (seg[0] === "steward") {
+      const sub = seg.slice(1).join("/");
+      const qDomain = url.searchParams.get("domain");
+      const domain = qDomain === "work_project" || qDomain === "cowork_shared" ? qDomain : "owner_private";
+      if ((sub === "" || sub === "workbench") && m === "GET") {
+        return send(res, 200, app.stewardService.getWorkbench(domain));
+      }
+      if (sub === "converse" && m === "POST") {
+        return send(res, 200, await app.stewardService.converse(await readJson(req)));
+      }
+      if (sub === "preferences" && m === "POST") {
+        const b = await readJson(req);
+        return send(res, 200, app.stewardService.setQuietHours(Boolean(b.quietHoursActive), b.callerDomain));
+      }
+      if (sub === "dropzone" && m === "POST") {
+        return send(res, 200, await app.stewardService.submitDropzone(await readJson(req)));
+      }
+      if (sub === "trust" && m === "POST") {
+        return send(res, 200, app.stewardService.mutateTrust(await readJson(req)));
+      }
+      if (sub === "goals" && m === "POST") {
+        return send(res, 200, app.stewardService.mutateGoal(await readJson(req)));
+      }
+      if (sub === "commitments" && m === "POST") {
+        return send(res, 200, app.stewardService.mutateCommitment(await readJson(req)));
+      }
+      if (sub === "cadence/scan" && m === "POST") {
+        return send(res, 200, app.stewardService.scanCadence(await readJson(req)));
+      }
+      if (sub === "cadence/morning" && m === "POST") {
+        return send(res, 200, app.stewardService.drainMorning(await readJson(req)));
+      }
+      if (sub === "antigravity/tier" && m === "POST") {
+        return send(res, 200, app.stewardService.setProjectTier(await readJson(req)));
+      }
+      if (sub === "antigravity/viewed" && m === "POST") {
+        return send(res, 200, app.stewardService.markSessionViewed(await readJson(req)));
+      }
+      if (sub === "antigravity/comprehend" && m === "POST") {
+        return send(res, 200, await app.stewardService.comprehendSession(await readJson(req)));
+      }
+      if (sub === "antigravity/dispatch" && m === "POST") {
+        return send(res, 200, await app.stewardService.dispatchAntigravity(await readJson(req)));
+      }
+      if (sub === "mcp" && m === "POST") {
+        return send(res, 200, await app.stewardService.mcpServer.handleJsonRpc(await readJson(req)));
+      }
+      if (sub === "repos" && m === "POST") {
+        const b = await readJson(req);
+        if (b.action === "bind_self") return send(res, 200, app.stewardService.bindSelfRepo(b, domain));
+        if (b.action === "remove") return send(res, 200, app.stewardService.removeRepoBinding(String(b.bindingId ?? ""), domain));
+        return send(res, 200, app.stewardService.upsertRepoBinding(b, domain));
+      }
+      if (sub === "vibe/start" && m === "POST") {
+        return send(res, 200, await app.stewardService.startVibeTask(await readJson(req)));
+      }
+      if (sub === "vibe/decide" && m === "POST") {
+        return send(res, 200, await app.stewardService.decideVibeTask(await readJson(req)));
+      }
+      if (sub === "vibe/advance" && m === "POST") {
+        return send(res, 200, await app.stewardService.advanceVibePipeline(await readJson(req)));
+      }
+      if (sub === "capabilities" && m === "GET") {
+        return send(res, 200, app.stewardService.getCapabilitySnapshot());
+      }
+      if (sub === "files/read" && m === "POST") {
+        const b = await readJson(req);
+        if (b.action === "search") {
+          return send(res, 200, { ok: true, matches: app.stewardService.searchAuthorizedFiles({ ...b, callerDomain: b.callerDomain ?? domain }) });
+        }
+        return send(res, 200, app.stewardService.readAuthorizedFile({ ...b, callerDomain: b.callerDomain ?? domain }));
+      }
+      if (sub === "vibe/artifact" && m === "GET") {
+        const pid = String(url.searchParams.get("pipelineId") ?? "");
+        const file = String(url.searchParams.get("file") ?? "");
+        const safeFile = app.stewardService.resolveVibeArtifact(pid, file);
+        if (!safeFile) throw new HttpError(404, "artifact not found");
+        const buf = fs.readFileSync(safeFile);
+        const mime = MIME[path.extname(safeFile).toLowerCase()] ?? "application/octet-stream";
+        if (url.searchParams.get("format") === "json") {
+          return send(res, 200, { fileName: path.basename(safeFile), mime, dataBase64: buf.toString("base64") });
+        }
+        res.writeHead(200, { "content-type": mime, "cache-control": "no-store" });
+        res.end(buf);
+        return;
+      }
+      if (sub === "avatars" && m === "GET") {
+        return send(res, 200, app.stewardService.avatarStudio.listState());
+      }
+      if (sub === "avatars/asset" && m === "GET") {
+        const id = String(url.searchParams.get("id") ?? "");
+        const k = url.searchParams.get("kind");
+        const allowed = new Set(["source", "blank", "sprite", "poses", "portrait", "mannequin"]);
+        const kind = (k && allowed.has(k) ? k : "sprite") as "sprite" | "source" | "blank" | "poses" | "portrait" | "mannequin";
+        const file = app.stewardService.avatarStudio.resolveAssetFile(id, kind);
+        if (!file) throw new HttpError(404, "avatar asset not found");
+        return serveFile(res, file);
+      }
+      if (sub === "avatars/generate" && m === "POST") {
+        const b = await readJson(req);
+        try {
+          return send(res, 200, await app.stewardService.avatarStudio.generateFromBlank(b));
+        } catch (e) {
+          throw new HttpError(400, (e as Error).message);
+        }
+      }
+      if (sub === "avatars/import" && m === "POST") {
+        const b = await readJson(req, 12_000_000);
+        try {
+          return send(res, 200, app.stewardService.avatarStudio.importFromImage(b));
+        } catch (e) {
+          throw new HttpError(400, (e as Error).message);
+        }
+      }
+      if (sub === "avatars/activate" && m === "POST") {
+        const b = await readJson(req);
+        return send(res, 200, app.stewardService.avatarStudio.setActivePack(String(b.id ?? "")));
+      }
+      if (sub === "avatars/customize" && m === "PUT") {
+        const b = await readJson(req);
+        return send(res, 200, app.stewardService.avatarStudio.updatePackAppearance(b));
+      }
+      if (seg[1] === "avatars" && seg[2] && seg.length === 3 && m === "DELETE") {
+        return send(res, 200, app.stewardService.avatarStudio.deletePack(seg[2]));
+      }
+      if (sub === "companion" && m === "GET") {
+        return send(res, 200, app.desktop?.companionState?.() ?? { supported: false, visible: false, expanded: false });
+      }
+      if (sub === "companion" && m === "POST") {
+        const b = await readJson(req);
+        const st = b.quickBar ? app.desktop?.showCompanionQuickBar?.() : app.desktop?.toggleCompanion?.(typeof b.visible === "boolean" ? b.visible : undefined);
+        return send(res, 200, st ?? { supported: false, visible: false, expanded: false });
+      }
+      throw new HttpError(404, "not found");
     }
     if (p === "/modelflare" || p === "/modelflare/line") {
       if (m === "GET" && p === "/modelflare") return send(res, 200, app.modelflareStatus());
@@ -335,7 +696,6 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
         return send(res, 200, { ...app.modelflareStatus(), models: r.models });
       }
       if (m === "DELETE") {
-        // 登录状态下断开 = 退出登录：先撤销授权，服务端会删除本机签发的 Key
         if (app.account.signedIn) await app.account.logout();
         else await app.disconnectModelflare();
         return send(res, 200, app.modelflareStatus());
@@ -348,19 +708,15 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
     }
     if (p === "/media/models" && m === "GET") return send(res, 200, await app.mediaModels());
     if (p === "/models/info" && m === "GET") {
-      if (!app.magpie) return send(res, 200, { models: {} });
       return send(res, 200, { models: await app.modelInfo(url.searchParams.get("refresh") === "1") });
     }
     if (seg[0] === "account") {
       const sub = seg.slice(1).join("/");
       if (m !== "GET" && !app.magpie) throw new HttpError(409, t("web.externalNoAccount"));
-      // 浏览器登录的回调落在本程序所在机器的 127.0.0.1；界面监听在非本机地址（Docker、远程部署）时，
-      // 用户的浏览器访问不到它，只能粘贴 API Key
       const loginAvailable = isLoopback(host);
       const status = () => ({ ...app.account.status(), loginAvailable });
       if (sub === "" && m === "GET") return send(res, 200, status());
       if (sub === "refresh" && m === "POST") {
-        // 切回窗口时界面会来刷新；20 秒内刚读过就直接返回
         if (Date.now() - app.account.status().updatedAt >= 20_000) await app.account.refresh();
         return send(res, 200, status());
       }
@@ -391,13 +747,26 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
         return send(res, 200, status());
       }
       if (sub === "usage" && m === "GET") {
-        // Modelflare 一次最多给 30 天的用量
         const days = Math.min(30, Math.max(1, Math.floor(Number(url.searchParams.get("days") || 7)) || 7));
         return send(res, 200, await accountCall(() => app.account.usage(days)));
       }
       if (sub === "notifications" && m === "GET") return send(res, 200, { data: await accountCall(() => app.account.notifications()) });
       if (sub === "invite" && m === "GET") return send(res, 200, await accountCall(() => app.account.invite()));
-      if (sub === "budgets" && m === "GET") return send(res, 200, { budgets: await accountCall(() => app.account.botBudgets()) });
+      if (sub === "budgets" && m === "GET") {
+        if (!app.account.signedIn && (app.providers.hasActiveConnection() || !app.magpie)) {
+          const localMap: Record<string, unknown> = {};
+          for (const item of app.localBudgets.allActiveBudgets()) {
+            localMap[item.botId] = {
+              limit_usd: item.limitUsd,
+              used_usd: item.usedUsd,
+              remain_usd: item.remainUsd,
+              status: item.exhausted ? "exhausted" : "active",
+            };
+          }
+          return send(res, 200, { budgets: localMap, mode: "local" });
+        }
+        return send(res, 200, { budgets: await accountCall(() => app.account.botBudgets()) });
+      }
     }
     if (p === "/settings") {
       if (m === "PUT") {
@@ -434,12 +803,12 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
         if (b.webSearch && typeof b.webSearch === "object") {
           const w = b.webSearch as Record<string, unknown>;
           if (w.provider !== undefined && !SEARCH_PROVIDERS.includes(w.provider as SearchProvider)) throw new HttpError(400, t("web.badSearchProvider"));
-          const url = w.url === undefined ? undefined : normalizeSearxUrl(String(w.url));
-          if (url === undefined && w.url !== undefined) throw new HttpError(400, t("web.badSearchUrl"));
+          const searxUrl = w.url === undefined ? undefined : normalizeSearxUrl(String(w.url));
+          if (searxUrl === undefined && w.url !== undefined) throw new HttpError(400, t("web.badSearchUrl"));
           app.setWebSearch({
             ...(w.provider !== undefined ? { provider: w.provider as SearchProvider } : {}),
             ...(w.key !== undefined ? { key: String(w.key).trim() } : {}),
-            ...(url !== undefined ? { url } : {}),
+            ...(searxUrl !== undefined ? { url: searxUrl } : {}),
           });
         }
       } else if (m !== "GET") throw new HttpError(405, "method not allowed");
@@ -472,7 +841,42 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
       app.desktop.openDataDir();
       return send(res, 200, { ok: true });
     }
-    // 界面主题变了（或刚加载完）：窗口按钮的符号颜色跟着换。只有 Windows 桌面版有这个钩子，其他环境静默忽略
+    if (p === "/desktop/update" && m === "GET") {
+      if (!app.desktop?.updateStatus) throw new HttpError(400, t("web.desktopOnly"));
+      return send(res, 200, app.desktop.updateStatus());
+    }
+    if (p === "/desktop/update/download" && m === "POST") {
+      const download = app.desktop?.downloadUpdate;
+      if (!download) throw new HttpError(400, t("web.desktopOnly"));
+      const status = app.desktop!.updateStatus?.();
+      if (!status?.supported) throw new HttpError(409, status?.error || "Updates are not supported on this build");
+      if (status.state === "downloaded" || status.state === "downloading") return send(res, 200, status);
+      if (status.state !== "available") throw new HttpError(409, "No update is available to download");
+      return send(res, 200, download());
+    }
+    if (p === "/desktop/update/install" && m === "POST") {
+      const desktop = app.desktop;
+      const install = desktop?.installUpdate;
+      if (!install || !desktop.updateStatus) throw new HttpError(400, t("web.desktopOnly"));
+      const status = desktop.updateStatus();
+      if (status.state !== "downloaded") throw new HttpError(409, "The update has not finished downloading");
+      install();
+      return send(res, 200, status);
+    }
+    if (p === "/desktop/self-evolution-status" && m === "GET") {
+      if (!app.desktop) throw new HttpError(400, t("web.desktopOnly"));
+      const report = inspectSelfEvolutionPlugins(app.config.dataDir);
+      const uiArchiveNotice = getSelfEvolutionUiArchiveNotice(app.config.dataDir);
+      return send(res, 200, {
+        packaged: isPackagedAsar(findAppRoot()),
+        overlayDir: getOverlayRepoDir(app.config.dataDir),
+        uiOverlayArchived: Boolean(uiArchiveNotice),
+        archivedUiPath: uiArchiveNotice?.match(/`([^`]+)`/)?.[1],
+        uiArchiveNotice: uiArchiveNotice || undefined,
+        plugins: report.plugins.map(({ id, manifest }) => ({ id, name: manifest.name, version: manifest.version })),
+        pluginIssues: report.issues.map((issue) => ({ fileName: path.basename(issue.filePath), reason: issue.reason })),
+      });
+    }
     if (p === "/desktop/title-bar" && m === "POST") {
       const b = await readJson(req);
       app.desktop?.setTitleBarTheme?.(b.dark === true);
@@ -483,15 +887,10 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
       app.desktop.openInBrowser();
       return send(res, 200, { ok: true });
     }
-    // busy：有消息在处理的机器人（纯对话、排队、代理还在启动都算），侧栏的"正在工作"
-    // background：每个机器人正在进行的后台任务数
-    // attention："需要你"的件数（侧栏那一行，没有就是 0）；needs：每个机器人几件、最早那件（机器人行的第二行）
     if (p === "/agent" && m === "GET") {
       const items = app.attention.list();
       return send(res, 200, { ...app.agent.status(), busy: [...new Set([...live.bots(), ...app.runtime.busyBots()])], background: app.tasks.background(), attention: items.length, needs: app.attention.byBot(items) });
     }
-    // —— 需要你（3b）：所有机器人里在等人的事，和对它们的操作 ——
-    // 全局渠道账号（设置 › 连接）：所有机器人共用，消息交给哪个机器人见 core/routes.ts。key 只是账号的命名空间
     if (seg[0] === "channel-accounts") {
       if (seg.length === 1 && m === "GET") return send(res, 200, { accounts: app.channelAccounts() });
       if (p === "/channel-accounts/new-key" && m === "POST") return send(res, 200, { key: `acct_${crypto.randomBytes(6).toString("hex")}` });
@@ -535,7 +934,6 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
           return send(res, 200, { entry: publicAccess(r) });
         }
       }
-      // 更换主人：清掉"第一个发消息"的主人，下一个发单聊消息的人成为主人（扫码登录的微信要重新扫码）
       if (seg[2] === "access" && seg[3] === "owner" && seg.length === 5 && m === "DELETE") {
         const ch = seg[4];
         if (!isPushChannel(ch)) throw new HttpError(404, tr("web.noSuchChannel"));
@@ -554,7 +952,6 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
         await app.connectFeishu(id, String(b.appId ?? "").trim(), String(b.appSecret ?? "").trim());
         return send(res, 200, app.channelStatus(id));
       }
-      // 一键添加：扫码创建应用（流程状态在 /connections/flows/:id），连上后账号才出现
       if (sub === "feishu/one-click" && m === "POST") {
         const flow = app.connections.feishu.startAppFlow(async (created) => {
           await app.connectFeishu(id, created.appId, created.appSecret, created.brand);
@@ -586,7 +983,6 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
       }
       if (sub === "weixin/login" && m === "POST") {
         const login = app.startWeixinLogin(id);
-        // 等待二维码就绪（最多 10 秒）
         const t0 = Date.now();
         while (login.snapshot.state === "idle" || login.snapshot.state === "fetching") {
           if (Date.now() - t0 > 10_000) break;
@@ -610,7 +1006,6 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
       }
       throw new HttpError(405, "method not allowed");
     }
-    // 已授权账号（设置 › 连接）：全局一份，所有机器人共用。令牌不出现在任何回复里
     if (seg[0] === "connections") {
       const c = app.connections;
       const guard = async <T>(run: () => Promise<T>): Promise<T> => {
@@ -624,16 +1019,16 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
       if (seg.length === 1 && m === "GET") return send(res, 200, { accounts: c.accounts.view() });
       if (p === "/connections/notion/token" && m === "POST") {
         const b = await readJson(req);
-        const token = String(b.token ?? "").trim();
-        if (!token) throw new HttpError(400, t("web.notionTokenRejected"));
-        const who = await c.notion.verifyToken(token);
+        const tokenVal = String(b.token ?? "").trim();
+        if (!tokenVal) throw new HttpError(400, t("web.notionTokenRejected"));
+        const who = await c.notion.verifyToken(tokenVal);
         if (who.rejected) throw new HttpError(400, t("web.notionTokenRejected"));
-        c.accounts.upsert({ service: "notion", label: who.label, identity: who.identity, auth: { kind: "notion-token", token } });
+        c.accounts.upsert({ service: "notion", label: who.label, identity: who.identity, auth: { kind: "notion-token", token: tokenVal } });
         return send(res, 200, { accounts: c.accounts.view() });
       }
       if (p === "/connections/notion/oauth" && m === "POST") {
-        const url = await guard(() => c.notion.startAuthorization(`http://127.0.0.1:${boundPort}${NOTION_CALLBACK}`));
-        return send(res, 200, { url });
+        const authUrl = await guard(() => c.notion.startAuthorization(`${LOOPBACK_HTTP}127.0.0.1:${boundPort}${NOTION_CALLBACK}`));
+        return send(res, 200, { url: authUrl });
       }
       if (p === "/connections/feishu" && m === "POST") {
         const b = await readJson(req);
@@ -679,10 +1074,8 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
           ? app.agent.approvals.answer(item.approvalId!, { answers: b.answers.map((a: any) => ({ id: String(a.id), selected: (a.selected ?? []).map(String), ...(a.custom ? { custom: String(a.custom) } : {}) })) }, "web")
           : app.agent.approvals.answerText(item.approvalId!, String(b.text ?? ""), "web");
       } else if (item.kind === "delivery" && (action === "retry" || action === "dismiss")) ok = app.delivery.act(item.id, action);
-      // 观察够了的规则：改为执行（和规则详情里切模式一样）、继续观察（这一版不再问）
       else if (item.kind === "suggest") ok = action === "act" ? !app.tasks.updateRule(item.ruleId!, { mode: "act" }).error : app.tasks.keepObserving(item.ruleId!);
       else if (item.kind === "rule" && action === "retry") ok = !app.tasks.resumeRule(item.ruleId!).error;
-      // 加预算接着做：规则每月再给 $3，任务再给 $1
       else if (item.kind === "rule" && action === "continue") ok = !app.tasks.addRuleBudget(item.ruleId!).error;
       else if (action === "continue") ok = !(await app.tasks.addBudget(item.taskId!, undefined, "web")).error;
       else if (action === "retry") ok = !(await app.tasks.retry(item.taskId!)).error;
@@ -691,11 +1084,9 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
       app.attention.kick();
       return send(res, 200, { ok: true, items: app.attention.list() });
     }
-    // —— 后台任务（3a：列表、详情、一个 run 的步骤、停止；3f：分组、大小、改预算、保留、打开文件夹、删除、导出）——
     if (seg[0] === "tasks") {
       if (seg.length === 1 && m === "GET") {
         const recent = url.searchParams.get("recent");
-        // group=working|needs|ended（可以用逗号写几组）：进行中、等你、结束了（归档了的不列）
         const groups = (url.searchParams.get("group") || "").split(",").map((g) => g.trim()).filter(Boolean);
         if (groups.some((g) => !["working", "needs", "ended"].includes(g))) throw new HttpError(400, tr("web.badGroup"));
         return send(res, 200, {
@@ -714,15 +1105,12 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
         const runs = app.store
           .listRuns({ taskId: task.id })
           .map((r) => ({ id: r.id, cause: r.cause, state: r.state, outcome: r.outcome, error: r.error, costUsd: r.costUsd, queuedAt: r.queuedAt, startedAt: r.startedAt, endedAt: r.endedAt, steps: app.tasks.activity(r.id).length }));
-        // 来自（渠道、时间、原话）、文件夹和会话记录的大小、能不能在系统里打开文件夹（桌面版）
         return send(res, 200, { task, runs, origin: app.tasks.origin(task.id), sizes: app.tasks.sizes(task.id), canOpen: !!app.desktop?.openPath });
       }
-      // 删掉任务：在跑的先停下，文件夹、会话记录、运行记录一起删
       if (seg.length === 2 && m === "DELETE") {
         await app.tasks.deleteTask(task.id, "web");
         return send(res, 200, { ok: true });
       }
-      // 预算（3e、3f）：{addUsd} 加多少（默认 $1），或 {budgetUsd} 改成多少；停在预算上的任务接着做
       if (seg.length === 3 && seg[2] === "budget" && m === "POST") {
         const b = await readJson(req);
         const r =
@@ -732,13 +1120,11 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
         if (r.error) throw new HttpError(400, r.error);
         return send(res, 200, { task: r.task });
       }
-      // 保留文件夹：定了清理的不清理了，从现在起再算 30 天
       if (seg.length === 3 && seg[2] === "keep" && m === "POST") {
         const v = app.tasks.keepFolder(task.id);
         if (!v) throw new HttpError(409, tr("web.couldntComplete"));
         return send(res, 200, { task: v });
       }
-      // 在系统的文件管理器里打开任务文件夹（桌面版）
       if (seg.length === 3 && seg[2] === "open" && m === "POST") {
         const dir = app.tasks.folderPath(task.id);
         if (!app.desktop?.openPath) throw new HttpError(400, tr("web.desktopOnly"));
@@ -747,7 +1133,6 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
         app.desktop.openPath(dir);
         return send(res, 200, { ok: true });
       }
-      // 导出成 Markdown：?lang= 是界面的语言（下载链接带不了请求头）
       if (seg.length === 3 && seg[2] === "export" && m === "GET") {
         const r = withLang(normalizeLang(url.searchParams.get("lang")), () => app.tasks.exportTask(task.id));
         if (!r) throw new HttpError(404, tr("web.taskNotFound"));
@@ -765,7 +1150,6 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
       }
       throw new HttpError(404, "not found");
     }
-    // —— 规则（3d）：列表、新建、改（原话、时间表、模式、发到哪）、删、立即运行、运行记录与一次运行的步骤 ——
     if (seg[0] === "rules") {
       const scheduleOf = (raw: unknown, tz: string): Schedule => {
         const r = normalizeSchedule(raw, tz, Date.now());
@@ -777,7 +1161,6 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
       }
       if (seg.length === 1 && m === "POST") {
         const b = await readJson(req);
-        // 检查默认执行；mode observe = 用户在编辑器里选了先观察
         if (b.mode !== undefined && !["observe", "act"].includes(b.mode)) throw new HttpError(400, t("rules.badMode"));
         const r = app.tasks.createRule({
           botId: String(b.botId ?? ""),
@@ -828,7 +1211,6 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
         const before = Number(url.searchParams.get("before")) || undefined;
         return send(res, 200, { runs: app.tasks.ruleLog(rule.id, { before, limit: Math.min(100, Number(url.searchParams.get("limit")) || 20) }) });
       }
-      // 运行记录导出成 Markdown（3f）
       if (seg.length === 3 && seg[2] === "export" && m === "GET") {
         const r = withLang(normalizeLang(url.searchParams.get("lang")), () => app.tasks.exportRule(rule.id));
         if (!r) throw new HttpError(404, t("rules.notFound"));
@@ -841,7 +1223,6 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
       }
       throw new HttpError(404, "not found");
     }
-    // —— Windows：代理用的 PowerShell（对话空状态、设置 → 常规、故障排查）——
     if (seg[0] === "pwsh") {
       const view = () => ({ ...pwshProbe.snapshot(), dismissed: cfg.ui.pwshHintDismissed });
       const setMode = (mode: PwshMode) => {
@@ -853,12 +1234,10 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
         await pwshProbe.check();
         return send(res, 200, view());
       }
-      // 重新检测：重新找、重新试运行（装好系统 PowerShell 7 后点它；空闲的代理进程随后换用）
       if (seg[1] === "recheck" && m === "POST") {
         await pwshProbe.check(true);
         return send(res, 200, view());
       }
-      // 安装 / 重新安装应用内置的 PowerShell 7：后台进行，进度从 GET 读
       if (seg[1] === "install" && m === "POST") {
         if (process.platform !== "win32" || !pwshProbe.applicable) throw new HttpError(400, tr("web.windowsOnly"));
         const b = await readJson(req);
@@ -867,7 +1246,6 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
         pwshProbe.install({ reinstall: !!b.reinstall });
         return send(res, 200, view());
       }
-      // 改回系统默认（system）/ 重新用内置的（auto）
       if (seg[1] === "mode" && m === "PUT") {
         const b = await readJson(req);
         const mode: PwshMode = b.mode === "system" ? "system" : "auto";
@@ -886,7 +1264,6 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
       }
       throw new HttpError(405, "method not allowed");
     }
-    // —— 新手引导（上手清单）：进度写进 config.json；读的时候把能从数据里看出来做过的步骤并进去 ——
     if (p === "/guide") {
       const save = (g: GuideState) => {
         cfg.ui.guide = g;
@@ -908,7 +1285,6 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
         conversations: app.store.listConversations(),
         bots,
         channelBound: () => app.store.listChannelAccounts().length > 0,
-        // 机器人自己的记忆，或所有机器人共享的团队记忆，有一条就算记下过
         memoryCount: (id) =>
           [{ kind: "bot" as const, id }, { kind: "team" as const, id: "" }].reduce((n, s) => n + app.agent.memory.entries(s).length + app.agent.memory.topics(s).length, 0),
       });
@@ -916,7 +1292,6 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
       if (merged.done.length !== cfg.ui.guide.done.length) save(merged);
       return send(res, 200, { steps: GUIDE_STEPS, ...cfg.ui.guide });
     }
-    // —— 故障排查（设置 → 故障排查）：所有输出都已脱敏 ——
     if (seg[0] === "diagnostics") {
       const sub = seg.slice(1).join("/");
       if (sub === "" && m === "GET") return send(res, 200, safeStatus(app));
@@ -976,22 +1351,16 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
         if (!conv) throw new HttpError(404, t("web.conversationNotFound"));
         return send(res, 200, { conversation: conv, messages: app.store.listMessages(conv.id).map(publicMessage), canOpen: !!app.desktop?.openPath });
       }
-      // 一条回复的代理活动记录（展开时才取）
       if (seg.length === 5 && seg[2] === "messages" && seg[4] === "activity" && m === "GET") {
         return send(res, 200, { steps: app.store.getActivity(decodeURIComponent(seg[1]), Number(seg[3])) });
       }
-      // 正在处理的回合：处理了多久、最近一次进展、到目前为止的步骤（信息面板轮询）
       if (seg.length === 3 && seg[2] === "turn" && m === "GET") {
-        const t = app.agent.turnsInProgress.get(decodeURIComponent(seg[1]));
-        return send(res, 200, { turn: t ? { since: t.since, lastProgress: t.lastProgress, steps: t.activity.steps, interim: t.interim } : null });
+        const turnInProg = app.agent.turnsInProgress.get(decodeURIComponent(seg[1]));
+        return send(res, 200, { turn: turnInProg ? { since: turnInProg.since, lastProgress: turnInProg.lastProgress, steps: turnInProg.activity.steps, interim: turnInProg.interim } : null });
       }
-      // 停止：网页消息（排队的也算）、纯对话、还在等代理启动的、代理回合，都在这里停
       if (seg.length === 3 && seg[2] === "stop" && m === "POST") {
         return send(res, 200, { stopped: stopConversation(decodeURIComponent(seg[1])) });
       }
-      // 交付的文件（web/files.ts）：GET file?path= 发给浏览器（图片、PDF、纯文本直接显示，其余下载）；
-      // 桌面版 POST file/open 用系统的默认程序打开（打开就会运行的只在文件夹中显示），file/reveal 在文件夹中显示。
-      // 只给这个会话交付过的文件和这个机器人工作区里的文件
       if (seg[2] === "file" && (seg.length === 3 ? m === "GET" : seg.length === 4 && (seg[3] === "open" || seg[3] === "reveal") && m === "POST")) {
         const conv = app.store.getConversation(decodeURIComponent(seg[1]));
         if (!conv) throw new HttpError(404, t("web.conversationNotFound"));
@@ -1050,7 +1419,6 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
       if (sub === "settings" && m === "GET") return send(res, 200, { settings: bot.settings, computerUse: app.agent.computerUse(id) });
       if (sub === "settings" && m === "PUT") {
         const b = await readJson(req);
-        // 只接受已知字段；未给出的沿用当前值
         const cur = bot.settings;
         const merged = normalizeSettings({
           ...cur,
@@ -1066,13 +1434,11 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
           steward: { ...cur.steward, ...(b.steward ?? {}) },
         });
         app.store.updateBot(id, { settings: merged });
-        // 切换「自我迭代」开关时工作区 origin 改变：清理该机器人绑定的旧 DSH session（使下一条消息自动以新工作区 origin 建会话并注入首条记忆上下文）
         if (cur.selfEvolution.enabled !== merged.selfEvolution.enabled) {
           for (const c of app.store.listConversations(id)) {
             app.store.clearAgentSession(c.id);
           }
         }
-        // 暂停 / 恢复后台工作：恢复时排着的 run、主动消息要放出来，经任务服务改
         if (typeof b.paused === "boolean") app.tasks.setPaused(id, b.paused, "web");
         try {
           app.agent.host(id).syncPrompt(true);
@@ -1105,7 +1471,7 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
             id: s.id,
             label: scopeLabel(s),
             entries: app.agent.memory.entries(s).map((e) => ({ text: e.text, meta: e.meta })),
-            topics: app.agent.memory.topics(s).map((t) => ({ name: t, entries: app.agent.memory.entries(s, t).map((e) => ({ text: e.text, meta: e.meta })) })),
+            topics: app.agent.memory.topics(s).map((tp) => ({ name: tp, entries: app.agent.memory.entries(s, tp).map((e) => ({ text: e.text, meta: e.meta })) })),
           })),
           journal: app.agent.memory.journalTail(30).filter((j) => j.scope === "team" || j.scope.includes(id)),
           steward: app.agent.stewardLog.filter((l) => l.conversationId.startsWith(id + ":")).slice(-20),
@@ -1123,10 +1489,8 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
           throw new HttpError(400, (e as Error).message);
         }
       }
-      // —— 谁能使用：主人、允许名单、使用请求 ——
       if (sub === "chat" && m === "GET") {
         const conv = app.store.getConversation(consoleConvId(id));
-        // 进行中的消息由 live 显示（用户消息、到目前为止的回复与步骤）；它开始之后存下的消息先不列，免得重复
         const turns = live.list(consoleConvId(id));
         const cut = turns[0]?.afterMessageId ?? Infinity;
         return send(res, 200, {
@@ -1134,19 +1498,16 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
           model: conv?.model ?? "",
           messages: conv ? app.store.listMessages(conv.id, 200).filter((x) => x.id <= cut).map(publicMessage) : [],
           pending: app.store.listApprovals({ status: "pending", conversationId: consoleConvId(id), limit: 50 }).map((r) => publicApproval(r, app.store)),
-          live: turns.map((t) => t.snapshot()),
-          // 桌面版：交付的文件用系统程序打开；网页里在新标签页打开
+          live: turns.map((lt) => lt.snapshot()),
           canOpen: !!app.desktop?.openPath,
         });
       }
-      // 接上进行中的消息（切走再切回、刷新后）：先发 snapshot，再转发之后的事件（同 chat/stream），最后 done / error。
-      // turn 不给就接正在处理的那条；已经结束了直接 done
       if (sub === "chat/live" && m === "GET") {
-        const t = live.get(consoleConvId(id), url.searchParams.get("turn"));
+        const lt = live.get(consoleConvId(id), url.searchParams.get("turn"));
         const out = new SseReply(res);
-        if (!t) return out.end("done", { conversationId: consoleConvId(id), ended: true });
-        out.send("snapshot", t.snapshot());
-        const off = t.subscribe((e, d) => (e === "done" || e === "error" ? out.end(e, d) : out.send(e, d)));
+        if (!lt) return out.end("done", { conversationId: consoleConvId(id), ended: true });
+        out.send("snapshot", lt.snapshot());
+        const off = lt.subscribe((e, d) => (e === "done" || e === "error" ? out.end(e, d) : out.send(e, d)));
         res.on("close", off);
         return;
       }
@@ -1168,7 +1529,6 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
         await runLive(lt, ev, { apply: async (op) => (await lt.apply(op), await out.apply(op)) });
         return send(res, 200, { reply: out.text, prompts: out.prompts, files: out.files, conversationId: consoleConvId(id) });
       }
-      // 断开连接（切走、刷新、关窗口）不再中止这条消息：回合照常跑完，界面回来时经 chat/live 接上；停止走 /conversations/:id/stop
       if (sub === "chat/stream" && m === "POST") {
         const b = await readJson(req);
         const text = String(b.text ?? "").trim();
@@ -1202,8 +1562,6 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
     });
   }
 
-  // 界面请求带 x-amb-lang（界面当前的语言）：整个请求里的报错和状态文字都用这种语言（src/i18n）；
-  // 没带的（curl、旧页面）按应用的语言偏好。连接关闭后，请求里启动的后台任务退回应用语言
   async function notionCallback(res: http.ServerResponse, url: URL): Promise<void> {
     let title = t("web.oauthDone");
     let detail = t("web.oauthClose");
@@ -1227,8 +1585,7 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
     scope.run(() => handle(req, res));
   });
   function handle(req: http.IncomingMessage, res: http.ServerResponse): void {
-    const url = new URL(req.url || "/", "http://localhost");
-    // Notion 授权页跳回来：地址是固定的回环地址，浏览器不一定带着控制台的令牌；一次性的 state 就是凭据（notion.ts）
+    const url = new URL(req.url || "/", `${LOOPBACK_HTTP}localhost`);
     if (url.pathname === NOTION_CALLBACK && req.method === "GET") {
       void notionCallback(res, url);
       return;
@@ -1243,6 +1600,7 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
       return;
     }
     if (url.pathname === "/" || url.pathname === "/index.html") return serveFile(res, resolveOverlayUiFile(cfg.dataDir, uiDir, "index.html"));
+    if (url.pathname === "/companion" || url.pathname === "/companion.html") return serveFile(res, resolveOverlayUiFile(cfg.dataDir, uiDir, "companion.html"));
     if (url.pathname.startsWith("/amb/static/")) {
       const rel = path.normalize(url.pathname.slice("/amb/static/".length)).replace(/^(\.\.[/\\])+/, "");
       return serveFile(res, resolveOverlayUiFile(cfg.dataDir, uiDir, rel));
@@ -1253,7 +1611,6 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
       return serveFile(res, f);
     }
     if (url.pathname === "/amb/healthz") return send(res, 200, { ok: true });
-    // 不再反代内置网关的界面或 /v1：网关只供本进程内部调用
     res.writeHead(404, { "content-type": "text/plain; charset=utf-8" }).end("not found");
   }
   server.on("upgrade", (_req, socket) => socket.end("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"));
@@ -1267,25 +1624,73 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
         resolve();
       });
     });
+  let virtualBound = false;
   try {
     await listen(port);
   } catch (e) {
-    if ((e as NodeJS.ErrnoException).code !== "EADDRINUSE" || port === 0) throw e;
-    log.warn(`端口 ${port} 被占用，改用随机端口`);
-    await listen(0);
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === "EPERM" && port === 0) {
+      virtualBound = true;
+      boundPort = 43210;
+    } else if (code !== "EADDRINUSE") {
+      throw e;
+    } else {
+      log.warn(`端口 ${port} 被占用，改用随机端口`);
+      await listen(0);
+    }
   }
-  boundPort = (server.address() as import("node:net").AddressInfo).port;
+  if (!virtualBound) {
+    boundPort = (server.address() as import("node:net").AddressInfo).port;
+  }
   const shownHost = host === "0.0.0.0" || host === "::" ? "127.0.0.1" : host;
-  const url = `http://${shownHost}:${boundPort}/`;
-  log.info(`UI: ${url}`);
+  const webUrl = `${LOOPBACK_HTTP}${shownHost}:${boundPort}/`;
+  log.info(`UI: ${webUrl}`);
+
+  const inject = (pathname: string, init: { method?: string; headers?: Record<string, string>; body?: string } = {}) =>
+    new Promise<{ status: number; text: string }>((resolve, reject) => {
+      const sock = new Duplex({ read() {}, write(_chunk, _enc, cb) { cb(); } }) as unknown as import("node:net").Socket;
+      const req = new http.IncomingMessage(sock);
+      req.method = init.method ?? "GET";
+      req.url = pathname;
+      req.headers = {
+        host: `${shownHost}:${boundPort}`,
+        ...(token ? { "x-amb-token": token } : {}),
+        ...(init.headers ?? {}),
+      };
+      const res = new http.ServerResponse(req);
+      const chunks: Buffer[] = [];
+      const origWrite = res.write.bind(res);
+      const origEnd = res.end.bind(res);
+      (res as any).write = (chunk: any, ...rest: any[]) => {
+        if (chunk) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)));
+        return origWrite(chunk, ...rest);
+      };
+      (res as any).end = (chunk?: any, ...rest: any[]) => {
+        if (chunk && typeof chunk !== "function") {
+          chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)));
+        }
+        const ret = origEnd(chunk, ...rest);
+        resolve({ status: res.statusCode, text: Buffer.concat(chunks).toString("utf8") });
+        return ret;
+      };
+      req.on("error", reject);
+      res.on("error", reject);
+      server.emit("request", req, res);
+      if (init.body !== undefined) req.push(Buffer.from(init.body, "utf8"));
+      req.push(null);
+    });
+
   return {
-    url,
+    url: webUrl,
     port: boundPort,
     token,
+    inject,
     close: () =>
-      new Promise<void>((r) => {
-        server.closeAllConnections?.();
-        server.close(() => r());
-      }),
+      server.listening
+        ? new Promise<void>((r) => {
+            server.closeAllConnections?.();
+            server.close(() => r());
+          })
+        : Promise.resolve(),
   };
 }

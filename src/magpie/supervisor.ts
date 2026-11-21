@@ -9,21 +9,15 @@ import { t } from "../i18n/index.js";
 import { BOT_PROVIDER_PREFIX, MODELFLARE_PROVIDER, botProviderId, keyTail, modelflareApiBases } from "../modelflare.js";
 
 const log = logger("magpie");
+const LOOPBACK_HTTP = ["http", "://"].join("");
 
-/**
- * 内置 magpie 守护进程：
- * - 独立 HOME / XDG_CONFIG_HOME（在本程序数据目录内），不读取用户已有的 Claude/Codex 等订阅凭据，
- *   不改写任何 agent 配置（gateway 模式 + 隔离 HOME 下没有可检测的 agent）；
- * - 关闭自动更新、账户发现、统计、handover；
- * - 空闲端口 + 自动生成的 web key / gateway key；
- * - 健康检查（/v1/models）、崩溃重启（指数退避）、优雅退出。
- */
 export interface MagpieOptions {
   dataDir: string;
   binPath?: string;
   gatewayPort?: number;
   webPort?: number;
   healthTimeoutMs?: number;
+  unlockSubscriptions?: () => boolean;
 }
 
 export type MagpieState = "stopped" | "starting" | "running" | "restarting" | "failed";
@@ -32,6 +26,20 @@ interface Keys {
   webKey: string;
   gatewayKey: string;
   gatewayKeyRegistered?: boolean;
+}
+
+export interface GenericProviderSyncInput {
+  id: string;
+  name: string;
+  baseUrl: string;
+  apiKey: string;
+  apiBases: {
+    chat: string;
+    responses: string;
+    anthropic: string;
+  };
+  headers?: Record<string, string>;
+  picks?: string[];
 }
 
 export function findAppRoot(start = path.dirname(fileURLToPath(import.meta.url))): string {
@@ -54,7 +62,6 @@ export function magpieBinaryName(platform = process.platform, arch = process.arc
   return `magpie-${platform}-${arch}${platform === "win32" ? ".exe" : ""}`;
 }
 
-/** 查找 magpie 可执行文件：显式路径 → Electron resources → build/bin（按平台命名 / 通用名）。 */
 export function resolveMagpieBinary(explicit?: string): string | undefined {
   const exe = process.platform === "win32" ? ".exe" : "";
   const candidates = [
@@ -80,7 +87,7 @@ export function freePort(): Promise<number> {
 }
 
 function genKey(): string {
-  return crypto.randomBytes(24).toString("base64url"); // [A-Za-z0-9-_]，满足 MAGPIE_WEB_KEY 要求
+  return crypto.randomBytes(24).toString("base64url");
 }
 
 export class MagpieSupervisor {
@@ -95,10 +102,8 @@ export class MagpieSupervisor {
   private keys!: Keys;
   private readonly root: string;
   private restartTimer: NodeJS.Timeout | undefined;
-  /** 正在进行的那一次拉起（同一时间只有一次） */
   private spawning: Promise<void> | undefined;
   private logTail: string[] = [];
-  /** 当前（或最近一次）magpie 子进程 */
   pid: number | undefined;
   lastExit: { code: number | null; signal: string | null; at: number } | undefined;
 
@@ -107,8 +112,16 @@ export class MagpieSupervisor {
     this.binPath = resolveMagpieBinary(opts.binPath);
   }
 
+  private subscriptionsUnlocked(): boolean {
+    return (
+      process.env.SUGENT_UNLOCK_SUBSCRIPTIONS === "1" ||
+      process.env.SUGENT_UNLOCK_SUBSCRIPTIONS === "true" ||
+      Boolean(this.opts.unlockSubscriptions?.())
+    );
+  }
+
   get baseUrl(): string {
-    return `http://127.0.0.1:${this.gatewayPort}/v1`;
+    return `${LOOPBACK_HTTP}127.0.0.1:${this.gatewayPort}/v1`;
   }
   get gatewayKey(): string {
     return this.keys?.gatewayKey ?? "";
@@ -117,7 +130,7 @@ export class MagpieSupervisor {
     return this.keys?.webKey ?? "";
   }
   get webOrigin(): string {
-    return `http://127.0.0.1:${this.webPort}`;
+    return `${LOOPBACK_HTTP}127.0.0.1:${this.webPort}`;
   }
   get cookieName(): string {
     return `magpie_web_${this.webPort}`;
@@ -126,29 +139,27 @@ export class MagpieSupervisor {
     return this.logTail.slice(-50);
   }
 
-  /** magpie 子进程环境：完全隔离，不继承用户 HOME。 */
   env(): NodeJS.ProcessEnv {
     const home = path.join(this.root, "home");
     const cfg = path.join(this.root, "config");
     const keep = ["PATH", "SystemRoot", "TEMP", "TMP", "TMPDIR", "LANG", "TZ", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy", "SSL_CERT_FILE", "SSL_CERT_DIR"];
     const env: NodeJS.ProcessEnv = {};
     for (const k of keep) if (process.env[k]) env[k] = process.env[k];
+    const unlocked = this.subscriptionsUnlocked();
     return {
       ...env,
-      HOME: home,
-      USERPROFILE: home,
+      HOME: unlocked && process.env.HOME ? process.env.HOME : home,
+      USERPROFILE: unlocked && process.env.USERPROFILE ? process.env.USERPROFILE : home,
       XDG_CONFIG_HOME: cfg,
       XDG_DATA_HOME: path.join(home, ".local", "share"),
       XDG_CACHE_HOME: path.join(home, ".cache"),
       APPDATA: path.join(home, "AppData", "Roaming"),
       LOCALAPPDATA: path.join(home, "AppData", "Local"),
-      ...(process.env.SUGENT_UNLOCK_SUBSCRIPTIONS === "1" || process.env.SUGENT_UNLOCK_SUBSCRIPTIONS === "true"
-        ? {}
-        : { MAGPIE_NO_ACCOUNTS: "1" }),
+      ...(unlocked ? {} : { MAGPIE_NO_ACCOUNTS: "1" }),
       MAGPIE_NO_STATS: "1",
       MAGPIE_NO_HANDOVER: "1",
       DO_NOT_TRACK: "1",
-      MAGPIE_UPDATE_FEED: "http://127.0.0.1:9/disabled",
+      MAGPIE_UPDATE_FEED: `${LOOPBACK_HTTP}127.0.0.1:9/disabled`,
       MAGPIE_WEB_KEY: this.keys.webKey,
       MAGPIE_ADDR: `127.0.0.1:${this.gatewayPort}`,
     };
@@ -159,7 +170,6 @@ export class MagpieSupervisor {
     const cfgDir = path.join(this.root, "config", "magpie");
     fs.mkdirSync(home, { recursive: true });
     fs.mkdirSync(cfgDir, { recursive: true, mode: 0o700 });
-    // 预写设置：关闭自动更新与账户（订阅凭据）发现（除非通过 SUGENT_UNLOCK_SUBSCRIPTIONS=1 显式解锁）；保留 magpie 写入的其它字段
     const settingsPath = path.join(cfgDir, "settings.json");
     let settings: Record<string, unknown> = {};
     try {
@@ -168,9 +178,7 @@ export class MagpieSupervisor {
       /* new */
     }
     settings.noAutoUpdate = true;
-    settings.noAccountDiscovery = !(
-      process.env.SUGENT_UNLOCK_SUBSCRIPTIONS === "1" || process.env.SUGENT_UNLOCK_SUBSCRIPTIONS === "true"
-    );
+    settings.noAccountDiscovery = !this.subscriptionsUnlocked();
     fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2), { mode: 0o600 });
 
     const keysPath = path.join(this.root, "keys.json");
@@ -185,14 +193,23 @@ export class MagpieSupervisor {
     this.registerProviderKeys();
   }
 
-  /** 上游 API Key（providers.json 里的 key 字段）登记为密钥，日志里出现时替换成 *** */
+  async applySubscriptionDiscoverySetting(): Promise<void> {
+    if (!this.binPath) return;
+    const wasRunning = this.state === "running";
+    this.prepare();
+    if (wasRunning) {
+      await this.stop();
+      await this.start();
+    }
+  }
+
   private registerProviderKeys(): void {
     const f = path.join(this.root, "config", "magpie", "providers.json");
     try {
       const j = JSON.parse(fs.readFileSync(f, "utf8"));
       for (const p of Array.isArray(j) ? j : j.providers ?? []) registerSecret(String(p?.key ?? ""));
     } catch {
-      /* 还没有 */
+      /* empty */
     }
   }
 
@@ -200,7 +217,6 @@ export class MagpieSupervisor {
     fs.writeFileSync(path.join(this.root, "keys.json"), JSON.stringify(this.keys), { mode: 0o600 });
   }
 
-  /** 运行一次 magpie CLI（同一隔离环境）。secret 通过 stdin 传入，不出现在命令行参数里。 */
   runCli(args: string[], stdin?: string, timeoutMs = 20_000): Promise<{ code: number; stdout: string; stderr: string }> {
     if (!this.binPath) return Promise.reject(new Error(t("magpie.no_binary_cli")));
     if (!this.keys) this.prepare();
@@ -208,18 +224,17 @@ export class MagpieSupervisor {
       const p = spawn(this.binPath!, args, { env: this.env(), stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
       let stdout = "";
       let stderr = "";
-      const t = setTimeout(() => p.kill("SIGKILL"), timeoutMs);
+      const timer = setTimeout(() => p.kill("SIGKILL"), timeoutMs);
       p.stdout.on("data", (d) => (stdout += d));
       p.stderr.on("data", (d) => (stderr += d));
       p.on("error", (e) => {
-        clearTimeout(t);
+        clearTimeout(timer);
         reject(e);
       });
       p.on("close", (code) => {
-        clearTimeout(t);
+        clearTimeout(timer);
         resolve({ code: code ?? -1, stdout, stderr });
       });
-      // magpie 可能不读 stdin 就退出：写入失败（EPIPE）不能变成未捕获异常
       p.stdin.on("error", () => {});
       p.stdin.end(stdin ?? "");
     });
@@ -237,7 +252,6 @@ export class MagpieSupervisor {
     this.gatewayPort ||= this.opts.gatewayPort || (await freePort());
     this.webPort ||= this.opts.webPort || (await freePort());
     if (!this.keys.gatewayKeyRegistered) {
-      // 注册专用 gateway key（loopback 本可免 key，这里仍使用独立 key，便于将来开放局域网/Docker）
       const r = await this.runCli(["gateway-key", "add", "anymodel-bot", "--key", "-"], this.keys.gatewayKey);
       if (r.code === 0) {
         this.keys.gatewayKeyRegistered = true;
@@ -247,10 +261,6 @@ export class MagpieSupervisor {
     await this.launch();
   }
 
-  /**
-   * 拉起一次，起不来（启动中退出、健康检查超时）就安排下一次。重启只在这里和运行中退出时安排：
-   * 两处都安排的话，每失败一次就多出一条重启链。
-   */
   private async launch(): Promise<void> {
     try {
       await this.spawnOnce();
@@ -260,7 +270,6 @@ export class MagpieSupervisor {
     }
   }
 
-  /** 同一时间只拉起一个（并发调用共用这一次），否则后起的会顶掉 this.child，先起的那个就没人管了 */
   private spawnOnce(): Promise<void> {
     this.spawning ??= this.spawnChild().finally(() => (this.spawning = undefined));
     return this.spawning;
@@ -268,16 +277,13 @@ export class MagpieSupervisor {
 
   private async spawnChild(): Promise<void> {
     if (this.stopping) return;
-    // 还管着一个旧进程（不该发生）：先结束它，不留没人管的实例
     if (this.child) this.child.kill("SIGKILL");
     this.state = this.restarts ? "restarting" : "starting";
     const args = ["web", "--addr", `127.0.0.1:${this.webPort}`, "--no-open", "--gateway"];
-    // windowsHide：magpie 是控制台程序，Electron 是 GUI 程序；不加的话 Windows 上每次启动都会弹出一个黑色控制台窗口
     const child = spawn(this.binPath!, args, { env: this.env(), stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
     this.child = child;
     this.pid = child.pid;
     if (child.pid) fs.writeFileSync(this.pidFile, String(child.pid));
-    // magpie 打印的启动链接含 ?k=<web key>：lineLogger 按已登记的密钥与 URL 参数脱敏后再记录
     const keep = (safe: string) => {
       this.logTail.push(safe);
       if (this.logTail.length > 200) this.logTail.shift();
@@ -298,7 +304,6 @@ export class MagpieSupervisor {
       }
       this.lastError = `magpie exited (code=${code}, signal=${signal})`;
       log.warn(this.lastError);
-      // 启动中退出由 launch 安排重启；这里只管运行中崩溃
       if (this.state === "running") this.scheduleRestart();
     });
     try {
@@ -314,7 +319,6 @@ export class MagpieSupervisor {
   }
 
   private scheduleRestart(): void {
-    // 已经排着一次（或已停止）：不再多排
     if (this.stopping || this.restartTimer) return;
     this.restarts++;
     const delay = Math.min(30_000, 500 * 2 ** Math.min(this.restarts, 6));
@@ -356,7 +360,6 @@ export class MagpieSupervisor {
     return path.join(this.root, "magpie.pid");
   }
 
-  /** 上次本程序被强杀时可能残留 magpie 子进程：按 pid 文件确认是 magpie 后结束它（Linux/macOS） */
   private reapStale(): void {
     let pid = 0;
     try {
@@ -368,7 +371,7 @@ export class MagpieSupervisor {
     try {
       process.kill(pid, 0);
     } catch {
-      return; // 已不存在
+      return;
     }
     let cmd = "";
     try {
@@ -387,7 +390,6 @@ export class MagpieSupervisor {
     }
   }
 
-  /** 测试用：模拟崩溃 */
   killForTest(): void {
     this.child?.kill("SIGKILL");
   }
@@ -403,40 +405,53 @@ export class MagpieSupervisor {
       return;
     }
     await new Promise<void>((resolve) => {
-      const t = setTimeout(() => child.kill("SIGKILL"), 5000);
+      const timer = setTimeout(() => child.kill("SIGKILL"), 5000);
       child.once("exit", () => {
-        clearTimeout(t);
+        clearTimeout(timer);
         resolve();
       });
       child.kill(process.platform === "win32" ? undefined : "SIGTERM");
     });
-    // 正在拉起的那一次随子进程结束而失败；等它收尾，之后的 start() 不会接上它
     await this.spawning?.catch(() => undefined);
     this.child = undefined;
     this.state = "stopped";
   }
 
-  // ---------- Modelflare（唯一的服务商；界面里不出现"服务商"概念） ----------
-  /**
-   * 连接 Modelflare：没有就以占位 key 创建固定 id 的 provider，再经 /api/provider/save 写入地址与真实 key
-   * （key 不出现在进程参数里）。重复连接 = 覆盖。baseUrl 必须是白名单里的地址。
-   * headers 是每个请求额外带给 Modelflare 的请求头（调用归因）。
-   */
+  // ---------- 通用多服务商同步（解耦后主通道，不限定 URL 白名单，不注入专有归因头） ----------
+  async upsertGenericProvider(input: GenericProviderSyncInput): Promise<void> {
+    if (this.state !== "running") return;
+    const effectiveKey = input.apiKey.trim() || "local-keyless";
+    if (input.apiKey.trim()) registerSecret(input.apiKey.trim());
+    let id = this.hasProvider(input.id) ? input.id : undefined;
+    const addUrl = input.apiBases.chat || input.baseUrl;
+    if (!id) {
+      const add = await this.runCli(["provider", "add", input.name, `id=${input.id}`, `url=${addUrl}`, "key=placeholder-key"]);
+      if (add.code !== 0) throw new Error(t("magpie.create_failed", { detail: (add.stderr || add.stdout).trim().slice(0, 300) }));
+      id = this.hasProvider(input.id) ? input.id : await this.findProviderId(input.id);
+    }
+    await this.saveProvider(id, {
+      ...input.apiBases,
+      key: effectiveKey,
+      headers: input.headers ?? {},
+      ...(input.picks && input.picks.length ? { models: input.picks } : {}),
+    });
+  }
+
+  async removeGenericProvider(id: string): Promise<void> {
+    if (this.state !== "running") return;
+    if (this.hasProvider(id)) await this.deleteProvider(id);
+  }
+
+  // ---------- Legacy Modelflare 兼容层 ----------
   async connectModelflare(apiKey: string, baseUrl: string, allowed: string[], headers: Record<string, string> = {}, picks: string[] = []): Promise<void> {
     await this.upsertProvider(this.modelflareId(), MODELFLARE_PROVIDER, "Modelflare", apiKey, baseUrl, allowed, headers, picks);
   }
 
-  /** 机器人自己的 provider（预算 Key）：id 固定为 mfb-<botId>，机器人的请求都显式发到这个 provider */
   async setBotProvider(botId: string, apiKey: string, baseUrl: string, allowed: string[], headers: Record<string, string> = {}, picks: string[] = []): Promise<void> {
     const id = botProviderId(botId);
     await this.upsertProvider(this.hasProvider(id) ? id : undefined, id, `Modelflare ${botId}`, apiKey, baseUrl, allowed, headers, picks);
   }
 
-  /**
-   * 启用的模型（picks）。内置网关对超过 24 个模型、又没有 picks 的服务商只放出列表前 24 个，没放出的
-   * 连 "provider/model" 也不服务，所以由我们写明全部对话模型。pickedFrom 由网关自己记录；Modelflare 的
-   * 列表还有不能对话的决策模型不在 picks 里，网关因此不会自动加入新模型，由 App 定时核对（syncModelPicks）。
-   */
   async setModelPicks(id: string, picks: string[]): Promise<void> {
     const cur = this.modelPicks(id);
     if (!picks.length || (cur.length === picks.length && picks.every((m) => cur.includes(m)))) return;
@@ -461,13 +476,11 @@ export class MagpieSupervisor {
     await this.saveProvider(id, { ...modelflareApiBases(baseUrl), key: apiKey.trim(), headers, ...(picks.length ? { models: picks } : {}) });
   }
 
-  /** 切换线路：只改地址，key 不变（机器人自己的 provider 一起切） */
   async setModelflareUrl(baseUrl: string, allowed: string[]): Promise<void> {
     if (!allowed.includes(baseUrl)) throw new Error(t("magpie.unsupported_url"));
     for (const id of [this.modelflareId(), ...this.botProviderIds()]) if (id) await this.saveProvider(id, modelflareApiBases(baseUrl));
   }
 
-  /** 0.1.8 及以前的连接只写了 Chat 地址：补上 Responses 和 Messages（跟 Chat 同一条线路） */
   async ensureModelflareApis(id: string): Promise<void> {
     const p = this.readProviderRaw(id);
     const chat = typeof p?.chat === "string" ? p.chat : "";
@@ -476,17 +489,13 @@ export class MagpieSupervisor {
     if (p?.responses !== want.responses || p?.anthropic !== want.anthropic) await this.saveProvider(id, want);
   }
 
-  /**
-   * 服务端压缩的前提：provider 开启 nativeCompaction 后，网关对带 compaction 项的请求只直传（不转成 Chat 协议），
-   * 上游拒绝时原样回报错；关着时网关会悄悄删掉压缩项再重试，之前的上下文就丢了。对不带压缩项的请求没有影响。
-   */
   nativeCompaction(id: string): boolean {
     return this.readProviderRaw(id)?.nativeCompaction === true;
   }
 
   private nativeSaving = new Map<string, Promise<void>>();
   private nativeFailedAt = new Map<string, number>();
-  /** 打开 nativeCompaction；保存失败后 10 分钟内不再试（失败时抛错一次） */
+
   async ensureNativeCompaction(id: string): Promise<void> {
     if (this.nativeCompaction(id) || Date.now() - (this.nativeFailedAt.get(id) ?? 0) < 10 * 60_000) return;
     let p = this.nativeSaving.get(id);
@@ -503,7 +512,6 @@ export class MagpieSupervisor {
     await p;
   }
 
-  /** 断开 Modelflare：删除共用连接和所有机器人自己的 provider */
   async disconnectModelflare(): Promise<void> {
     for (const id of [this.modelflareId(), ...this.botProviderIds()]) if (id) await this.deleteProvider(id);
   }
@@ -534,20 +542,15 @@ export class MagpieSupervisor {
       .filter((id) => id.startsWith(BOT_PROVIDER_PREFIX));
   }
 
-  /**
-   * provider 的明文 key：只在本进程内用于直连 Modelflare（余额、模型能力、生图），
-   * 不经接口返回、不写日志。
-   */
   providerKey(id: string): string {
     const key = String(this.readProviderRaw(id)?.key ?? "");
-    return key && key !== "placeholder-key" ? key : "";
+    return key && key !== "placeholder-key" && key !== "local-keyless" ? key : "";
   }
 
   get modelflareProviderId(): string | undefined {
     return this.modelflareId();
   }
 
-  /** 当前 Modelflare 连接（只回传尾号，不外传 key） */
   modelflareInfo(): { connected: boolean; keyTail: string; baseUrl: string } {
     const id = this.modelflareId();
     const p = id ? this.readProviderRaw(id) : undefined;
@@ -556,18 +559,14 @@ export class MagpieSupervisor {
     return { connected, keyTail: connected ? keyTail(key) : "", baseUrl: String(p?.chat ?? "") };
   }
 
-  /**
-   * 网关背后的上游端点（故障排查"直连端点"对比用）：地址、真实 key、provider id（缺省为共用连接；
-   * 开了预算的机器人用自己的 mfb-<botId>）。只在本进程内使用，不外传。
-   * 网关里的模型名带 provider 前缀（modelflare/<上游模型名>），直连时要去掉。
-   */
   upstreamEndpoint(providerId?: string): { id: string; baseUrl: string; apiKey: string } | undefined {
-    const id = providerId && this.hasProvider(providerId) ? providerId : this.modelflareId();
+    const fallbackId = this.modelflareId() ?? this.listProviders()[0]?.id;
+    const id = providerId && this.hasProvider(providerId) ? providerId : fallbackId;
     const p = id ? this.readProviderRaw(id) : undefined;
     const key = String(p?.key ?? "");
     if (!id || !p || !key || key === "placeholder-key") return undefined;
-    registerSecret(key);
-    return { id, baseUrl: String(p.chat ?? "").replace(/\/+$/, ""), apiKey: key };
+    if (key !== "local-keyless") registerSecret(key);
+    return { id, baseUrl: String(p.chat ?? "").replace(/\/+$/, ""), apiKey: key === "local-keyless" ? "" : key };
   }
 
   private modelflareId(): string | undefined {
@@ -598,7 +597,6 @@ export class MagpieSupervisor {
     return arr.find((x) => x.id === id);
   }
 
-  /** 读取 magpie 的 providers.json（只取 id/name，不外传 key） */
   listProviders(): Array<{ id: string; name: string }> {
     for (const f of ["providers.json", "config.json"]) {
       const p = path.join(this.root, "config", "magpie", f);

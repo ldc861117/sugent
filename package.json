@@ -13,7 +13,7 @@
   "scripts": {
     "setup": "node scripts/setup.mjs",
     "build:magpie": "node scripts/build-magpie.mjs",
-    "build": "tsc -p tsconfig.build.json",
+    "build": "tsc -p tsconfig.build.json && node scripts/write-build-manifest.mjs",
     "start": "tsx src/main.ts",
     "dev": "tsx watch src/main.ts",
     "init": "tsx src/cli/init.ts",
@@ -33,8 +33,11 @@
     "bundle:dsh": "node scripts/bundle-dsh.mjs",
     "test:dsh-bundle": "node scripts/test-dsh-bundle.mjs",
     "fetch:cua": "node scripts/fetch-cua-driver.mjs",
-    "test:sugent": "vitest run test/sugent.unit.test.ts test/sugent-sources.unit.test.ts test/sugent-kg.unit.test.ts",
+    "test:sugent": "vitest run test/sugent.unit.test.ts test/sugent-sources.unit.test.ts test/sugent-kg.unit.test.ts test/sugent-self-evolution.unit.test.ts test/sugent-security-envelope.unit.test.ts test/sugent-causal-ledger.unit.test.ts test/sugent-cowork-bridge.unit.test.ts test/sugent-receipt-and-probes.unit.test.ts test/sugent-delivery.unit.test.ts test/sugent-provider-and-budget.unit.test.ts test/sugent-auth-provider.unit.test.ts test/sugent-google-oauth.unit.test.ts test/sugent-gemini-web2api-catalog.unit.test.ts test/sugent-gemini-web2api-adapter.unit.test.ts test/sugent-providers-api.unit.test.ts test/sugent-auth-api-google.unit.test.ts test/sugent-gemini-web2api-api.unit.test.ts test/sugent-auth-broker-contract.unit.test.ts test/sugent-auth-broker.e2e.unit.test.ts test/sugent-opc-concierge.unit.test.ts test/sugent-byok-diagnostics.unit.test.ts test/sugent-e2ee-sync.unit.test.ts test/sugent-p2-web-api.unit.test.ts test/sugent-concierge-bridge.unit.test.ts test/sugent-stewardship-ledger.unit.test.ts test/sugent-universal-dropzone.unit.test.ts test/sugent-proactive-cadence.unit.test.ts test/sugent-antigravity-reader.unit.test.ts test/sugent-steward-web-api.unit.test.ts test/sugent-steward-conversation.unit.test.ts test/sugent-antigravity-bridge.unit.test.ts test/sugent-steward-mcp.unit.test.ts test/sugent-steward-llm-agent.unit.test.ts test/sugent-repo-and-handoff.unit.test.ts test/sugent-vibe-pipeline.unit.test.ts test/sugent-safe-relaunch.unit.test.ts test/sugent-capability-and-file-read.unit.test.ts test/sugent-avatar-studio.unit.test.ts test/sugent-salience-and-clarify.unit.test.ts test/sugent-executive-arbiter.unit.test.ts test/sugent-sim-and-gardener.unit.test.ts",
     "verify:sugent": "npm run typecheck && npm run build && node scripts/verify-sugent.mjs && npm run docs:check",
+    "demo:jarvis": "npm run build && node scripts/start-jarvis-workbench.mjs",
+    "sugent:why": "node -e \"import('node:fs').then(fs=>!fs.existsSync('dist/src/cli/why.js')&&import('node:child_process').then(c=>c.execSync('npm run -s build',{stdio:'inherit'})))\" && node dist/src/cli/why.js",
+    "sugent:try": "npm run -s build && node dist/src/cli/try.js",
     "sugent:bootstrap": "npm run build && node scripts/bootstrap-self-dev.mjs",
     "build:icons": "node scripts/build-sugent-icons.mjs",
     "sync:upstreams": "node scripts/sync-upstreams.mjs --check",
@@ -42,6 +45,7 @@
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "1.76.0",
+    "electron-updater": "^6.8.11",
     "htm": "^3.1.1",
     "preact": "^11.0.2",
     "qrcode": "^1.5.4",
@@ -67,13 +71,22 @@
   "build": {
     "appId": "ai.sugent.app",
     "productName": "Sugent",
-    "artifactName": "Sugent-${version}-${os}-${arch}.${ext}",
+    "artifactName": "anymodel-bot-${version}-${os}-${arch}.${ext}",
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "ldc861117",
+        "repo": "sugent",
+        "releaseType": "release"
+      }
+    ],
     "directories": {
       "output": "release",
       "buildResources": "assets"
     },
     "files": [
       "dist/**",
+      "electron/companion-preload.cjs",
       "ui/**",
       "src/sugent/**",
       "ARCHITECTURE.md",

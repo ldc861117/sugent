@@ -9,5 +9,7 @@ export default {
     red: { name: "哒哒", about: "耳机一戴，节拍就哒哒哒响个不停。" },
     purple: { name: "晶晶", about: "头顶结着一颗水晶，转起来亮晶晶。" },
     orange: { name: "飞飞", about: "飞行护目镜一戴，随时准备起飞。" },
+    "sugent-core": { name: "曜石 · Core", about: "深炭黑哑光陶瓷全身搭档，配极简微光与物理舞台。" },
+    "clay-atelier": { name: "陶白 · Atelier", about: "2.5 头身哑光高岭土白瓷微缩关节人偶，桌面雕塑基准形态。" },
   },
 };

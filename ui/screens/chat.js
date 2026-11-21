@@ -718,7 +718,7 @@ export function ChatScreen({ bot, models, modelsError, reloadModels, defaultMode
   return html`<section class=${`chat${scrolled ? " scrolled" : ""}`} data-screen="chat" aria-label=${t("chat.aria", { name: bot.name })}>
     <header class="chat-head">
       <button type="button" class="head-bot bot-hover" data-guide="info" aria-pressed=${infoOpen} title=${t("chat.infoPanel")} onClick=${onToggleInfo}>
-        <${BotAvatar} bot=${bot} size=${22} state=${face} cue=${cue} />
+        <${BotAvatar} bot=${bot} useActivePack=${bot.id === "default"} size=${22} state=${face} cue=${cue} />
         <span class="name">${bot.name}</span>
       </button>
       <span class="grow"></span>
@@ -730,7 +730,7 @@ export function ChatScreen({ bot, models, modelsError, reloadModels, defaultMode
         ${loadErr && html`<${Notice} tone="red" action=${html`<button type="button" class="btn" onClick=${() => load()}>${t("common.retry")}</button>`}>${t("chat.error.loadHistory", { error: loadErr })}<//>`}
         ${items === null && html`<div class="chat-skel"><${Skeleton} w="40%" /><${Skeleton} w="28%" /></div>`}
         ${empty && html`<div class=${`chat-empty${showGuide ? " with-guide" : ""}`}>
-          <${BotAvatar} bot=${bot} size=${88} state=${face} cue=${cue} lively pokeable greet />
+          <${BotAvatar} bot=${bot} useActivePack=${bot.id === "default"} size=${88} state=${face} cue=${cue} lively pokeable greet />
           ${showGuide
             ? html`<h2>${t("chat.empty.guideTitle", { name: bot.name })}</h2>
               <p>${t("chat.empty.guideBody")}</p>

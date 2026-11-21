@@ -5,6 +5,8 @@ import { useEffect, useRef, useState } from "preact/hooks";
 import { html } from "./ui.js";
 import { ms, reducedMotion } from "../design/motion.js";
 import { t } from "../lib/i18n.js";
+import { api } from "../lib/api.js";
+import { CompanionStage } from "./companion-stage.js";
 
 /**
  * 角色。eyes：两眼中心；r：眼睛半径；earL / earR / top：耳朵与头顶配件的转轴；tip：配件的中心（特效从这里发出）；
@@ -32,9 +34,64 @@ export const BOT_CHARS = {
     eyes: [[38.18, 61.84], [61.83, 61.84]], r: 3.57, earL: [15.66, 61.47], earR: [84.34, 61.47], top: [50.12, 27.44], tip: [50, 17],
     lens: [[35.27, 40.85], [64.81, 40.85], 6.4],
   },
+  "sugent-core": {
+    eyes: [[41.75, 56.5], [58.25, 56.5]], r: 4.2, earL: [25.5, 57], earR: [74.5, 57], top: [50, 32], tip: [50, 19],
+    schemaVersion: "pose_sheet_v2",
+    poseSheetUrl: "/amb/static/design/bots/sugent-core-v2-poses.png",
+    portraitUrl: "/amb/static/design/bots/sugent-core-v2-portrait.png",
+    accentColor: "#9fe870",
+    sprite: "/amb/static/design/bots/sugent-core.png", eyeStyle: "minimal", hasGlow: false, motionPersonality: "calm", auraHue: 88,
+  },
+  "clay-atelier": {
+    eyes: [[41.75, 56.5], [58.25, 56.5]], r: 4.2, earL: [25.5, 57], earR: [74.5, 57], top: [50, 32], tip: [50, 19],
+    schemaVersion: "pose_sheet_v2",
+    poseSheetUrl: "/amb/static/design/bots/clay-atelier-poses.png",
+    portraitUrl: "/amb/static/design/bots/clay-atelier-portrait.png",
+    accentColor: "#788596",
+    sprite: "/amb/static/design/bots/sugent-core.png", eyeStyle: "minimal", hasGlow: false, motionPersonality: "calm", auraHue: 214,
+  },
 };
 export const CHAR_KEYS = Object.keys(BOT_CHARS);
-export const MAIN_CHAR = "blue";
+export const MAIN_CHAR = "sugent-core";
+
+// —— Avatar Studio 共享响应式缓存 ——
+let studioCache = null;
+let studioInflight = null;
+const studioSubs = new Set();
+
+export function getAvatarStudioState() {
+  return studioCache;
+}
+export function getActiveAvatarPack() {
+  return studioCache && studioCache.activePack ? studioCache.activePack : null;
+}
+export function getAvatarPackById(id) {
+  if (!id || !studioCache || !Array.isArray(studioCache.packs)) return null;
+  const clean = String(id).replace(/^custom:/, "");
+  return studioCache.packs.find((p) => p.id === clean) || null;
+}
+export function setAvatarStudioState(next) {
+  studioCache = next;
+  for (const fn of studioSubs) fn(next);
+}
+export async function loadAvatarStudio(force = false) {
+  if (studioCache && !force) return studioCache;
+  if (studioInflight && !force) return studioInflight;
+  studioInflight = api("/steward/avatars")
+    .then((d) => { setAvatarStudioState(d); return d; })
+    .catch(() => studioCache)
+    .finally(() => { studioInflight = null; });
+  return studioInflight;
+}
+export function useAvatarStudio(autoLoad = true) {
+  const [st, setSt] = useState(studioCache);
+  useEffect(() => {
+    studioSubs.add(setSt);
+    if (autoLoad) void loadAvatarStudio();
+    return () => studioSubs.delete(setSt);
+  }, [autoLoad]);
+  return st;
+}
 
 /** 角色的名字和介绍（按当前语言） */
 export const charText = (key) => ({ name: t(`avatar.chars.${key}.name`), about: t(`avatar.chars.${key}.about`) });
@@ -52,7 +109,7 @@ function hash(s) {
 /** 机器人用哪个角色：设置里选过的 > 默认机器人用默认头像 > 由 id 稳定地挑一个 */
 export function charOf(bot) {
   const a = bot && bot.settings && bot.settings.avatar;
-  if (a && BOT_CHARS[a]) return a;
+  if (a && (BOT_CHARS[a] || String(a).startsWith("custom:"))) return a;
   if (!bot || bot.id === "default") return MAIN_CHAR;
   return CHAR_KEYS[hash(String(bot.id || bot.name || "?")) % CHAR_KEYS.length];
 }
@@ -98,7 +155,7 @@ function watchPointer() {
 }
 
 // —— 表情：每种都画在以眼睛中心为原点的坐标里（单位同 viewBox 0–100），右眼镜像 ——
-function eyeShapes(R) {
+function eyeShapes(R, eyeStyle = "round") {
   const f = (n) => +(n * R).toFixed(2);
   const spiral = [];
   for (let i = 0; i <= 28; i++) {
@@ -106,7 +163,14 @@ function eyeShapes(R) {
     const rr = (0.12 + (0.9 * i) / 28) * R;
     spiral.push(`${i ? "L" : "M"}${(Math.cos(t) * rr).toFixed(2)} ${(Math.sin(t) * rr).toFixed(2)}`);
   }
-  return html`<circle class="e e-open" r=${R} />
+  const openShape = eyeStyle === "capsule"
+    ? html`<g class="e e-open"><rect x=${f(-0.62)} y=${f(-1.05)} width=${f(1.24)} height=${f(2.1)} rx=${f(0.62)} /><circle class="e-glint" cx=${f(-0.2)} cy=${f(-0.48)} r=${f(0.2)} /></g>`
+    : eyeStyle === "visor"
+      ? html`<rect class="e e-open" x=${f(-1.22)} y=${f(-0.56)} width=${f(2.44)} height=${f(1.12)} rx=${f(0.56)} />`
+      : eyeStyle === "minimal"
+        ? html`<circle class="e e-open" r=${f(0.68)} />`
+        : html`<circle class="e e-open" r=${R} />`;
+  return html`${openShape}
     <path class="e e-happy line" d=${`M${f(-1.05)} ${f(0.45)}Q0 ${f(-1.3)} ${f(1.05)} ${f(0.45)}`} />
     <path class="e e-closed line" d=${`M${f(-1.05)} ${f(-0.15)}Q0 ${f(0.8)} ${f(1.05)} ${f(-0.15)}`} />
     <path class="e e-sad" d=${`M${f(-1.05)} 0L${f(1.05)} 0A${f(1.05)} ${f(1.05)} 0 0 1 ${f(-1.05)} 0Z`} />
@@ -147,9 +211,37 @@ function Fx({ char, state, shot }) {
  *   pokeable          可以戳：戳一下开心，连戳三下冒爱心，戳太多会晕
  *   neutral           还没有身份的灰色版（新建页占位）
  */
-export function BotAvatar({ bot, id, name, char, size = 34, state = "idle", working = false, cue, greet = false, lively = false, pokeable = false, neutral = false }) {
-  const key = BOT_CHARS[char] ? char : neutral ? MAIN_CHAR : charOf(bot || (id || name ? { id, name } : null));
-  const c = BOT_CHARS[key];
+export function BotAvatar({
+  bot,
+  id,
+  name,
+  char,
+  pack,
+  useActivePack = false,
+  size = 34,
+  state = "idle",
+  working = false,
+  cue,
+  greet = false,
+  lively = false,
+  pokeable = false,
+  neutral = false,
+  facing = "left",
+  dragging = false,
+  dragVx = 0,
+  dropOver = false,
+  coolingProgress = 0,
+  onDoubleClick,
+}) {
+  const studio = useAvatarStudio(false);
+  const rawKey = char ? char : neutral ? MAIN_CHAR : charOf(bot || (id || name ? { id, name } : null));
+  const resolvedPack = pack || (useActivePack && studio?.activePack) || getAvatarPackById(rawKey);
+  const key = resolvedPack ? resolvedPack.id : (BOT_CHARS[rawKey] ? rawKey : MAIN_CHAR);
+  const c = (resolvedPack && resolvedPack.rig) || BOT_CHARS[key] || BOT_CHARS[MAIN_CHAR];
+  const eyeStyle = resolvedPack?.eyeStyle || c.eyeStyle || "round";
+  const motionPersonality = resolvedPack?.motionPersonality || c.motionPersonality || "lively";
+  const spriteUrl = resolvedPack?.spriteUrl || c.sprite || `/amb/static/design/bots/${key}.webp`;
+  const hasGlow = Boolean(resolvedPack ? resolvedPack.hasGlow : c.hasGlow);
   const st = working && state === "idle" ? "working" : state;
   const [shot, setShot] = useState(greet ? "hello" : "");
   const [n, setN] = useState(0);
@@ -192,17 +284,46 @@ export function BotAvatar({ bot, id, name, char, size = 34, state = "idle", work
   const p = (pt) => `${pt[0]}% ${pt[1]}%`;
   const style = {
     "--s": size + "px",
-    "--bf-sprite": `url("/amb/static/design/bots/${key}.webp")`,
+    "--bf-sprite": `url("${spriteUrl}")`,
     "--o-el": p(c.earL),
     "--o-er": p(c.earR),
     "--o-top": p(c.top),
     "--tip-x": c.tip[0] + "%",
     "--tip-y": c.tip[1] + "%",
     "--bf-seed": ((hash(String((bot && bot.id) || id || key)) % 1000) / 1000).toFixed(3),
+    ...(resolvedPack?.eyeColor ? { "--bf-eye": resolvedPack.eyeColor } : {}),
+    ...(resolvedPack?.glowColor ? { "--bf-glow": resolvedPack.glowColor } : {}),
   };
   const cls = `bot-face${lively ? " lively" : ""}${pokeable ? " pokeable" : ""}${neutral ? " neutral" : ""}${size < FX_MIN ? " sm" : ""}`;
   const part = (k) => html`<i class=${`bf-part bf-${k}`}><i class="bf-pin"><b class="bf-img"></b><b class="bf-glow"></b></i></i>`;
+  const v2Pack = resolvedPack?.schemaVersion === "pose_sheet_v2"
+    ? resolvedPack
+    : (BOT_CHARS[key]?.schemaVersion === "pose_sheet_v2" ? { id: key, ...BOT_CHARS[key] } : null);
+  if (v2Pack && v2Pack.poseSheetUrl) {
+    if (size <= 48) {
+      const pCls = `bot-portrait${neutral ? " neutral" : ""}`;
+      return html`<div class=${pCls} style=${{ "--s": size + "px" }} data-state=${st} aria-hidden="true">
+        <img class="bp-img" src=${v2Pack.portraitUrl || v2Pack.poseSheetUrl} alt="" />
+        <i class="bp-ring"></i>
+      </div>`;
+    }
+    const stageCue = cue || (shot ? { kind: shot, at: n || 1 } : null);
+    return html`<${CompanionStage}
+      pack=${v2Pack}
+      state=${st}
+      cue=${stageCue}
+      size=${size}
+      facing=${facing}
+      dragging=${dragging}
+      dragVx=${dragVx}
+      dropOver=${dropOver}
+      coolingProgress=${coolingProgress}
+      interactive=${lively || pokeable}
+      onDoubleClick=${onDoubleClick}
+    />`;
+  }
   return html`<div class=${cls} style=${style} data-char=${key} data-state=${st} data-shot=${shot || undefined} data-eyes=${eyes}
+      data-eye-style=${eyeStyle} data-motion-personality=${motionPersonality} data-has-glow=${hasGlow ? "1" : undefined}
       aria-hidden="true" onClick=${pokeable ? poke : undefined}>
     ${lively && html`<i class="bf-shadow"></i>`}
     <i class="bf-aura"></i>
@@ -215,7 +336,7 @@ export function BotAvatar({ bot, id, name, char, size = 34, state = "idle", work
           ${c.eyes.map((e) => html`<i class="bf-blush" style=${{ left: (e[0] + (e[0] < 50 ? -5.6 : 5.6)).toFixed(2) + "%", top: (e[1] + 6.2).toFixed(2) + "%" }}></i>`)}
           <svg class="bf-eyes" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
             <g class="bf-gaze"><g class="bf-glance">
-              ${c.eyes.map((e, i) => html`<g transform=${`translate(${e[0]} ${e[1]})${i ? " scale(-1 1)" : ""}`}><g class="bf-lid">${eyeShapes(c.r)}</g></g>`)}
+              ${c.eyes.map((e, i) => html`<g transform=${`translate(${e[0]} ${e[1]})${i ? " scale(-1 1)" : ""}`}><g class="bf-lid">${eyeShapes(c.r, eyeStyle)}</g></g>`)}
             </g></g>
           </svg>
           ${size >= FX_MIN && key === "blue" && BUSY.has(st) && html`<span class="fx fx-rings"><i></i><i></i><i></i></span>`}

@@ -5,9 +5,16 @@ export type CuBackend = "cua" | "codex";
 export type CuApproval = "auto" | "ask-input";
 /** auto = 只在预计花费超过上限时问（视频算不出花费也问）；always = 每次生成前都问 */
 export type MediaConfirm = "auto" | "always";
-/** 内置头像角色（ui/components/avatar.js 的 BOT_CHARS）；blue 是默认头像 */
-export const BOT_AVATARS = ["blue", "yellow", "green", "red", "purple", "orange"] as const;
-export type BotAvatarKey = (typeof BOT_AVATARS)[number];
+/** 内置头像角色（ui/components/avatar.js 的 BOT_CHARS）；blue 是默认兼容头像，sugent-core / clay-atelier 是全身雕塑形象 */
+export const BOT_AVATARS = ["blue", "yellow", "green", "red", "purple", "orange", "sugent-core", "clay-atelier"] as const;
+export type BotAvatarKey = (typeof BOT_AVATARS)[number] | `custom:${string}`;
+
+function normalizeAvatarSetting(v: unknown): BotAvatarKey | "" {
+  if (typeof v !== "string") return "";
+  if ((BOT_AVATARS as readonly string[]).includes(v)) return v as BotAvatarKey;
+  if (/^custom:[a-z0-9][a-z0-9_-]{0,48}$/.test(v)) return v as BotAvatarKey;
+  return "";
+}
 
 export interface BotSettings {
   /**
@@ -115,7 +122,7 @@ export function normalizeSettings(raw: unknown): BotSettings {
     // 以前每次都问；升级后默认只在花费高时问
     media: { confirm: md.confirm === "always" ? "always" : "auto" },
     utilityModel: typeof r.utilityModel === "string" ? r.utilityModel.trim().slice(0, 200) : "",
-    avatar: (BOT_AVATARS as readonly string[]).includes(r.avatar) ? r.avatar : "",
+    avatar: normalizeAvatarSetting(r.avatar),
     budget: {
       enabled: b(bg.enabled, DEFAULT_SETTINGS.budget.enabled),
       limitUsd: Number.isFinite(limit) && limit >= 0 && limit <= 100_000 ? Math.round(limit * 100) / 100 : DEFAULT_SETTINGS.budget.limitUsd,

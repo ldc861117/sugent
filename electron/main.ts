@@ -10,6 +10,7 @@
  * CLI（npm start）与 Docker 走同一套 src/ 代码，本文件只做桌面外壳。
  */
 import { app, BrowserWindow, Menu, Notification, Tray, nativeImage, nativeTheme, net, powerMonitor, session, shell, dialog, safeStorage } from "electron";
+import electronUpdater from "electron-updater";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -20,6 +21,8 @@ import { findAppRoot } from "../src/magpie/supervisor.js";
 import { initFileLog, logFilePath, logger, registerSecret, setConsoleLog } from "../src/log.js";
 import { normalizeLang, onLangChange, setLangPref, setSystemLang, t } from "../src/i18n/index.js";
 import { notificationOf, trayTitle, type AttentionItem } from "../src/tasks/attention.js";
+import type { DesktopUpdateStatus } from "../src/app.js";
+import { SugentCompanionController } from "./sugent-companion.js";
 
 const log = logger("desktop");
 const SMOKE = process.env.AMB_ELECTRON_SMOKE; // 冒烟测试：截图到该路径后退出
@@ -27,9 +30,134 @@ const SMOKE = process.env.AMB_ELECTRON_SMOKE; // 冒烟测试：截图到该路�
 let core: App | undefined;
 let win: BrowserWindow | undefined;
 let tray: Tray | undefined;
+let companion: SugentCompanionController | undefined;
 let entryUrl = "";
 let quitting = false;
 let stopped = false;
+const UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
+let updateStatus: DesktopUpdateStatus = { supported: false, state: "unsupported", currentVersion: "" };
+let autoUpdater: typeof electronUpdater.autoUpdater | undefined;
+let updateCheckTimer: NodeJS.Timeout | undefined;
+let updateInstallStarted = false;
+
+function updateNotes(notes: unknown): string {
+  if (typeof notes === "string") return notes;
+  if (!Array.isArray(notes)) return "";
+  return notes
+    .map((entry) => (entry && typeof entry === "object" ? String((entry as { note?: unknown }).note ?? "") : String(entry ?? "")))
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+function configureUpdater(): void {
+  const supported = process.platform === "darwin" && app.isPackaged && !SMOKE;
+  updateStatus = {
+    supported,
+    state: supported ? "not-available" : "unsupported",
+    currentVersion: app.getVersion(),
+    ...(!supported ? { error: process.platform === "darwin" ? undefined : "Automatic updates are available on macOS only" } : {}),
+  };
+  if (!supported) return;
+  // electron-updater is CommonJS and exposes autoUpdater through a lazy getter. Import its default
+  // namespace for Node ESM compatibility, then resolve the getter only after Electron is ready.
+  autoUpdater = electronUpdater.autoUpdater;
+  const updater = autoUpdater;
+
+  // The updater only checks for stable GitHub releases. Downloading and installing are always user initiated.
+  updater.autoDownload = false;
+  updater.autoInstallOnAppQuit = false;
+  updater.allowPrerelease = false;
+  updater.allowDowngrade = false;
+  updater.on("checking-for-update", () => {
+    updateStatus = { supported: true, state: "checking", currentVersion: app.getVersion() };
+  });
+  updater.on("update-available", (info) => {
+    updateStatus = {
+      supported: true,
+      state: "available",
+      currentVersion: app.getVersion(),
+      version: info.version,
+      releaseNotes: updateNotes(info.releaseNotes),
+    };
+  });
+  updater.on("update-not-available", (info) => {
+    updateStatus = {
+      supported: true,
+      state: "not-available",
+      currentVersion: app.getVersion(),
+      ...(info?.version ? { version: info.version } : {}),
+    };
+  });
+  updater.on("download-progress", (progress) => {
+    updateStatus = {
+      ...updateStatus,
+      supported: true,
+      state: "downloading",
+      percent: Math.max(0, Math.min(100, progress.percent)),
+    };
+  });
+  updater.on("update-downloaded", (info) => {
+    updateStatus = {
+      supported: true,
+      state: "downloaded",
+      currentVersion: app.getVersion(),
+      version: info.version,
+      releaseNotes: updateNotes(info.releaseNotes),
+      percent: 100,
+    };
+  });
+  updater.on("error", (error) => {
+    log.warn("desktop update failed", { message: error.message });
+    updateStatus = { ...updateStatus, supported: true, state: "error", error: error.message };
+  });
+}
+
+async function checkForDesktopUpdate(): Promise<DesktopUpdateStatus> {
+  const updater = autoUpdater;
+  if (!updateStatus.supported || !updater) return updateStatus;
+  if (updateStatus.state === "checking" || updateStatus.state === "downloading" || updateStatus.state === "downloaded") return updateStatus;
+  updateStatus = { supported: true, state: "checking", currentVersion: app.getVersion() };
+  try {
+    await updater.checkForUpdates();
+  } catch (error) {
+    const message = (error as Error).message || String(error);
+    log.warn("desktop update check failed", { message });
+    updateStatus = { supported: true, state: "error", currentVersion: app.getVersion(), error: message };
+  }
+  return updateStatus;
+}
+
+function downloadDesktopUpdate(): DesktopUpdateStatus {
+  const updater = autoUpdater;
+  if (!updateStatus.supported || !updater) return updateStatus;
+  if (updateStatus.state === "downloading" || updateStatus.state === "downloaded") return updateStatus;
+  if (updateStatus.state !== "available") return updateStatus;
+  updateStatus = { ...updateStatus, state: "downloading", percent: 0, error: undefined };
+  // Start the network transfer without holding the local API request open. Progress and completion
+  // arrive through updater events; this catch records failures that happen after the response returns.
+  void Promise.resolve()
+    .then(() => updater.downloadUpdate())
+    .catch((error: unknown) => {
+    const message = (error as Error).message || String(error);
+    log.warn("desktop update download failed", { message });
+    updateStatus = { ...updateStatus, state: "error", error: message };
+    });
+  return updateStatus;
+}
+
+function installDesktopUpdate(): void {
+  const updater = autoUpdater;
+  if (updateInstallStarted || !updateStatus.supported || updateStatus.state !== "downloaded" || !updater) return;
+  updateInstallStarted = true;
+  updater.quitAndInstall(false, true);
+}
+
+function startDesktopUpdateChecks(): void {
+  if (!updateStatus.supported) return;
+  void checkForDesktopUpdate();
+  updateCheckTimer = setInterval(() => void checkForDesktopUpdate(), UPDATE_CHECK_INTERVAL_MS);
+  updateCheckTimer.unref();
+}
 
 // 图标由 scripts/build-app-icons.py 生成。Windows 窗口和托盘都用多尺寸 ico，系统按当前缩放挑对应的帧；
 // 其他系统窗口用 icon.png（macOS 忽略，Dock 用包里的 icns），托盘用 18px 的 tray.png，高分屏自动换 tray@2x.png
@@ -177,6 +305,8 @@ function buildTray(): void {
         // 有事在等你时才有这一项
         ...(needsCount ? [{ label: t("desktop.trayNeeds", { count: needsCount }), click: openNeeds }, { type: "separator" as const }] : []),
         { label: t("desktop.trayOpen", { product: PRODUCT }), click: showWindow },
+        { label: t("desktop.trayCompanionToggle"), click: () => companion?.toggle() },
+        { label: t("desktop.trayQuickBar"), click: () => companion?.showQuickBar() },
         { label: t("desktop.trayOpenInBrowser"), click: () => void shell.openExternal(entryUrl) },
         { type: "separator" },
         {
@@ -217,6 +347,7 @@ async function boot(): Promise<void> {
   if (!config.ui.token) config.ui.token = crypto.randomBytes(24).toString("base64url");
   registerSecret(config.ui.token);
   core = new App(config);
+  configureUpdater();
   core.desktop = {
     autostart: () => ({ supported: canAutostart, on: canAutostart && app.getLoginItemSettings().openAtLogin }),
     setAutostart,
@@ -244,18 +375,49 @@ async function boot(): Promise<void> {
     fetch: ((input: string | URL | Request, init?: RequestInit) => net.fetch(input instanceof URL ? input.href : input, init)) as typeof fetch,
     // 代理执行的命令用的系统代理：Chromium 按系统设置和 PAC 解析（代理进程每次拉起时问）
     resolveProxy: (url) => session.defaultSession.resolveProxy(url),
+    updateStatus: () => ({ ...updateStatus }),
+    downloadUpdate: downloadDesktopUpdate,
+    installUpdate: installDesktopUpdate,
+    requestRelaunchQuit: () => app.quit(),
+    companionState: () => companion?.state() ?? { supported: false, visible: false, expanded: false },
+    toggleCompanion: (v) => companion?.toggle(v) ?? { supported: false, visible: false, expanded: false },
+    showCompanionQuickBar: () => companion?.showQuickBar() ?? { supported: false, visible: false, expanded: false },
   };
   await core.start();
   if (!core.web) throw new Error(t("desktop.uiNotStarted"));
+  startDesktopUpdateChecks();
   // 规则的定时器：电脑醒来、解锁时马上重新看一遍（睡着时错过的按宽限期补跑一次或记为跳过）
   powerMonitor.on("resume", () => core?.tasks.scheduler.wake());
   powerMonitor.on("unlock-screen", () => core?.tasks.scheduler.wake());
   entryUrl = `${core.web.url.replace(/\/$/, "")}/?token=${encodeURIComponent(config.ui.token)}`;
+  const companionUrl = `${core.web.url.replace(/\/$/, "")}/companion?token=${encodeURIComponent(config.ui.token)}`;
+  if (!SMOKE) {
+    const appRoot = findAppRoot(path.dirname(fileURLToPath(import.meta.url)));
+    companion = new SugentCompanionController({
+      dataDir,
+      companionUrl,
+      preloadPath: path.join(appRoot, "electron", "companion-preload.cjs"),
+      onOpenMain: (hash) => {
+        showWindow();
+        if (hash) {
+          const run = () => void win?.webContents.executeJavaScript(`location.hash = ${JSON.stringify(hash)}`).catch(() => {});
+          if (win?.webContents.isLoading()) win.webContents.once("did-finish-load", run);
+          else run();
+        }
+      },
+    });
+    companion.initVisible();
+  }
   log.info(`数据目录：${dataDir}`);
   log.info(`管理界面：${core.web.url}`);
   if (!SMOKE) buildTray();
   // 「需要你」：托盘、角标、系统通知
   if (!SMOKE) core.attention.onChange(onAttention);
+  if (!SMOKE) {
+    setTimeout(() => {
+      if (!quitting) core?.markDesktopBootHealthy(process.pid, app.getVersion());
+    }, 1500).unref();
+  }
   const atLogin = process.argv.includes("--hidden") || (process.platform === "darwin" && app.getLoginItemSettings().wasOpenedAtLogin);
   if (!atLogin || SMOKE) createWindow();
   if (SMOKE) await smoke(SMOKE);
@@ -319,6 +481,8 @@ if (!app.requestSingleInstanceLock()) {
   app.on("activate", () => entryUrl && showWindow());
   app.on("before-quit", (e) => {
     quitting = true;
+    companion?.destroy();
+    if (updateCheckTimer) clearInterval(updateCheckTimer);
     if (stopped || !core) return;
     e.preventDefault();
     const force = setTimeout(() => app.exit(1), 10_000);

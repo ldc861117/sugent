@@ -3,7 +3,7 @@ export default {
   tabs: {
     general: "General",
     appearance: "Appearance",
-    modelflare: "Modelflare",
+    modelflare: "Models & providers",
     computer: "Computer use",
     connections: "Connections",
     privacy: "Privacy & security",
@@ -111,8 +111,14 @@ export default {
     },
     selfEvo: {
       name: "Self-evolution & code autonomy",
-      sub: "Automatically binds the relative repository or hot-overlay directory (./) so bots can evolve UI, plugins, and skills",
+      sub: "In an installed app, bots can add Skills and compatible plugins. Source workspaces can evolve the full repository",
       keys: "self evolution code autonomy hot overlay plugin skill",
+    },
+    selfEvoStatus: {
+      name: "Self-evolution notices",
+      uiArchived: "Legacy UI overrides were archived at {path}; the official interface is active",
+      pluginIssues: "{count} plugin(s) are disabled until their manifests are fixed",
+      keys: "self evolution archived UI plugin manifest disabled",
     },
     sendKey: {
       name: "Send with",
@@ -375,6 +381,20 @@ export default {
     version: {
       name: "Version",
       keys: "version",
+    },
+    update: {
+      name: "App update",
+      sub: "Checks for stable releases on macOS. Downloads and restarts only when you choose",
+      available: "Version {version} is available",
+      downloading: "Downloading: {percent}%",
+      downloaded: "Version {version} is ready to install",
+      error: "Update error: {error}",
+      checking: "Checking for updates…",
+      current: "You have the latest version",
+      unsupported: "Automatic updates are unavailable in this build",
+      download: "Download",
+      install: "Restart and install",
+      keys: "update upgrade version release",
     },
     licenses: {
       name: "Licenses & third-party notices",

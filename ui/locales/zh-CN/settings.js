@@ -3,7 +3,7 @@ export default {
   tabs: {
     general: "常规",
     appearance: "外观",
-    modelflare: "Modelflare",
+    modelflare: "模型与服务商",
     computer: "电脑操作",
     connections: "连接",
     privacy: "隐私与安全",
@@ -111,8 +111,14 @@ export default {
     },
     selfEvo: {
       name: "自我迭代与代码自治",
-      sub: "开启后，机器人自动绑定自身源码或热覆盖层目录 (./)，可按指令自主修改界面、新增插件与沉淀技能",
+      sub: "安装版可新增技能和兼容插件；源码工作区可按 Git 流程迭代完整仓库",
       keys: "自我迭代 代码 自治 热更新 插件 技能 self evolution",
+    },
+    selfEvoStatus: {
+      name: "自我迭代提示",
+      uiArchived: "旧版界面覆盖已归档至 {path}，当前使用官方界面",
+      pluginIssues: "有 {count} 个插件已停用，请修复对应清单后再启用",
+      keys: "自我迭代 归档 界面 插件 清单 停用",
     },
     sendKey: {
       name: "发送消息",
@@ -375,6 +381,20 @@ export default {
     version: {
       name: "版本",
       keys: "version",
+    },
+    update: {
+      name: "应用更新",
+      sub: "macOS 会检查正式稳定版；只有你主动选择时才会下载和重启",
+      available: "发现新版 {version}",
+      downloading: "正在下载：{percent}%",
+      downloaded: "新版 {version} 已下载，可以安装",
+      error: "更新失败：{error}",
+      checking: "正在检查更新…",
+      current: "已是最新版本",
+      unsupported: "当前版本不支持自动更新",
+      download: "下载",
+      install: "重启并安装",
+      keys: "更新 升级 版本 release",
     },
     licenses: {
       name: "许可与第三方声明",

@@ -4,7 +4,7 @@
 // 有事在等你时，机器人列表上方多一行「需要你 N」（没事时没有这一行）；机器人行的第二行换成最早那件事。
 import { useEffect, useRef, useState } from "preact/hooks";
 import { html, Icon, IconButton, Menu, Popover, Skeleton } from "../components/ui.js";
-import { BotAvatar } from "../components/avatar.js";
+import { BotAvatar, useAvatarStudio } from "../components/avatar.js";
 import { GuidePill } from "../components/guide.js";
 import { api } from "../lib/api.js";
 import { confirmSheet, failed, toast } from "../lib/store.js";
@@ -50,17 +50,25 @@ function LowBalance({ account }) {
   </a>`;
 }
 
-export function Sidebar({ bots, botsError, reloadBots, selectedId, view, previews, pending, working, needs = { n: 0, bots: {} }, username, account, onNew, onSelect, onNeeds, onDeleted, onOpenSettings, onBotSettings, onGuide }) {
+export function Sidebar({ bots, botsError, reloadBots, selectedId, view, previews, pending, working, needs = { n: 0, bots: {} }, username, account, onNew, onSelect, onNeeds, onSteward, onStudio, onDeleted, onOpenSettings, onBotSettings, onGuide }) {
+  const studio = useAvatarStudio(false);
   const [q, setQ] = useState("");
   const [ctx, setCtx] = useState(null); // 行的操作菜单：右键 { bot, x, y }，或者"更多"按钮 { bot, el }
   const [renaming, setRenaming] = useState("");
   const [renameText, setRenameText] = useState("");
+  const [specialistsOpen, setSpecialistsOpen] = useState(false);
+  const [companion, setCompanion] = useState({ supported: false, visible: false });
   const root = useRef(null);
   const searchRef = useRef(null);
   const renameRef = useRef(null);
   useEffect(() => {
     if (renaming) requestAnimationFrame(() => (renameRef.current?.focus(), renameRef.current?.select()));
   }, [renaming]);
+  useEffect(() => {
+    api("/steward/companion").then((d) => d && setCompanion(d)).catch(() => {});
+  }, []);
+  const toggleCompanion = () =>
+    api("/steward/companion", { method: "POST", body: {} }).then((d) => d && setCompanion(d)).catch(failed);
 
   const rename = async (bot) => {
     const n = renameText.trim();
@@ -86,19 +94,48 @@ export function Sidebar({ bots, botsError, reloadBots, selectedId, view, preview
 
   const needle = q.trim().toLowerCase();
   const list = (bots || []).filter((b) => !needle || b.name.toLowerCase().includes(needle) || (previews[b.id]?.text || "").toLowerCase().includes(needle));
+  const primary = (bots || []).find((b) => b.id === "default") || (bots || [])[0];
+  const primaryNeeds = primary ? (needs.bots[primary.id]?.n || pending[primary.id] || 0) : 0;
+  const primaryWorking = !!(primary && working[primary.id]);
+  const showSpecialists = specialistsOpen || !!needle || (bots && bots.length > 1) || view === "new" || view === "bot-settings";
 
   return html`<aside class="side" ref=${root} aria-label=${t("sidebar.bots")}>
     <div class="side-top">
-      <span class="side-brand"><img src="/amb/static/assets/favicon-64.png" alt="" /><span>AnyModelBot</span></span>
+      <span class="side-brand"><img src="/amb/static/assets/favicon-64.png" alt="" /><span>${t("steward.nav.brand")}</span></span>
       <${IconButton} icon="plus" iconSize="md" label=${t("sidebar.newShortcut")} on=${view === "new"} onClick=${onNew} />
     </div>
-    <label class="side-search">
-      <${Icon} name="search" size="sm" />
-      <input ref=${searchRef} type="search" placeholder=${t("common.search")} aria-label=${t("sidebar.search")} value=${q} onInput=${(e) => setQ(e.target.value)}
-        onKeyDown=${(e) => e.key === "Escape" && q && (e.stopPropagation(), setQ(""))} />
-    </label>
-    <nav class="side-list" aria-label=${t("sidebar.list")}>
-      <${NeedsRow} count=${needs.n} on=${view === "needs"} onClick=${onNeeds} />
+    ${primary && html`<div class="side-hero">
+      <${BotAvatar} bot=${primary} useActivePack=${primary.id === "default"} size=${40} state=${primaryNeeds > 0 ? "waiting" : primaryWorking ? "working" : "idle"} />
+      <div class="side-hero-info">
+        <div class="side-hero-name">${studio?.activePack?.name || primary.name}</div>
+        <div class="side-hero-sub">${t("steward.nav.primaryBadge")}</div>
+      </div>
+      ${companion.supported && html`<${IconButton} icon="spark" iconSize="sm" on=${companion.visible}
+        label=${t(companion.visible ? "steward.nav.companionOn" : "steward.nav.companionOff")} onClick=${toggleCompanion} />`}
+    </div>`}
+    <div class="side-list">
+      <div class="side-nav-group">
+        <button type="button" class=${`nav-item${view === "chat" ? " sel" : ""}`} onClick=${() => onSelect(primary?.id)}>
+          <${Icon} name="chat" size="md" /><span>${t("steward.nav.chat")}</span>
+        </button>
+        <button type="button" class=${`nav-item${view === "steward" ? " sel" : ""}`} onClick=${onSteward}>
+          <${Icon} name="pulse" size="md" /><span>${t("steward.nav.hub")}</span>
+        </button>
+        <button type="button" class=${`nav-item${view === "studio" ? " sel" : ""}`} onClick=${onStudio}>
+          <${Icon} name="palette" size="md" /><span>${t("steward.nav.studio")}</span>
+        </button>
+        <${NeedsRow} count=${needs.n} on=${view === "needs"} onClick=${onNeeds} />
+      </div>
+      <label class="side-search">
+        <${Icon} name="search" size="sm" />
+        <input ref=${searchRef} type="search" placeholder=${t("common.search")} aria-label=${t("sidebar.search")} value=${q} onInput=${(e) => setQ(e.target.value)}
+          onKeyDown=${(e) => e.key === "Escape" && q && (e.stopPropagation(), setQ(""))} />
+      </label>
+      <button type="button" class="side-specialists-toggle" aria-expanded=${showSpecialists} onClick=${() => setSpecialistsOpen((v) => !v)}>
+        <span>${t("steward.nav.specialists", { count: list.length })}</span>
+        <${Icon} name=${showSpecialists ? "chevDown" : "chevRight"} size="xs" />
+      </button>
+      ${showSpecialists && html`<nav aria-label=${t("sidebar.list")}>
       ${view === "new" && html`<div class="thread sel" aria-current="page"><${BotAvatar} neutral size=${38} />
         <span class="body"><span class="line"><span class="title">${t("sidebar.newBot")}</span></span><span class="line"><span class="snip">${t("sidebar.creating")}</span></span></span></div>`}
       ${botsError && html`<div class="side-empty"><span>${t("sidebar.loadFailed")}</span><button type="button" class="btn" onClick=${reloadBots}>${t("common.retry")}</button></div>`}
@@ -120,7 +157,7 @@ export function Sidebar({ bots, botsError, reloadBots, selectedId, view, preview
         return html`<div class="thread-item" key=${b.id}>
           <button type="button" class=${`thread bot-hover${sel ? " sel" : ""}`} aria-current=${sel ? "page" : undefined}
             onClick=${() => onSelect(b.id)} onContextMenu=${(e) => { e.preventDefault(); setCtx({ bot: b, x: e.clientX, y: e.clientY }); }}>
-            <span class="avatar-wrap"><${BotAvatar} bot=${b} size=${38} state=${n > 0 ? "waiting" : working[b.id] ? "working" : "idle"} />${working[b.id] && html`<span class="working-dot" title=${t("sidebar.working")}></span>`}</span>
+            <span class="avatar-wrap"><${BotAvatar} bot=${b} useActivePack=${b.id === "default"} size=${38} state=${n > 0 ? "waiting" : working[b.id] ? "working" : "idle"} />${working[b.id] && html`<span class="working-dot" title=${t("sidebar.working")}></span>`}</span>
             <span class="body">
               <span class="line"><span class="title">${b.name}</span>${pv?.at && html`<span class="when num">${fmtAgo(pv.at)}</span>`}</span>
               <span class="line"><span class="snip">${nd?.line || (working[b.id] ? t("sidebar.workingNow") : pv?.text || t("sidebar.noChats"))}</span>${n > 0 && html`<span class="badge count" title=${t("sidebar.needs", { count: n })}>${n}</span>`}</span>
@@ -130,7 +167,8 @@ export function Sidebar({ bots, botsError, reloadBots, selectedId, view, preview
             onClick=${(e) => { const el = e.currentTarget; setCtx((c) => (c && c.el && c.bot.id === b.id ? null : { bot: b, el })); }} />
         </div>`;
       })}
-    </nav>
+      </nav>`}
+    </div>
     <${LowBalance} account=${account} />
     ${bots && bots.length > 0 && html`<${GuidePill} onGo=${onGuide} />`}
     <div class="side-foot"><${AccountButton} username=${username} account=${account} onSettings=${() => onOpenSettings()} onModelflare=${() => onOpenSettings("modelflare")} /></div>

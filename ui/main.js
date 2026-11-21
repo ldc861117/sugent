@@ -10,7 +10,9 @@ import { SettingsScreen, SettingsSide, TABS } from "./screens/settings.js";
 import { BotSettingsScreen } from "./screens/bot-settings.js";
 import { NewBotScreen } from "./screens/new-bot.js";
 import { NeedsYouScreen } from "./screens/needs-you.js";
-import { BotAvatar, MAIN_CHAR, charOf } from "./components/avatar.js";
+import { BotAvatar, MAIN_CHAR, charOf, useAvatarStudio } from "./components/avatar.js";
+import { StewardHubScreen, CoolingUndoBanner } from "./components/jarvis-workbench.js";
+import { AvatarStudioScreen } from "./components/avatar-studio.js";
 import { Onboarding } from "./screens/onboarding.js";
 import { CoachMark } from "./components/guide.js";
 import { api } from "./lib/api.js";
@@ -21,11 +23,13 @@ import { prefs, setPrefs } from "./lib/prefs.js";
 import { usePresence } from "./design/motion.js";
 import { t, useLang, adoptServerLang, changeLang, getLangPref, LANG_NAMES } from "./lib/i18n.js";
 
-// —— 路由：#/chat/<bot> · #/new · #/needs · #/settings/<tab>[/<row>] · #/bot/<bot>/settings[/<section>] ——
+// —— 路由：#/chat/<bot> · #/steward · #/studio · #/new · #/needs · #/settings/<tab>[/<row>] · #/bot/<bot>/settings[/<section>] ——
 function parseHash() {
   const [kind, a, b, c] = location.hash.replace(/^#\/?/, "").split("/").map((x) => decodeURIComponent(x || ""));
   if (kind === "settings") return { view: "settings", tab: TABS.some(([t]) => t === a) ? a : "general", row: b || "" };
   if (kind === "bot" && a && b === "settings") return { view: "bot-settings", botId: a, section: c || "" };
+  if (kind === "steward") return { view: "steward" };
+  if (kind === "studio") return { view: "studio" };
   if (kind === "new") return { view: "new" };
   if (kind === "needs") return { view: "needs" };
   if (kind === "models") return { view: "settings", tab: "modelflare", row: "" }; // 旧链接
@@ -123,7 +127,7 @@ function Palette({ commands, onClose }) {
 }
 
 /** 环境光色相（OKLCH 色相角）：和头像角色的主色一致 */
-const AURA_HUE = { blue: 245, yellow: 95, green: 155, red: 25, purple: 305, orange: 55 };
+const AURA_HUE = { "sugent-core": 84, blue: 245, yellow: 95, green: 155, red: 25, purple: 305, orange: 55 };
 
 function App() {
   // 订阅界面语言：切换语言时整棵树跟着重渲染（子组件里的 t() 都在渲染时取）
@@ -137,6 +141,7 @@ function App() {
     if (settings) adoptServerLang(settings.lang);
   }, [settings && settings.lang]);
   const connected = !!(mf && (mf.mode === "external" || mf.connected));
+  const studio = useAvatarStudio(connected);
   const [botsData, botsErr, reloadBots] = useLoader(() => (connected ? api("/bots") : Promise.resolve(null)), [connected]);
   const [modelsData, , loadModels] = useLoader(() => (connected ? api("/models") : Promise.resolve(null)), [connected]);
   // Modelflare 账户与余额：后端每 5 分钟读一次；界面每分钟取快照，切回窗口时请后端立刻刷新
@@ -283,6 +288,11 @@ function App() {
     if (route.view !== "chat") openChat();
   };
   const openNeeds = () => go("/needs");
+  const openSteward = () => go("/steward");
+  const openStudio = () => go("/studio");
+  useEffect(() => {
+    window.__openSugentJarvisWorkbench = () => go("/steward");
+  }, []);
   // 「需要你」里的重新扫码：去这个机器人的对话，打开信息面板（渠道在最上面）
   const relogin = () => openSettings("connections");
   useEffect(() => {
@@ -311,6 +321,9 @@ function App() {
       } else if (mod(e) && e.shiftKey && e.key.toLowerCase() === "i") {
         e.preventDefault();
         if (route.view === "chat") setInfoOpen((v) => !v);
+      } else if (mod(e) && e.key.toLowerCase() === "j") {
+        e.preventDefault();
+        route.view === "steward" ? openChat() : openSteward();
       } else if (mod(e) && !e.shiftKey && e.key.toLowerCase() === "n") {
         e.preventDefault();
         newBot();
@@ -318,6 +331,7 @@ function App() {
         const t = e.target;
         const typing = t && (t.tagName === "TEXTAREA" || t.tagName === "INPUT");
         if (route.view === "bot-settings" && !typing) openChat(route.botId);
+        else if ((route.view === "steward" || route.view === "studio") && !typing) openChat();
         else if (route.view === "new" && !typing && bots && bots.length) openChat();
         else if (route.view === "settings" && !typing) openChat();
         else if (route.view === "needs" && !typing) openChat();
@@ -331,6 +345,8 @@ function App() {
   // keys：搜索用的关键词（不显示），两种语言的词典各有一份
   const setLang = (l) => changeLang(l).then(() => toast(t("common.saved"))).catch(failed);
   const commands = [
+    { label: t("steward.cmd.hub"), kbd: isMac ? "⌘J" : "Ctrl+J", keys: t("steward.cmd.hubKeys"), run: openSteward },
+    { label: t("steward.cmd.studio"), keys: t("steward.cmd.studioKeys"), run: openStudio },
     { label: t("app.cmd.settings"), kbd: isMac ? "⌘," : "Ctrl+,", keys: t("app.cmd.settingsKeys"), run: () => openSettings() },
     { label: t("app.cmd.newBot"), kbd: isMac ? "⌘N" : "Ctrl+N", keys: t("app.cmd.newBotKeys"), run: newBot },
     ...(needs.n > 0 ? [{ label: t("app.cmd.needs", { count: needs.n }), keys: t("app.cmd.needsKeys"), run: openNeeds }] : []),
@@ -369,21 +385,24 @@ function App() {
   const panelBot = view === "chat" && infoOpen && bot;
   const shownPanel = panelFx.mounted ? panelBot || lastPanel.current : null;
   const routedBot = view === "bot-settings" && bots ? bots.find((b) => b.id === route.botId) : null;
-  // 环境光的色相跟着当前机器人角色的主色（设置页和新建页用缺省的冷色）
+  // 环境光的色相跟着当前机器人角色的主色（主助手与管家/工坊视图跟随形象工坊当前皮肤）
   const auraBot = view === "chat" ? bot : view === "bot-settings" ? routedBot : null;
-  const auraHue = (auraBot && AURA_HUE[charOf(auraBot)]) || 250;
+  const useStudioHue = view === "steward" || view === "studio" || (auraBot && auraBot.id === "default");
+  const auraHue = (useStudioHue && studio?.activePack?.auraHue) || (auraBot && AURA_HUE[charOf(auraBot)]) || 84;
   return html`<div class=${`app${panelBot ? " with-panel" : ""}`} ref=${appRef} style=${{ "--aura-hue": String(auraHue) }}>
     ${view === "settings"
       ? html`<${SettingsSide} tab=${route.tab} query=${settingsQ} onQuery=${setSettingsQ} onTab=${(t) => openSettings(t)} onBack=${() => openChat()}
           username=${status && status.username} account=${managed ? account : null} />`
       : html`<${Sidebar} bots=${bots} botsError=${botsErr} reloadBots=${reloadBots} selectedId=${bot && bot.id} view=${view === "chat" && bots && !bots.length ? "new" : view}
           previews=${previews} pending=${pending} working=${working} needs=${needs} username=${status && status.username} account=${managed ? account : null}
-          onNew=${newBot} onSelect=${openChat} onNeeds=${openNeeds} onDeleted=${onDeleted} onOpenSettings=${(tab) => openSettings(tab)} onBotSettings=${openBotSettings} onGuide=${startGuide} />`}
+          onNew=${newBot} onSelect=${openChat} onNeeds=${openNeeds} onSteward=${openSteward} onStudio=${openStudio} onDeleted=${onDeleted} onOpenSettings=${(tab) => openSettings(tab)} onBotSettings=${openBotSettings} onGuide=${startGuide} />`}
     <${Splitter} class="split-side" size="--side-w" label=${t("app.resizeSide")} value=${sideW} room=${room("--panel-track")} onCommit=${(v) => setPrefs({ sideW: v })} />
     <main class="main">
       ${view === "chat" && bot && html`<${ChatScreen} key=${bot.id} bot=${bot} models=${models} modelsError=${modelsError} reloadModels=${reloadModels}
         defaultModel=${settings && settings.defaultModel} infoOpen=${infoOpen} onToggleInfo=${() => setInfoOpen((v) => !v)}
         onWorking=${onWorking} pending=${pending[bot.id] || 0} serverBusy=${!!agentWorking[bot.id]} onOpenSettings=${openSettings} onOpenBotSettings=${openBotSettings} onBotUpdated=${onBotUpdated} />`}
+      ${view === "steward" && html`<${StewardHubScreen} />`}
+      ${view === "studio" && html`<${AvatarStudioScreen} />`}
       ${(view === "new" || (view === "chat" && bots && !bots.length)) && html`<${NewBotScreen} first=${!!bots && !bots.length}
         onCreated=${(b) => { reloadBots(); openChat(b.id); }} onCancel=${bots && bots.length ? () => openChat() : null} />`}
       ${view === "settings" && html`<${SettingsScreen} tab=${route.tab} query=${settingsQ} onQuery=${setSettingsQ} onTab=${(t) => openSettings(t)} focusRow=${route.row}
@@ -402,6 +421,7 @@ function App() {
     ${shownPanel && html`<${InfoPanel} key=${shownPanel.id} bot=${shownPanel} leaving=${panelFx.leaving} onClose=${() => setInfoOpen(false)}
       onOpenBotSettings=${() => openBotSettings(shownPanel.id)} onOpenChat=${() => setInfoOpen(false)} onOpenConnections=${() => openSettings("connections")} />`}
     <${CoachMark} bot=${view === "chat" ? bot : null} view=${view} infoOpen=${!!panelBot} />
+    <${CoolingUndoBanner} onChanged=${pollWorking} />
     ${palette && html`<${Palette} commands=${commands} onClose=${() => setPalette(false)} />`}
     <${DialogHost} />
     <${Toasts} />

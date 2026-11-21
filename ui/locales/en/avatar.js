@@ -8,5 +8,7 @@ export default {
     red: { name: "Beat", about: "Headset on, it moves to the beat." },
     purple: { name: "Crystal", about: "A crystal on top that catches the light." },
     orange: { name: "Pilot", about: "Goggles down, ready for takeoff." },
+    "sugent-core": { name: "Core", about: "Matte obsidian ceramic full-body companion with minimal glow." },
+    "clay-atelier": { name: "Atelier", about: "2.5-head matte white bisque porcelain miniature sculpture." },
   },
 };

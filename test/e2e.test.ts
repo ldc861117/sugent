@@ -6,7 +6,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { App } from "../src/app.js";
+import { App, type DesktopHooks, type DesktopUpdateStatus } from "../src/app.js";
 import { loadConfig } from "../src/config.js";
 import { FakeFeishu, feishuEvent, mockIlink, mockOpenAI, until } from "./helpers.js";
 
@@ -99,6 +99,45 @@ describe("飞书 E2E", () => {
     feishu.onMessage!(feishuEvent("新开始", { chatId: "oc_m" }));
     await ch.idle();
     expect(llm.calls.at(-1)!.messages.filter((m: any) => m.role !== "system")).toHaveLength(1);
+  });
+});
+
+describe("桌面版更新 API", () => {
+  it("仅桌面钩子存在时开放状态、下载和安装操作", async () => {
+    expect((await api("/desktop/update")).status).toBe(400);
+    expect((await api("/desktop/update/download", { method: "POST", body: {} })).status).toBe(400);
+    expect((await api("/desktop/update/install", { method: "POST", body: {} })).status).toBe(400);
+    expect((await api("/desktop/self-evolution-status")).status).toBe(400);
+
+    let status: DesktopUpdateStatus = { supported: true, state: "available", currentVersion: "1.0.0", version: "1.1.0", releaseNotes: "Fixes" };
+    let installed = 0;
+    const hooks = {
+      updateStatus: () => status,
+      downloadUpdate: () => (status = { ...status, state: "downloading", percent: 0 }),
+      installUpdate: () => installed++,
+    } as unknown as DesktopHooks;
+    app.desktop = hooks;
+    try {
+      const overlay = path.join(dataDir, "self-repo");
+      fs.mkdirSync(path.join(overlay, "extensions", "plugins"), { recursive: true });
+      fs.writeFileSync(path.join(overlay, "extensions", "plugins", "legacy.mjs"), "export default {};\n");
+      fs.writeFileSync(path.join(overlay, "UI_OVERLAY_DISABLED.md"), "旧界面已归档。\n");
+      expect((await api("/desktop/self-evolution-status")).json).toMatchObject({
+        packaged: false,
+        uiOverlayArchived: true,
+        pluginIssues: [{ fileName: "legacy.mjs" }],
+      });
+      expect((await api("/desktop/update")).json).toMatchObject({ state: "available", currentVersion: "1.0.0", version: "1.1.0" });
+      expect((await api("/desktop/update/download", { method: "POST", body: {} })).json.state).toBe("downloading");
+      expect((await api("/desktop/update/install", { method: "POST", body: {} })).status).toBe(409);
+      status = { ...status, state: "downloaded", percent: 100 };
+      expect((await api("/desktop/update/install", { method: "POST", body: {} })).status).toBe(200);
+      expect(installed).toBe(1);
+      status = { supported: false, state: "unsupported", currentVersion: "1.0.0" };
+      expect((await api("/desktop/update/download", { method: "POST", body: {} })).status).toBe(409);
+    } finally {
+      app.desktop = undefined;
+    }
   });
 });
 
@@ -253,7 +292,11 @@ describe("Web 界面 / API", () => {
     const form = await fetch(base + "/amb/api/bots", { method: "POST", headers: { "content-type": "text/plain" }, body: "{}" });
     expect(form.status).toBe(415);
     for (const p of ["/magpie/", "/v1/models", "/api/providers"]) expect((await fetch(base + p)).status, p).toBe(404);
-    expect((await api("/providers", { method: "POST", body: { preset: "deepseek", apiKey: "x" } })).status).toBe(404);
+    const provForm = await fetch(base + "/amb/api/providers", { method: "POST", headers: { "content-type": "text/plain" }, body: "{}" });
+    expect(provForm.status).toBe(415);
+    const provList = await api("/providers");
+    expect(provList.status).toBe(200);
+    expect(Array.isArray(provList.json.providers)).toBe(true);
   });
   it("状态：版本号来自 package.json，不暴露网关端口与二进制路径", async () => {
     const st = await api("/status");

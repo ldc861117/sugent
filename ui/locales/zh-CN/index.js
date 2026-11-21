@@ -24,5 +24,6 @@ import needs from "./needs.js";
 import rules from "./rules.js";
 import access from "./access.js";
 import perms from "./perms.js";
+import steward from "./steward.js";
 
-export default { common, app, time, settings, account, pwsh, chat, info, markdown, notify, troubleshoot, onboarding, newBot, botSettings, sidebar, avatar, models, ui, guide, activity, perms, access, tasks, needs, rules };
+export default { common, app, time, settings, account, pwsh, chat, info, markdown, notify, troubleshoot, onboarding, newBot, botSettings, sidebar, avatar, models, ui, guide, activity, perms, access, tasks, needs, rules, steward };
