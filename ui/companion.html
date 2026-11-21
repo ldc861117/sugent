@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Sugent Companion</title>
+  <script>
+    (function () {
+      var root = document.documentElement;
+      root.classList.add("companion-mode");
+      var mq = function (q) { return window.matchMedia(q).matches; };
+      var m = "system";
+      try { m = localStorage.getItem("amb-theme") || "system"; } catch (_) {}
+      var dark = m === "dark" || (m !== "light" && mq("(prefers-color-scheme: dark)"));
+      root.setAttribute("data-theme", dark ? "dark" : "light");
+      var norm = function (s) { s = String(s || "").toLowerCase(); return s.indexOf("zh") === 0 ? "zh-CN" : s.indexOf("en") === 0 ? "en" : ""; };
+      var lang = "";
+      try { lang = norm(localStorage.getItem("amb-lang")); } catch (_) {}
+      if (!lang) { var ls = navigator.languages && navigator.languages.length ? navigator.languages : [navigator.language]; for (var i = 0; i < ls.length && !lang; i++) lang = norm(ls[i]); }
+      root.setAttribute("lang", lang || "zh-CN");
+      root.setAttribute("data-text", "md");
+      root.setAttribute("data-font", "system");
+      root.setAttribute("data-motion", mq("(prefers-reduced-motion: reduce)") ? "reduce" : "full");
+      root.setAttribute("data-glass", mq("(prefers-reduced-transparency: reduce)") ? "off" : "on");
+    })();
+  </script>
+  <link rel="stylesheet" href="/amb/static/design/index.css" />
+  <link rel="stylesheet" href="/amb/static/css/companion.css" />
+  <script type="importmap">
+    { "imports": { "preact": "/amb/vendor/preact.mjs", "preact/hooks": "/amb/vendor/hooks.mjs", "htm": "/amb/vendor/htm.mjs" } }
+  </script>
+</head>
+<body>
+  <div id="companion-app"></div>
+  <script type="module" src="/amb/static/companion.js"></script>
+</body>
+</html>

@@ -1,0 +1,180 @@
+/* Codex 式桌面透明浮动伴侣样式（@layer app）：全量复用设计系统语义 token */
+@layer app {
+  :root.companion-mode,
+  :root.companion-mode body {
+    background: transparent;
+    overflow: hidden;
+  }
+
+  .comp-shell {
+    position: relative;
+    width: 100vw;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    justify-content: flex-end;
+    padding: var(--space-2);
+    gap: var(--space-2);
+    user-select: none;
+  }
+
+  .comp-shell.left-dock {
+    align-items: flex-start;
+  }
+
+  .comp-shell.left-dock .comp-dock-row {
+    flex-direction: row-reverse;
+  }
+
+  .comp-card {
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2-5);
+    padding: var(--space-3);
+    border-radius: var(--r-pane);
+    background: var(--grain), var(--glass-sheet);
+    backdrop-filter: var(--glass-filter-lg);
+    border: var(--hairline) solid var(--glass-edge);   /* 描边：桌面透明浮层玻璃卡片外边 */
+    box-shadow: var(--shadow-pop);
+    color: var(--fg);
+    --rise: var(--space-2);
+    animation: rise-in var(--dur-base) var(--ease-spring);
+  }
+
+  .comp-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-2);
+  }
+
+  .comp-title {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    min-width: 0;
+  }
+
+  .comp-name {
+    font-size: var(--fs-md);
+    font-weight: var(--fw-semibold);
+    color: var(--fg);
+  }
+
+  .comp-sub {
+    font-size: var(--fs-xs);
+    color: var(--muted);
+  }
+
+  .comp-actions {
+    display: flex;
+    align-items: center;
+    gap: var(--space-1);
+  }
+
+  .comp-approval {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    padding: var(--space-2-5);
+    border-radius: var(--r-well);
+    background: var(--well);
+  }
+
+  .comp-approval-text {
+    font-size: var(--fs-xs);
+    color: var(--fg-2);
+    line-height: var(--lh-snug);
+  }
+
+  .comp-reply {
+    max-height: 92px;
+    overflow-y: auto;
+    padding: var(--space-2) var(--space-2-5);
+    border-radius: var(--r-well);
+    background: var(--well);
+    font-size: var(--fs-xs);
+    color: var(--fg);
+    line-height: var(--lh-normal);
+    white-space: pre-wrap;
+  }
+}
+@layer app {
+  .comp-compose {
+    display: flex;
+    align-items: center;
+    gap: var(--space-1-5);
+  }
+
+  .comp-compose .field {
+    flex: 1;
+    min-width: 0;
+    height: var(--ctl-lg);
+    padding: 0 var(--space-2-5);
+    border-radius: var(--r-md);
+    background: var(--well);
+    border: var(--hairline) solid var(--ctl-edge);   /* 描边：快捷输入框 */
+    color: var(--fg);
+    font-size: var(--fs-sm);
+  }
+
+  .comp-dock-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+  }
+
+  .comp-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-1-5) var(--space-2-5);
+    border-radius: var(--r-full);
+    background: var(--grain), var(--glass-pop);
+    backdrop-filter: var(--glass-filter);
+    border: var(--hairline) solid var(--glass-edge);   /* 描边：桌面悬浮状态胶囊 */
+    box-shadow: var(--shadow-md);
+    font-size: var(--fs-xs);
+    color: var(--fg);
+    white-space: nowrap;
+  }
+
+  .comp-pill.cooling {
+    background: var(--amber-wash);
+    border: var(--hairline) solid var(--amber);   /* 描边：防社死冷静撤回警示条 */
+  }
+
+  .comp-orb {
+    position: relative;
+    width: 140px;
+    height: 152px;
+    display: grid;
+    place-items: center;
+    border-radius: var(--r-well);
+    cursor: grab;
+    transition: transform var(--t-fast);
+  }
+
+  .comp-orb:active {
+    cursor: grabbing;
+    transform: scale(var(--press));
+  }
+
+  .comp-orb.drop-over {
+    background: var(--accent-wash);
+    box-shadow: var(--ring);
+    transform: scale(1.06);
+  }
+
+  .comp-toast {
+    padding: var(--space-1) var(--space-2-5);
+    border-radius: var(--r-full);
+    background: var(--primary);
+    color: var(--on-primary);
+    font-size: var(--fs-xs);
+    box-shadow: var(--shadow-sm);
+    white-space: nowrap;
+  }
+}
