@@ -1,0 +1,669 @@
+import type { ArtifactComprehensionResult } from "./antigravity-artifacts.js";
+import type { DispatchOutcome } from "./antigravity-dispatcher.js";
+import type { CommandExecutionOutcome } from "./concierge-dispatcher.js";
+import type { ConciergeChannelKind } from "./concierge-envelope.js";
+import type { SugentKnowledgeGraph } from "./knowledge-graph.js";
+import type { StewardWorkbenchLike } from "./steward-conversation.js";
+import type {
+  CallerAccessDomain,
+  CommitmentItem,
+  ContextPartition,
+  GoalNorthStar,
+  RelationshipProfile,
+  ResourceEntry,
+  StewardshipLedger,
+  TrustTier,
+} from "./stewardship-ledger.js";
+import type { DropzoneChannel, DropzoneOutcome } from "./universal-dropzone.js";
+import type { VibeIngressChannel } from "./handoff-file-bridge.js";
+import type { RepoBindingRecord, UpsertRepoBindingInput } from "./repo-binding.js";
+import type { VibePipelineRecord } from "./vibe-coding-pipeline.js";
+import { formatCapabilityAwarenessPrompt, type CapabilityDescriptor } from "./capability-awareness.js";
+import type { AuthorizedFileMatch, ReadAuthorizedFileResult } from "./authorized-file-reader.js";
+
+export interface StewardLlmEndpoint {
+  baseUrl: string;
+  apiKey: string;
+  model: string;
+}
+
+export interface StewardLlmToolsPort<TWorkbench extends StewardWorkbenchLike = StewardWorkbenchLike> {
+  getWorkbench(callerDomain?: CallerAccessDomain): TWorkbench;
+  queryLedger(query: string, callerDomain: CallerAccessDomain): ReturnType<StewardshipLedger["queryContext"]>;
+  findArchiveResources(query: string, callerDomain: CallerAccessDomain): ResourceEntry[];
+  recallKnowledgeSubgraph?(query: string): Array<{ name: string; kind: string; summary: string }>;
+  upsertArchiveResource(input: { partition: ContextPartition; title: string; dueAt?: string; filePaths?: string[] }): ResourceEntry[];
+  mutateCommitment(input: {
+    action: "upsert" | "status";
+    id?: string;
+    partition?: ContextPartition;
+    direction?: CommitmentItem["direction"];
+    summary?: string;
+    counterpartyOrRef?: string;
+    dueAt?: string;
+    status?: CommitmentItem["status"];
+    callerDomain?: CallerAccessDomain;
+  }): { ok: true; commitment: CommitmentItem; workbench: TWorkbench };
+  mutateGoal(input: {
+    action: "upsert" | "status";
+    id?: string;
+    partition?: ContextPartition;
+    title?: string;
+    northStarCriterion?: string;
+    status?: GoalNorthStar["status"];
+    supersedeGoalId?: string;
+    callerDomain?: CallerAccessDomain;
+  }): { ok: boolean; errorCode?: string; message?: string; goal?: GoalNorthStar; activeGoals?: GoalNorthStar[]; workbench: TWorkbench };
+  mutateTrust(input: {
+    id: string;
+    action: "observe" | "promote_l3" | "downgrade";
+    ownerConfirmed?: boolean;
+    targetTier?: TrustTier;
+    callerDomain?: CallerAccessDomain;
+  }): { ok: boolean; errorCode?: string; message?: string; profile?: RelationshipProfile; workbench: TWorkbench };
+  submitDropzone(input: {
+    text: string;
+    channel?: DropzoneChannel;
+    partition?: ContextPartition;
+    callerDomain?: CallerAccessDomain;
+    filePaths?: string[];
+  }): Promise<{ ok: true; outcome: DropzoneOutcome; workbench: TWorkbench }>;
+  scanCadence(input?: { quietHoursActive?: boolean; calibrationDue?: boolean; callerDomain?: CallerAccessDomain }): {
+    emitNow: Array<{ urgency: string; title: string; threeLineBody: [string, string, string] }>;
+    foldToMorningDigest: Array<{ urgency: string; title: string; threeLineBody: [string, string, string] }>;
+    workbench: TWorkbench;
+  };
+  setQuietHours(active: boolean, callerDomain?: CallerAccessDomain): { quietHoursActive: boolean; workbench: TWorkbench };
+  setProjectTier(input: { projectKey: string; tier: 0 | 1 | 2; callerDomain?: CallerAccessDomain }): { workbench: TWorkbench };
+  markSessionViewed(input: { conversationId: string; callerDomain?: CallerAccessDomain }): { workbench: TWorkbench };
+  comprehendSession(input: { conversationId: string; projectKey: string; title?: string; callerDomain?: CallerAccessDomain }): Promise<ArtifactComprehensionResult>;
+  dispatchAntigravity(input: {
+    mode: "resume" | "new";
+    conversationId?: string;
+    prompt: string;
+    title?: string;
+    workspacePath?: string;
+  }): Promise<DispatchOutcome>;
+  executeConciergeCommand?(commandText: string, channel?: ConciergeChannelKind): Promise<CommandExecutionOutcome>;
+  bindSelfRepo?(opts?: { repoRoot?: string; targetAppBundlePath?: string }, callerDomain?: CallerAccessDomain): { ok: true; binding: RepoBindingRecord; workbench: TWorkbench };
+  upsertRepoBinding?(input: UpsertRepoBindingInput, callerDomain?: CallerAccessDomain): { ok: true; binding: RepoBindingRecord; workbench: TWorkbench };
+  startVibeTask?(input: { text: string; bindingQuery?: string; channel?: VibeIngressChannel; filePaths?: string[]; callerDomain?: CallerAccessDomain }): Promise<{ ok: boolean; message: string; pipeline?: VibePipelineRecord; workbench: TWorkbench }>;
+  decideVibeTask?(input: { pipelineId?: string; rawReplyText?: string; action?: "approve" | "revise" | "cancel" | "verify_now" | "relaunch_now"; feedback?: string; callerDomain?: CallerAccessDomain }): Promise<{ ok: boolean; message: string; pipeline?: VibePipelineRecord; workbench: TWorkbench }>;
+  searchAuthorizedFiles?(input: { query?: string; projectQuery?: string; conversationId?: string; callerDomain?: CallerAccessDomain; limit?: number }): AuthorizedFileMatch[];
+  readAuthorizedFile?(input: { filePath?: string; fileQuery?: string; projectQuery?: string; conversationId?: string; offsetChars?: number; maxChars?: number; callerDomain?: CallerAccessDomain }): ReadAuthorizedFileResult;
+}
+export const STEWARD_CAPABILITY_DESCRIPTORS: readonly CapabilityDescriptor[] = [
+  { toolName: "query_personal_memory", title: "五维个人记忆检索", summary: "查询目标、待办、联系人禁忌、价值红线/墓碑、档案与图谱", whenToUse: ["查目标/待办/红线/联系人/历史档案"] },
+  { toolName: "capture_note_or_todo", title: "静默记事与待办归档", summary: "快速记下随口交代的待办、临期提醒或本地档案", whenToUse: ["记一下/备忘/待办/存档案"] },
+  { toolName: "manage_focus_goals", title: "北极星主目标管理", summary: "新增、替换（上限 3 项）、暂停或达成重点目标", whenToUse: ["设目标/换目标/目标完成"] },
+  { toolName: "complete_todo", title: "待办销账", summary: "标记待办或承诺已完成并积累配合度", whenToUse: ["某事办妥了/搞定了/销账"] },
+  { toolName: "prepare_offline_errand", title: "线下事务前 80% 准备包", summary: "查清流程、翻齐本地证件与可复制话术", whenToUse: ["线下办理/政务/报销/无工具跑腿"] },
+  { toolName: "manage_messages", title: "社交消息耳麦代理", summary: "查看外部来信、稳健/积极拟稿、发前确认与缓冲期撤回", whenToUse: ["有人找我吗/回复某客户/撤回消息"] },
+  { toolName: "manage_antigravity", title: "Antigravity 会话观测与唤醒", summary: "查看开发项目实时进度、安全信封解读或唤醒原根会话", whenToUse: ["项目在跑啥/看会话进度/叫醒原会话"] },
+  { toolName: "manage_vibe_coding", title: "本地仓绑定与定制开发流水线", summary: "绑定本地源码仓、隔离 worktree 透传文件、方案拍板与安全重启", whenToUse: ["绑定仓库/定制开发/批复方案/安全重启"] },
+  { toolName: "read_authorized_file", title: "受控本地项目与制品全文读取", summary: "在已注册项目、绑定仓与 brain 制品目录检索并分段读取完整 .md/日志全文（单次最高 24000 字）", whenToUse: ["要看完整报告/.md全文/每日复盘/排查截断摘要"] },
+  { toolName: "manage_briefing_and_prefs", title: "简报巡检与隐私偏好", summary: "扫描今日提醒、开关免打扰或调整自治信任等级", whenToUse: ["今日简报/开免打扰/调整自治度"] },
+];
+const LLM_TOOLS = [
+  {
+    type: "function",
+    function: {
+      name: "query_personal_memory",
+      description: "查询主人的五维生命账本：重点目标、待办事项、人脉禁忌与偏好、价值红线/历史墓碑、本地档案与知识图谱。",
+      parameters: { type: "object", properties: { query: { type: "string", description: "检索关键词或主题，留空可总览" } }, required: ["query"] },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "capture_note_or_todo",
+      description: "把随口交代的备忘、文件或双向待办/临期事项静默记入本地账本与档案。",
+      parameters: {
+        type: "object",
+        properties: {
+          kind: { type: "string", enum: ["archive", "todo"] },
+          text: { type: "string" },
+          direction: { type: "string", enum: ["i_owe", "waiting_for", "expiring"] },
+          counterparty: { type: "string" },
+          dueAt: { type: "string" },
+          filePaths: { type: "array", items: { type: "string" } },
+        },
+        required: ["kind", "text"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "manage_focus_goals",
+      description: "管理主人的重点北极星目标（受最多 3 个活跃目标硬上限约束；若已满请返回现有 3 个目标请主人挑一个替换）。",
+      parameters: {
+        type: "object",
+        properties: {
+          action: { type: "string", enum: ["add", "replace", "achieve", "pause"] },
+          title: { type: "string" },
+          northStarCriterion: { type: "string" },
+          targetGoalQuery: { type: "string", description: "要替换/达成/暂停的旧目标名称或序号（如 1/2/3）" },
+        },
+        required: ["action"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "complete_todo",
+      description: "将某项挂账待办或承诺标记为已完成销账（同时自动积累 1 次无误配合记录）。",
+      parameters: { type: "object", properties: { todoQuery: { type: "string" } }, required: ["todoQuery"] },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "prepare_offline_errand",
+      description: "处理政务、就医、线下跑腿等无自动化 API 的事务，生成前 80% 准备清单、本地证件检索、可复制话术并挂跟进待办。",
+      parameters: { type: "object", properties: { taskDescription: { type: "string" } }, required: ["taskDescription"] },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "manage_messages",
+      description: "查看外部来信、按稳健/积极拟稿发送、发送自定义回复、在主人下轮明确确认后确认发送含金额回复，或撤回缓冲期内的外发消息。",
+      parameters: {
+        type: "object",
+        properties: {
+          action: { type: "string", enum: ["list", "send_preset_a", "send_preset_b", "send_custom", "confirm_pending", "undo_last"] },
+          peerQuery: { type: "string" },
+          customBody: { type: "string" },
+        },
+        required: ["action"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "manage_antigravity",
+      description: "查看本机 Antigravity 代码项目进展、经安全信封解读会话制品/成果、调整项目隐私档位、标记会话已处理、唤醒原根会话或新开任务。",
+      parameters: {
+        type: "object",
+        properties: {
+          action: { type: "string", enum: ["overview", "comprehend_session", "set_privacy", "mark_viewed", "wake_session", "new_session"] },
+          projectOrSessionQuery: { type: "string" },
+          privacyLevel: { type: "string", enum: ["private", "summary", "collab"] },
+          messageOrPrompt: { type: "string" },
+          title: { type: "string" },
+        },
+        required: ["action"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "manage_briefing_and_prefs",
+      description: "主动扫描今日提醒与早间简报、开关免打扰、或调整主人信任自治等级。",
+      parameters: {
+        type: "object",
+        properties: {
+          action: { type: "string", enum: ["get_briefing", "set_quiet_hours", "set_trust_mode"] },
+          quietHours: { type: "boolean" },
+          trustMode: { type: "string", enum: ["record_only", "whisper", "autonomous"] },
+        },
+        required: ["action"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "manage_vibe_coding",
+      description: "绑定本地代码仓库（含一键绑定 Sugent 自身源码）、向隔离工作区派发定制开发与透传文件、批准/修改方案或触发安全重启。",
+      parameters: {
+        type: "object",
+        properties: {
+          action: { type: "string", enum: ["status", "bind_self", "bind_repo", "start_task", "decide_task"] },
+          repoAlias: { type: "string" },
+          repoRoot: { type: "string" },
+          requirementText: { type: "string" },
+          filePaths: { type: "array", items: { type: "string" } },
+          pipelineId: { type: "string" },
+          decision: { type: "string", enum: ["approve", "revise", "cancel", "verify_now", "relaunch_now"] },
+          feedback: { type: "string" },
+        },
+        required: ["action"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "read_authorized_file",
+      description: "在已注册的本机项目目录、绑定代码仓、Antigravity brain 制品目录与个人档案库中检索并分页读取完整文本文件（突破摘要截断，支持 .md/.txt/.json/.log）。",
+      parameters: {
+        type: "object",
+        properties: {
+          action: { type: "string", enum: ["search", "read"] },
+          query: { type: "string", description: "文件名或关键词，如 2026-11-21_daily_review.md" },
+          filePath: { type: "string", description: "已知的授权文件绝对路径" },
+          projectQuery: { type: "string", description: "限定项目名称或关键词，如 airtoken" },
+          conversationId: { type: "string", description: "限定 Antigravity 会话 ID" },
+          offsetChars: { type: "number", description: "分段读取起始字符偏移，默认 0" },
+          maxChars: { type: "number", description: "单次返回最大字符数（500-24000，默认 12000）" },
+        },
+        required: ["action"],
+      },
+    },
+  },
+];
+const shortProj = (k: string): string => k.replace(/^repo:[^/]+\//, "").replace(/^local:[^:]+:/, "");
+const tierLabel = (t: 0 | 1 | 2): string => (t === 0 ? "私密（仅本机）" : t === 1 ? "脱敏摘要" : "深度协同");
+
+function matchItem<T>(items: readonly T[], query: string, getText: (it: T) => string): T | undefined {
+  const q = query.trim().toLowerCase();
+  if (!q) return items[0];
+  const ordMatch = q.match(/^[第]?\s*([1-9])\s*[个条项]?$/);
+  if (ordMatch?.[1]) {
+    const idx = Number(ordMatch[1]) - 1;
+    if (items[idx]) return items[idx];
+  }
+  const direct = items.find((it) => {
+    const txt = getText(it).toLowerCase();
+    return txt.includes(q) || q.includes(txt);
+  });
+  if (direct) return direct;
+  const han = Array.from(q).filter((c) => /\p{Script=Han}/u.test(c));
+  const toks = new Set([...(q.match(/[a-z0-9_-]{2,}/g) ?? []), ...han.slice(0, -1).map((c, i) => c + han[i + 1]!)]);
+  let best: T | undefined;
+  let bestScore = 0;
+  for (const it of items) {
+    const txt = getText(it).toLowerCase();
+    let score = 0;
+    for (const tok of toks) if (txt.includes(tok)) score += 1;
+    if (score > bestScore) { bestScore = score; best = it; }
+  }
+  return bestScore > 0 ? best : undefined;
+}
+
+function buildSystemPrompt(wb: StewardWorkbenchLike): string {
+  const goals = wb.ledger.goals.filter((g) => g.status === "active").map((g, i) => `${i + 1}. ${g.title}（${g.northStarCriterion}）`);
+  const commits = wb.ledger.commitments.filter((c) => c.status === "open" || c.status === "waiting_review").slice(0, 8).map((c) => `- ${c.summary} (${c.counterpartyOrRef})`);
+  const guards = wb.ledger.guardrails.slice(0, 6).map((g) => `- ${g.statement}`);
+  const contacts = wb.ledger.relationships.filter((r) => r.subjectType === "key_contact").slice(0, 5).map((r) => `- ${r.name}${r.taboos.length ? ` 忌讳:${r.taboos.join("；")}` : ""}`);
+  const msgCount = wb.concierge?.cards.length ?? 0;
+  const running = wb.antigravity.sessions
+    .filter((s) => s.isRunning)
+    .slice(0, 5)
+    .map((s) => `${s.projectDisplayName || shortProj(s.projectKey)}「${s.title || s.conversationId.slice(0, 8)}」(第${s.stepCount ?? 0}步${s.activeSubagentCount ? `/${s.activeSubagentCount}个活跃子代理` : ""})`);
+
+  const capBlock = wb.capabilities
+    ? formatCapabilityAwarenessPrompt(wb.capabilities, wb.vibeCoding?.bindings ?? [])
+    : "";
+
+  return [
+    "你是主人的贴身私人管家与生命幕僚（Sugent），围着主人本人生长，而不是技术控制台。",
+    "表达准则：全程用自然、简练、像真人助理聊天的中文直接回应（说人话）。绝对禁止暴露任何内部实现术语或代号（如 Epoch、T0/T1/T2、L0/L1/L3、superseded、CASCADE_RUN_STATUS、tool_calls、JSON 字段名）。隐私档位统一说“私密（仅本机）/ 脱敏摘要 / 深度协同”。",
+    "项目命名与状态铁律：称呼 Antigravity 项目时一律优先用工具返回的显示名（如 Andy-web），不要拿底层仓库后缀代替；当运行状态为“进行中/running”时说明任务正在后台跑，绝不可误说成“已处理完”或“正等你点头放行”，想看具体跑到哪一步请调用 manage_antigravity(action='comprehend_session')。",
+    "行动准则：遇到查询目标/待办/档案/来信/开发项目、读取完整本地 .md 或报告全文、记录事项、更改目标、处理来信、绑定仓或发起定制开发时，务必先调用对应工具获取真实现场数据或执行状态变更再回答，绝不靠猜或编造结果；工具返回 ok=false 时必须如实告知限制原因，绝不越权伪造成功。",
+    ...(capBlock ? ["", capBlock] : []),
+    "",
+    `当前状况速览（免打扰=${wb.quietHoursActive ? "开启" : "关闭"}，待回复外部来信=${msgCount}条，本机 Antigravity 主会话=${wb.antigravity.totalSessions}个）：`,
+    `重点目标(${goals.length}/3)：${goals.length ? goals.join(" | ") : "暂无"}`,
+    `未结待办：${commits.length ? commits.join("；") : "暂无"}`,
+    `正在运行中的开发任务：${running.length ? running.join(" | ") : "暂无"}`,
+    `价值红线与墓碑：${guards.length ? guards.join("；") : "暂无"}`,
+    `重要联系人：${contacts.length ? contacts.join("；") : "暂无"}`,
+  ].join("\n");
+}
+export class StewardLlmAgent<TWorkbench extends StewardWorkbenchLike = StewardWorkbenchLike> {
+  private turnSeq = 0;
+  private pendingDoubleConfirm?: { cardId: string; channel: ConciergeChannelKind; peerDisplayName: string; confirmHash: string; createdTurnSeq: number };
+
+  constructor(
+    private readonly opts: {
+      getEndpoint: () => StewardLlmEndpoint | undefined;
+      fetchImpl?: typeof fetch;
+      toolsPort: StewardLlmToolsPort<TWorkbench>;
+      recordUsageUsd?: (usd: number) => void;
+    },
+  ) {}
+
+  private async executeTool(name: string, args: Record<string, unknown>, domain: CallerAccessDomain, channel: DropzoneChannel): Promise<Record<string, unknown>> {
+    const p = this.opts.toolsPort;
+    const part: ContextPartition = domain === "owner_private" ? "personal_life" : domain;
+
+    if (name === "query_personal_memory") {
+      const q = String(args.query ?? "");
+      const ctx = p.queryLedger(q, domain);
+      const archives = p.findArchiveResources(q, domain);
+      const kg = domain === "owner_private" ? p.recallKnowledgeSubgraph?.(q) ?? [] : [];
+      return { ok: true, goals: ctx.goals, commitments: ctx.commitments, guardrails: ctx.guardrails, relationships: ctx.relationships, archives, kg };
+    }
+    if (name === "capture_note_or_todo") {
+      const text = String(args.text ?? "").trim();
+      if (args.kind === "todo") {
+        const c = p.mutateCommitment({
+          action: "upsert",
+          partition: part,
+          direction: (args.direction as CommitmentItem["direction"]) ?? "i_owe",
+          summary: text,
+          counterpartyOrRef: typeof args.counterparty === "string" && args.counterparty ? args.counterparty : "个人跟进",
+          ...(typeof args.dueAt === "string" ? { dueAt: args.dueAt } : {}),
+          callerDomain: domain,
+        });
+        return { ok: true, commitment: c.commitment };
+      }
+      const saved = p.upsertArchiveResource({
+        partition: part,
+        title: text || "备忘档案",
+        ...(typeof args.dueAt === "string" ? { dueAt: args.dueAt } : {}),
+        ...(Array.isArray(args.filePaths) ? { filePaths: args.filePaths.map(String) } : {}),
+      });
+      return { ok: true, archivedCount: saved.length, titles: saved.map((r) => r.title) };
+    }
+    if (name === "manage_focus_goals") {
+      const action = String(args.action ?? "add");
+      const active = p.getWorkbench("owner_private").ledger.goals.filter((g) => g.status === "active");
+      const target = typeof args.targetGoalQuery === "string" ? matchItem(active, args.targetGoalQuery, (g) => g.title) : undefined;
+      if (action === "achieve" || action === "pause") {
+        if (!target) return { ok: false, errorCode: "GOAL_NOT_FOUND", activeGoals: active.map((g, i) => ({ index: i + 1, title: g.title })) };
+        const res = p.mutateGoal({ action: "status", id: target.id, status: action === "pause" ? "paused" : "achieved", callerDomain: domain });
+        return { ok: res.ok, goal: res.goal };
+      }
+      const title = String(args.title ?? "").trim() || "未命名重点目标";
+      const criterion = String(args.northStarCriterion ?? "").trim() || "按期验收通过";
+      const partition: ContextPartition = /(健康|父母|家庭|生活|体检|房子)/.test(title) ? "personal_life" : "work_project";
+      const res = p.mutateGoal({ action: "upsert", partition, title, northStarCriterion: criterion, ...(target ? { supersedeGoalId: target.id } : {}), callerDomain: domain });
+      return res.ok ? { ok: true, goal: res.goal } : { ok: false, errorCode: res.errorCode, activeGoals: (res.activeGoals ?? active).map((g, i) => ({ index: i + 1, title: g.title, criterion: g.northStarCriterion })) };
+    }
+    if (name === "complete_todo") {
+      const open = p.getWorkbench("owner_private").ledger.commitments.filter((c) => c.status === "open" || c.status === "waiting_review");
+      const target = matchItem(open, String(args.todoQuery ?? ""), (c) => `${c.summary} ${c.counterpartyOrRef}`);
+      if (!target) return { ok: false, errorCode: "TODO_NOT_FOUND", openTodos: open.map((c, i) => ({ index: i + 1, summary: c.summary })) };
+      const res = p.mutateCommitment({ action: "status", id: target.id, status: "closed", callerDomain: domain });
+      return { ok: true, closedSummary: res.commitment.summary };
+    }
+    if (name === "prepare_offline_errand") {
+      const res = await p.submitDropzone({ text: String(args.taskDescription ?? ""), channel, callerDomain: domain, partition: part });
+      return { ok: true, outcome: res.outcome };
+    }
+    return this.executeExternalTool(name, args, domain, channel);
+  }
+  private async executeExternalTool(name: string, args: Record<string, unknown>, domain: CallerAccessDomain, channel: DropzoneChannel): Promise<Record<string, unknown>> {
+    const p = this.opts.toolsPort;
+    const wb = p.getWorkbench(domain);
+
+    if (name === "manage_messages") {
+      const cg = wb.concierge;
+      if (!cg) return { ok: false, errorCode: "CONCIERGE_NOT_AVAILABLE" };
+      const act = String(args.action ?? "list");
+      if (act === "list") {
+        return {
+          ok: true,
+          pendingCards: cg.cards.map((c) => ({ sender: c.peerDisplayName, channel: c.channel, summary: c.summary, draftA: c.draftA.body, draftB: c.draftB.body })),
+          coolingDispatches: cg.pendingDispatches.map((d) => ({ recipient: d.peerDisplayName, remainingSec: Math.ceil(d.remainingMs / 1000) })),
+        };
+      }
+      if (act === "undo_last") {
+        const d = cg.pendingDispatches[0];
+        if (!d || !p.executeConciergeCommand) return { ok: false, errorCode: "NOTHING_IN_COOLING_WINDOW" };
+        await p.executeConciergeCommand(`/undo ${d.dispatchId}`, d.channel);
+        return { ok: true, canceledRecipient: d.peerDisplayName };
+      }
+      if (act === "confirm_pending") {
+        const pending = this.pendingDoubleConfirm;
+        if (!pending || !p.executeConciergeCommand) return { ok: false, errorCode: "NO_PENDING_DOUBLE_CONFIRM" };
+        if (pending.createdTurnSeq >= this.turnSeq) {
+          return { ok: false, errorCode: "SAME_TURN_CONFIRM_FORBIDDEN", reason: "涉及金额或正式承诺，必须由主人在下一轮明确回复确认后才能发送" };
+        }
+        const res = await p.executeConciergeCommand(`/confirm ${pending.cardId} ${pending.confirmHash}`, pending.channel);
+        this.pendingDoubleConfirm = undefined;
+        return res.status === "cooling_off_scheduled"
+          ? { ok: true, recipient: pending.peerDisplayName, coolingWindowSec: Math.round(cg.coolingWindowMs / 1000) }
+          : { ok: false, errorCode: res.status, reason: res.reason };
+      }
+      const card = (typeof args.peerQuery === "string" ? matchItem(cg.cards, args.peerQuery, (c) => c.peerDisplayName) : undefined) ?? (cg.cards.length === 1 ? cg.cards[0] : undefined);
+      if (!card || !p.executeConciergeCommand) return { ok: false, errorCode: "MESSAGE_CARD_NOT_FOUND" };
+      if (act === "send_preset_a" || act === "send_preset_b") {
+        const opt = act === "send_preset_a" ? "A" : "B";
+        const draft = opt === "A" ? card.draftA : card.draftB;
+        const res = await p.executeConciergeCommand(`/send ${opt} ${card.cardId} ${draft.confirmHash}`, card.channel);
+        return res.status === "cooling_off_scheduled" ? { ok: true, recipient: card.peerDisplayName, sentBody: draft.body, coolingWindowSec: Math.round(cg.coolingWindowMs / 1000) } : { ok: false, errorCode: res.status, reason: res.reason };
+      }
+      const body = String(args.customBody ?? "").trim();
+      if (!body) return { ok: false, errorCode: "EMPTY_CUSTOM_BODY" };
+      const res = await p.executeConciergeCommand(`/edit ${card.cardId} ${body}`, card.channel);
+      if (res.status === "pending_double_confirm" && res.requiredConfirmHash) {
+        this.pendingDoubleConfirm = { cardId: card.cardId, channel: card.channel, peerDisplayName: card.peerDisplayName, confirmHash: res.requiredConfirmHash, createdTurnSeq: this.turnSeq };
+        return { ok: false, requiresDoubleConfirm: true, recipient: card.peerDisplayName, draftBody: body, reason: "包含金额或正式承诺，请先向主人确认是否发送" };
+      }
+      return res.status === "cooling_off_scheduled" ? { ok: true, recipient: card.peerDisplayName, sentBody: body, coolingWindowSec: Math.round(cg.coolingWindowMs / 1000) } : { ok: false, errorCode: res.status, reason: res.reason };
+    }
+    if (name === "manage_antigravity") return this.executeAntigravityTool(args, wb, domain);
+    if (name === "manage_vibe_coding") return this.executeVibeCodingTool(args, wb, domain, channel);
+    if (name === "read_authorized_file") return this.executeAuthorizedFileTool(args, domain);
+    return this.executePrefsTool(args, wb, domain);
+  }
+
+  private executeAuthorizedFileTool(args: Record<string, unknown>, domain: CallerAccessDomain): Record<string, unknown> {
+    const p = this.opts.toolsPort;
+    const act = String(args.action ?? (args.filePath || args.query ? "read" : "search"));
+    if (act === "search") {
+      if (!p.searchAuthorizedFiles) return { ok: false, errorCode: "FILE_SEARCH_UNAVAILABLE" };
+      const matches = p.searchAuthorizedFiles({
+        ...(typeof args.query === "string" ? { query: args.query } : {}),
+        ...(typeof args.projectQuery === "string" ? { projectQuery: args.projectQuery } : {}),
+        ...(typeof args.conversationId === "string" ? { conversationId: args.conversationId } : {}),
+        callerDomain: domain,
+      });
+      return { ok: true, count: matches.length, matches };
+    }
+    if (!p.readAuthorizedFile) return { ok: false, errorCode: "FILE_READ_UNAVAILABLE" };
+    return p.readAuthorizedFile({
+      ...(typeof args.filePath === "string" ? { filePath: args.filePath } : {}),
+      ...(typeof args.query === "string" ? { fileQuery: args.query } : {}),
+      ...(typeof args.projectQuery === "string" ? { projectQuery: args.projectQuery } : {}),
+      ...(typeof args.conversationId === "string" ? { conversationId: args.conversationId } : {}),
+      ...(typeof args.offsetChars === "number" ? { offsetChars: args.offsetChars } : {}),
+      ...(typeof args.maxChars === "number" ? { maxChars: args.maxChars } : {}),
+      callerDomain: domain,
+    });
+  }
+
+  private async executeVibeCodingTool(
+    args: Record<string, unknown>,
+    wb: TWorkbench,
+    domain: CallerAccessDomain,
+    channel: DropzoneChannel,
+  ): Promise<Record<string, unknown>> {
+    const p = this.opts.toolsPort;
+    const act = String(args.action ?? "status");
+    if (act === "status") {
+      return { ok: true, bindings: wb.vibeCoding?.bindings ?? [], pipelines: wb.vibeCoding?.pipelines ?? [] };
+    }
+    if (act === "bind_self" && p.bindSelfRepo) {
+      const res = p.bindSelfRepo({}, domain);
+      return { ok: true, binding: res.binding };
+    }
+    if (act === "bind_repo" && p.upsertRepoBinding) {
+      const repoRoot = String(args.repoRoot ?? "").trim();
+      const alias = String(args.repoAlias ?? "").trim() || repoRoot.split(/[/\\]/).filter(Boolean).pop() || "本地仓库";
+      const res = p.upsertRepoBinding({ alias, repoRoot }, domain);
+      return { ok: true, binding: res.binding };
+    }
+    if (act === "start_task" && p.startVibeTask) {
+      const vibeChannel: VibeIngressChannel = channel === "weixin" || channel === "feishu" ? channel : "sugent_app";
+      const res = await p.startVibeTask({
+        text: String(args.requirementText ?? "").trim(),
+        ...(typeof args.repoAlias === "string" ? { bindingQuery: args.repoAlias } : {}),
+        channel: vibeChannel,
+        ...(Array.isArray(args.filePaths) ? { filePaths: args.filePaths.map(String) } : {}),
+        callerDomain: domain,
+      });
+      return { ok: res.ok, message: res.message, ...(res.pipeline ? { pipeline: res.pipeline } : {}) };
+    }
+    if (act === "decide_task" && p.decideVibeTask) {
+      const res = await p.decideVibeTask({
+        ...(typeof args.pipelineId === "string" ? { pipelineId: args.pipelineId } : {}),
+        ...(typeof args.decision === "string" ? { action: args.decision as "approve" | "revise" | "cancel" | "verify_now" | "relaunch_now" } : {}),
+        ...(typeof args.feedback === "string" ? { feedback: args.feedback } : {}),
+        callerDomain: domain,
+      });
+      return { ok: res.ok, message: res.message, ...(res.pipeline ? { pipeline: res.pipeline } : {}) };
+    }
+    return { ok: false, errorCode: "VIBE_TOOL_UNAVAILABLE" };
+  }
+  private async executeAntigravityTool(args: Record<string, unknown>, wb: TWorkbench, domain: CallerAccessDomain): Promise<Record<string, unknown>> {
+    const p = this.opts.toolsPort;
+    const act = String(args.action ?? "overview");
+    const q = String(args.projectOrSessionQuery ?? "").trim();
+    const projDisplay = (pr: TWorkbench["antigravity"]["projects"][number]) => pr.displayName || shortProj(pr.projectKey);
+    const projSearch = (pr: TWorkbench["antigravity"]["projects"][number]) => [projDisplay(pr), ...(pr.aliases ?? []), shortProj(pr.projectKey), pr.projectKey, pr.title].filter(Boolean).join(" ");
+    const sessRunState = (s: TWorkbench["antigravity"]["sessions"][number]) =>
+      s.isRunning ? "running" : s.hasError ? "error" : s.supersededReasons?.some((r) => r === "user_viewed_in_ide" || r === "external_watermark") ? "viewed" : "idle";
+
+    if (act === "overview") {
+      const runningSessions = wb.antigravity.sessions
+        .filter((s) => s.isRunning)
+        .slice(0, 8)
+        .map((s) => ({ projectName: s.projectDisplayName || shortProj(s.projectKey), conversationId: s.conversationId, title: s.title, stepCount: s.stepCount ?? 0, activeSubagents: s.activeSubagentCount ?? 0 }));
+      return {
+        ok: true,
+        totalRootSessions: wb.antigravity.totalSessions,
+        foldedSubagents: wb.antigravity.totalSubagentsFolded,
+        runningSessions,
+        projects: wb.antigravity.projects.slice(0, 10).map((pr) => ({ name: projDisplay(pr), aliases: pr.aliases ?? [], runningSessions: pr.runningSessionCount ?? 0, totalSessions: pr.sessionCount, privacy: tierLabel(pr.policy.tier) })),
+        recentSessions: wb.antigravity.sessions.slice(0, 8).map((s) => ({ conversationId: s.conversationId, projectName: s.projectDisplayName || shortProj(s.projectKey), title: s.title, runState: sessRunState(s), stepCount: s.stepCount ?? 0, activeSubagents: s.activeSubagentCount ?? 0 })),
+      };
+    }
+    if (act === "set_privacy") {
+      const proj = matchItem(wb.antigravity.projects, q, projSearch);
+      if (!proj) return { ok: false, errorCode: "PROJECT_NOT_FOUND" };
+      const lvl = args.privacyLevel === "private" ? 0 : args.privacyLevel === "collab" ? 2 : 1;
+      p.setProjectTier({ projectKey: proj.projectKey, tier: lvl, callerDomain: domain });
+      return { ok: true, projectName: projDisplay(proj), privacy: tierLabel(lvl) };
+    }
+    if (act === "new_session") {
+      const prompt = String(args.messageOrPrompt ?? q).trim();
+      if (!prompt) return { ok: false, errorCode: "EMPTY_PROMPT" };
+      const out = await p.dispatchAntigravity({ mode: "new", prompt, ...(typeof args.title === "string" ? { title: args.title } : {}) });
+      return { ...out };
+    }
+    const matchedProj = q ? matchItem(wb.antigravity.projects, q, projSearch) : undefined;
+    const sessSearch = (s: TWorkbench["antigravity"]["sessions"][number]) => `${s.projectDisplayName ?? ""} ${s.title} ${shortProj(s.projectKey)} ${s.projectKey} ${s.conversationId}`;
+    const sess =
+      (matchedProj ? wb.antigravity.sessions.find((s) => s.projectKey === matchedProj.projectKey) : undefined) ??
+      matchItem(wb.antigravity.sessions, q, sessSearch) ??
+      wb.antigravity.sessions[0];
+    if (!sess) return { ok: false, errorCode: "SESSION_NOT_FOUND" };
+    if (act === "mark_viewed") {
+      p.markSessionViewed({ conversationId: sess.conversationId, callerDomain: domain });
+      return { ok: true, conversationId: sess.conversationId, title: sess.title };
+    }
+    if (act === "comprehend_session") {
+      const res = await p.comprehendSession({ conversationId: sess.conversationId, projectKey: sess.projectKey, title: sess.title, callerDomain: domain });
+      if (!res.allowed) return { ok: false, reason: res.reason, privacy: tierLabel(res.tier) };
+      return { ok: true, projectName: res.projectDisplayName, conversationId: res.conversationId, sessionTitle: sess.title, runState: res.runState, livePulse: res.livePulse, artifactsFound: res.artifactsFound, ...(res.artifactFilePaths?.length ? { artifactFilePaths: res.artifactFilePaths } : {}), summaryCard: res.threeLineCard, excerpt: res.artifactExcerpt, requiresApproval: res.requiresApproval };
+    }
+    const msg = String(args.messageOrPrompt ?? "").trim();
+    if (!msg) return { ok: false, errorCode: "EMPTY_MESSAGE" };
+    const out = await p.dispatchAntigravity({ mode: "resume", conversationId: sess.conversationId, prompt: msg, ...(typeof args.title === "string" ? { title: args.title } : {}) });
+    return { ...out };
+  }
+
+  private executePrefsTool(args: Record<string, unknown>, wb: TWorkbench, domain: CallerAccessDomain): Record<string, unknown> {
+    const p = this.opts.toolsPort;
+    const act = String(args.action ?? "get_briefing");
+    if (act === "set_quiet_hours") {
+      const next = p.setQuietHours(Boolean(args.quietHours), domain);
+      return { ok: true, quietHoursActive: next.quietHoursActive };
+    }
+    if (act === "set_trust_mode") {
+      const rel = wb.ledger.relationships.find((r) => r.subjectType === "owner_trust") ?? wb.ledger.relationships[0];
+      if (!rel) return { ok: false, errorCode: "NO_OWNER_TRUST_PROFILE" };
+      if (args.trustMode === "record_only" || args.trustMode === "whisper") {
+        const res = p.mutateTrust({ id: rel.id, action: "downgrade", targetTier: args.trustMode === "record_only" ? "L0_record_only" : "L1_whisper_prompt", callerDomain: domain });
+        return { ok: res.ok, trustMode: args.trustMode };
+      }
+      const res = p.mutateTrust({ id: rel.id, action: "promote_l3", ownerConfirmed: true, callerDomain: domain });
+      return res.ok ? { ok: true, trustMode: "autonomous" } : { ok: false, errorCode: res.errorCode, verifiedObservations: rel.verifiedObservations, requiredObservations: 3 };
+    }
+    const scan = p.scanCadence({ quietHoursActive: false, calibrationDue: true, callerDomain: domain });
+    return { ok: true, urgentItems: scan.emitNow.filter((c) => c.urgency === "urgent"), routineItems: scan.emitNow.filter((c) => c.urgency !== "urgent"), queuedMorningItems: scan.workbench.cadence.state.morningDigestQueue };
+  }
+  async runTurn(input: {
+    text: string;
+    history?: Array<{ role: "user" | "assistant"; content: string }>;
+    callerDomain?: CallerAccessDomain;
+    channel?: DropzoneChannel;
+  }): Promise<{ ok: true; reply: string; modelUsed: string; toolCallsExecuted: string[]; workbench: TWorkbench } | { ok: false; fallbackReason: string }> {
+    const endpoint = this.opts.getEndpoint();
+    if (!endpoint?.baseUrl || !endpoint.apiKey) {
+      return { ok: false, fallbackReason: "no_endpoint" };
+    }
+    this.turnSeq += 1;
+    const domain: CallerAccessDomain = input.callerDomain ?? "owner_private";
+    const channel: DropzoneChannel = input.channel ?? "web_ui";
+    const wb = this.opts.toolsPort.getWorkbench(domain);
+    const messages: Array<Record<string, unknown>> = [
+      { role: "system", content: buildSystemPrompt(wb) },
+      ...(input.history ?? []).slice(-10).map((m) => ({ role: m.role, content: m.content })),
+      { role: "user", content: input.text },
+    ];
+    const fetchFn = this.opts.fetchImpl ?? fetch;
+    const url = `${endpoint.baseUrl.replace(/\/+$/, "")}/chat/completions`;
+    const toolCallsExecuted: string[] = [];
+
+    try {
+      for (let round = 0; round < 5; round++) {
+        const res = await fetchFn(url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${endpoint.apiKey}`,
+            "User-Agent": "Sugent/0.1",
+          },
+          body: JSON.stringify({ model: endpoint.model, messages, tools: LLM_TOOLS }),
+          signal: AbortSignal.timeout(75_000),
+        });
+        if (!res.ok) {
+          const errBody = await res.text().catch(() => "");
+          return { ok: false, fallbackReason: `HTTP ${res.status}: ${errBody.slice(0, 200)}` };
+        }
+        const data = (await res.json()) as {
+          model?: string;
+          usage?: { prompt_tokens?: number; completion_tokens?: number };
+          choices?: Array<{ message?: { role?: string; content?: string | null; tool_calls?: Array<{ id: string; type?: string; function?: { name?: string; arguments?: string }; extra_content?: unknown }> } }>;
+        };
+        if (data.usage && this.opts.recordUsageUsd) {
+          const usd = ((data.usage.prompt_tokens ?? 0) * 3 + (data.usage.completion_tokens ?? 0) * 15) / 1_000_000;
+          if (usd > 0) this.opts.recordUsageUsd(usd);
+        }
+        const msg = data.choices?.[0]?.message;
+        if (!msg) return { ok: false, fallbackReason: "empty_choice" };
+
+        const calls = msg.tool_calls;
+        if (!calls || calls.length === 0) {
+          const reply = String(msg.content ?? "").trim();
+          if (!reply) return { ok: false, fallbackReason: "empty_reply" };
+          return { ok: true, reply, modelUsed: data.model || endpoint.model, toolCallsExecuted, workbench: this.opts.toolsPort.getWorkbench(domain) };
+        }
+
+        // Preserve msg.tool_calls verbatim (including extra_content.google.thought_signature) for Gemini 4 multi-turn tool loops.
+        messages.push({ role: "assistant", content: msg.content ?? null, tool_calls: calls });
+        for (const tc of calls) {
+          const fnName = String(tc.function?.name ?? "");
+          toolCallsExecuted.push(fnName);
+          let parsedArgs: Record<string, unknown> = {};
+          try { parsedArgs = JSON.parse(String(tc.function?.arguments ?? "{}")) as Record<string, unknown>; } catch { parsedArgs = {}; }
+          const toolOut = await this.executeTool(fnName, parsedArgs, domain, channel);
+          messages.push({ role: "tool", tool_call_id: tc.id, name: fnName, content: JSON.stringify(toolOut) });
+        }
+      }
+      return { ok: false, fallbackReason: "max_tool_rounds_exceeded" };
+    } catch (err) {
+      return { ok: false, fallbackReason: err instanceof Error ? err.message : String(err) };
+    }
+  }
+}
