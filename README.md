@@ -73,7 +73,7 @@ flowchart LR
   C -->|2. 结构化演进层| E[SugentKnowledgeGraph 实体关系图谱]
   E -->|exclusive: true 排他更新| F[自动归档过时边 supersededAt]
   E -->|K-Hop 邻域扩展| G[2 跳关联子图召回注入 Prompt]
-  E -->|reinforcements >= 3| H[自动结晶生成 dsh/skills/crystallized/*/SKILL.md]
+  E -->|reinforcements >= 3| H[自动结晶生成 dsh/<botId>/skills/<skill-name>/SKILL.md]
 ```
 
 1. **第一层：Prompt Cache 友好的三层冻结快照（`team` / `bot` / `group`）**
@@ -84,7 +84,7 @@ flowchart LR
    - **时效排他边（Temporal Conflict Resolution）**：当你更新某项目的默认模型或服务器配置时，`exclusive: true` 关系会自动将旧边标记为 `supersededAt`，彻底杜绝新旧记忆打架。
    - **K-Hop 多跳联想召回**：提问时顺着关系链向外扩展 2 跳，把项目关联的负责人、工具链与历史排障经验一并召回。
 3. **第三层：从“记忆”到“能力”的自主技能结晶（Skill Crystallization）**
-   当图谱中的某个 `workflow`（操作流程）节点在实践中累计成功验证达到 **3 次**，引擎会自动将其操作步骤渲染为带 YAML Frontmatter 的标准 `SKILL.md` 并落盘至 `<dataDir>/dsh/skills/crystallized/`，让智能体真正实现“越用越会干活”。
+   当图谱中的某个 `workflow`（操作流程）节点在实践中累计成功验证达到 **3 次**，引擎会自动将其操作步骤渲染为带 YAML Frontmatter 的标准 `SKILL.md` 并落盘至当前机器人的 `<dataDir>/dsh/<botId>/skills/<skill-name>/`，让该机器人的 DSH 技能目录立即可发现并复用。
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshots/memory-dark.webp">
@@ -151,6 +151,8 @@ Sugent 在 [`src/sugent/gateway.ts`](./src/sugent/gateway.ts) 中解开了上游
 
 你可以通过源码直接构建运行，或在 Releases 页面获取对应平台（macOS Apple Silicon / Intel、Windows x64 / arm64、Linux AppImage 及 Docker）的安装包。
 
+macOS 桌面版会提示可用更新；下载完成后可选择重启安装。首次启用此功能时，如果你安装的版本尚未包含更新器，请先从 Releases 手动下载并安装最新的签名 DMG。此后即可在应用内更新。
+
 <p align="center">
   <img src="docs/assets/download/install-windows.gif" alt="安装与首次启动演示：运行安装程序并进入配置界面" width="100%">
 </p>
@@ -205,23 +207,25 @@ npm run sync:upstreams:merge
 
 # 🗺️ 中短期演进蓝图 (Roadmap)
 
-完整规划见 [`docs/ROADMAP.md`](./docs/ROADMAP.md)，核心推进节奏如下：
+完整规划与对标矩阵见 [`docs/ROADMAP.md`](./docs/ROADMAP.md)，核心推进节奏如下：
 
-### 阶段一：短期蓝图（第 1–4 周）—— 算力解耦、知识图谱闭环与自举维护
+### 阶段一：短期蓝图（第 1–4 周）—— 算力解耦、安全防注入与自举维护
 - [x] **M1.1 仓库基座与双上游 Subtree 拓扑搭建**：完成 `AnyModelBot` 宿主与 `dsh-superagent` 状态机同仓融合及一键同步脚本（[`scripts/sync-upstreams.mjs`](./scripts/sync-upstreams.mjs)）。
 - [x] **M1.2 网关解耦与四角色分层路由**：落地 [`src/sugent/gateway.ts`](./src/sugent/gateway.ts) 与 `SUGENT_UNLOCK_SUBSCRIPTIONS` 订阅解锁。
-- [x] **M1.3 自主维护知识图谱与技能结晶引擎**：落地 [`src/sugent/knowledge-graph.ts`](./src/sugent/knowledge-graph.ts)，接入 `AgentManager.review()` 自动沉淀节点、消解排他边矛盾并将高频 `workflow` 落盘为 `SKILL.md`。
-- [ ] **M1.4 自举式仓库维护官（Dogfooding）**：配置第一条主动规则，让 Sugent 每日自动巡检双上游更新、跑单测并向你的微信/飞书推送合并审批卡片。
+- [x] **M1.3 自主知识图谱与双模热演进引擎**：落地 [`src/sugent/knowledge-graph.ts`](./src/sugent/knowledge-graph.ts) 技能结晶与 [`src/sugent/self-evolution.ts`](./src/sugent/self-evolution.ts) 打包态安全扩展层。
+- [x] **M1.4 指令数据物理分离与防注入安全信封**：落地 [`src/sugent/security-envelope.ts`](./src/sugent/security-envelope.ts)，将外部不可信事件落盘为只读资料文件并拦截越权控制字段（借鉴 [Agent-Autoloop](https://github.com/KKKKhazix/agent-autoloop)）。
+- [ ] **M1.5 安全自举维护官与标签驱动 PR 交付**：每日巡检双上游更新，支持只读 `main` 规则、不检出外部 PR 代码的安全审查与自动交付闭环。
+- [ ] **M1.6 Agent-First 自引导安装与 `sugent try` 试跑**：提供面向 Coding Agent 的 `INSTALL.md` 与端到端拍板续接交互试跑。
 
-### 阶段二：中期蓝图（第 1–3 个月）—— 全景个人事件总线与影子学习工作台
-- [ ] **M2.1 个人邮件、日历与本地文件夹监听源**：扩展 [`PersonalSourceRegistry`](./src/sugent/sources.ts)，支持 Gmail/IMAP、日历提醒与 `~/Downloads` 文件自动分诊归档。
-- [ ] **M2.2 影子演练账本（Shadow Ledger）与一键转正 UI**：在本地控制台可视化展示 `observe` 模式下智能体“本打算做什么（`would`）”，满 3 次无误后一键升级为 `act` 自动执行。
-- [ ] **M2.3 知识图谱可视化面板与多端加密同步**：在前端信息面板增加交互式实体关系图谱视图，并支持通过 Git/WebDAV/S3 跨设备加密同步记忆与结晶技能库。
+### 阶段二：中期蓝图（第 1–3 个月）—— 确定性事件中台、异构 Agent 协同与影子工作台
+- [ ] **M2.1 挂起零消耗、TTL 跳数熔断与 `sugent why` 因果溯源**：等待拍板期间零驻留进程，跨 Agent 唤醒超过 8 跳自动熔断，支持一键追溯全链路因果与随机种子模拟测试。
+- [ ] **M2.2 零 Token 前置探针、事件合并与个人全景监听源**：无增量/健康正常时在脚本探针层零成本退出，支持同源排队防抖合并及邮件、日历、本地目录监听（[`src/sugent/sources.ts`](./src/sugent/sources.ts)）。
+- [ ] **M2.3 异构 CLI Agent 免改接入与影子转正面板**：一行配置协同调度本机 Claude Code / Codex / ACP 工具，上线影子演练账本（Shadow Ledger）、图谱视图与多端加密同步。
 
-### 阶段三：长期与商业化蓝图（第 3–6 个月）—— 一人公司生态与数字员工交付
-- [ ] **M3.1 Open-Core 旗舰安装包与移动端伴侣面板**：提供免配置的跨平台签名安装包与手机端专属「需要你（Needs You）」拍板伴侣。
-- [ ] **M3.2 垂直场景自治规则与结晶技能包（Playbooks）市场**：沉淀并分发面向独立开发者、跨境电商、外贸分诊与个人财务的开箱即用规则与技能包。
-- [ ] **M3.3 小微团队 Turnkey 私有化数字员工镜像**：推出带群聊静默旁听（`followForContext`）与团队预算硬上限的 NAS / 私有云一键部署套件。
+### 阶段三：长期与商业化蓝图（第 3–6 个月）—— 一人公司生态与高 ROI 数字员工交付
+- [ ] **M3.1 高价值自治配方（Playbooks）市场**：沉淀“虚实中台”飞书意见箱自治官、GEO 跨平台 AI 推荐浏览器巡检、周日“反屎山”自动重构清道夫与站点自愈监控模板。
+- [ ] **M3.2 Open-Core 旗舰安装包与移动端「批奏折」伴侣**：提供免配置签名安装包与手机端专属拍板及用量看板。
+- [ ] **M3.3 小微团队 Turnkey 私有化数字员工镜像**：推出带群聊静默旁听（`followForContext`）、权限隔离意见箱与预算硬上限的 NAS / 私有云一键套件。
 
 # 📜 许可证与致谢
 

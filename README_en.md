@@ -97,6 +97,8 @@ Pick your platform. Every release page lists all installers and a `SHA256SUMS` f
 | ![Linux][linux-badge] | x64 | `anymodel-bot-<version>-linux-x86_64.AppImage` | [Download][releases-link] |
 | ![Linux][linux-badge] | arm64 | `anymodel-bot-<version>-linux-arm64.AppImage` | [Download][releases-link] |
 
+The macOS app checks for stable updates and lets you download one, then restart to install it. If your current installation predates the updater, manually download and install the latest signed DMG from Releases once; in-app updates work from then on.
+
 <p align="center">
   <img src="docs/assets/download/install-windows.gif" alt="Installing AnyModelBot on Windows: run the installer, open the app, and land on the Modelflare sign-in screen" width="100%">
 </p>
