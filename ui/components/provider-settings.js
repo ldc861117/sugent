@@ -173,6 +173,26 @@ export function ProviderSettingsPanel({ models, modelsError, reloadModels, onCha
     }
   };
 
+  const syncProviderModels = async (providerId) => {
+    setBusyId(`sync-${providerId}`);
+    try {
+      const res = await api("/providers/sync-models", { method: "POST", body: { providerId, force: true } });
+      const results = Array.isArray(res?.results) ? res.results : [];
+      const firstFail = results.length > 0 && results.every((r) => !r.ok) ? results[0] : null;
+      if (firstFail) {
+        failed(firstFail.error || firstFail.skippedReason || t("common.error"));
+      } else {
+        const total = results.reduce((s, r) => s + (r.chatModelCount || 0), 0);
+        toast(t("onboarding.panel.syncModelsDoneToast", { count: total }));
+      }
+      await syncAfterChange();
+    } catch (e) {
+      failed(e);
+    } finally {
+      setBusyId("");
+    }
+  };
+
   const runDiagnosticsRadar = async () => {
     setDiagRunning(true);
     try {
@@ -306,7 +326,11 @@ export function ProviderSettingsPanel({ models, modelsError, reloadModels, onCha
         </div>
         <div class="ctl">
           ${renderDiagBadge(p.id)}
+          ${Array.isArray(p.models) && p.models.length > 0 && html`<span class="badge">${t("onboarding.panel.modelCountBadge", { count: p.models.length })}</span>`}
           <span class="val">${p.keyTail ? `••••${p.keyTail}` : (p.hasKey ? "••••" : t("onboarding.panel.keylessBadge"))}</span>
+          <button type="button" class="text accent" disabled=${!!busyId} onClick=${() => syncProviderModels(p.id)}>
+            ${busyId === `sync-${p.id}` ? t("onboarding.panel.syncModelsRunning") : t("onboarding.panel.syncModelsBtn")}
+          </button>
           ${p.preset === "gemini-web2api" && html`<a class="text" href=${adminUrlFromBase(p.baseUrl)} target="_blank" rel="noopener noreferrer">${t("onboarding.panel.adminConsole")}</a>`}
           ${p.preset === "gemini-web2api" && html`<button type="button" class="text accent" disabled=${!!busyId} onClick=${() => probeWeb2ApiPool(p)}>${t("onboarding.panel.probePool")}</button>`}
           ${!p.isDefault && html`<button type="button" class="text accent" disabled=${!!busyId} onClick=${() => makeDefault(p.id)}>${t("onboarding.panel.setDefault")}</button>`}

@@ -347,6 +347,48 @@ const BUILTIN_MODEL_RULES: readonly BuiltinModelRule[] = [
     },
   },
 
+  // Non-chat modalities exclusion (prevents Steward chat pool from selecting media/embedding models)
+  {
+    match: (m) =>
+      /(^|[-_/])(embedding|embed|tts|whisper|dall-e|imagen|veo|lyria|sora|moderation|rerank)/.test(m) ||
+      /(image-gen|gpt-image|-image-preview|-image$)/.test(m),
+    info: {
+      context: 8_192,
+      vision: false,
+      tools: false,
+      reasoning: false,
+      endpoints: ["openai"],
+    },
+  },
+
+  // Google Gemini 4 / 3 Official & CLIProxyAPI Chat Models (never shadows gemini-4-argon* / gemini-3.1-pro*)
+  {
+    match: (m) => m.startsWith("gemini-4-flash") || m.startsWith("gemini-3-flash"),
+    info: {
+      context: 1_048_576,
+      vision: true,
+      tools: true,
+      reasoning: true,
+      endpoints: ["openai"],
+      rates: { input: 0.3, output: 2.5, cacheRead: 0.075 },
+    },
+  },
+  {
+    match: (m) =>
+      m.startsWith("gemini-4-hydrogen") ||
+      m.startsWith("gemini-4-neon") ||
+      m.startsWith("gemini-4-pro") ||
+      m.startsWith("gemini-3-pro"),
+    info: {
+      context: 1_048_576,
+      vision: true,
+      tools: true,
+      reasoning: true,
+      endpoints: ["openai"],
+      rates: { input: 1.25, output: 10, cacheRead: 0.31 },
+    },
+  },
+
   // Google Gemini 2.5
   {
     match: (m) => m.startsWith("gemini-2.5-flash"),
@@ -713,4 +755,146 @@ export class SugentModelCatalog {
     }
     writeAtomicJson600(this.filePath, serialized);
   }
+}
+
+
+export type ModelTier = "fast" | "balanced" | "frontier" | "reasoning";
+export type ModelFamily =
+  | "claude"
+  | "openai"
+  | "gemini"
+  | "deepseek"
+  | "qwen"
+  | "llama"
+  | "other";
+export type ModelModality = "chat" | "image_gen" | "audio" | "video" | "embedding";
+
+export interface ModelCapabilityProfile {
+  rawModelId: string;
+  bareModelId: string;
+  family: ModelFamily;
+  tier: ModelTier;
+  modalities: ModelModality[];
+  isChatModel: boolean;
+  context: number;
+  vision: boolean;
+  tools: boolean;
+  reasoning: boolean;
+  thoughtSignatureRequired: boolean;
+  priorQuality: number;
+  quotaScarcity: number;
+  rates?: CatalogModelRates;
+  inferredFromFallback: boolean;
+}
+
+export function hasBuiltinModelRule(modelId: string): boolean {
+  const bareLower = stripProviderPrefix(modelId).toLowerCase();
+  return BUILTIN_MODEL_RULES.some((rule) => rule.match(bareLower));
+}
+
+export function parseModelSpecMetadata(rawModelId: string): {
+  bareModelId: string;
+  normalized: string;
+  hasThinkingTag: boolean;
+  hasXHighTag: boolean;
+  family: ModelFamily;
+} {
+  const bareModelId = stripProviderPrefix(rawModelId);
+  const normalized = bareModelId.toLowerCase();
+  const family: ModelFamily = normalized.includes("claude")
+    ? "claude"
+    : normalized.startsWith("gpt-") ||
+        normalized.startsWith("chatgpt-") ||
+        /^o[134](-|$)/.test(normalized) ||
+        normalized.includes("codex")
+      ? "openai"
+      : normalized.includes("gemini")
+        ? "gemini"
+        : normalized.includes("deepseek")
+          ? "deepseek"
+          : normalized.startsWith("qwen") || normalized.startsWith("qwq")
+            ? "qwen"
+            : normalized.includes("llama")
+              ? "llama"
+              : "other";
+  return {
+    bareModelId,
+    normalized,
+    hasThinkingTag: normalized.includes("thinking"),
+    hasXHighTag: normalized.includes("xhigh"),
+    family,
+  };
+}
+
+export function classifyModelProfile(
+  modelId: string,
+  catalog?: SugentModelCatalog,
+): ModelCapabilityProfile {
+  const meta = parseModelSpecMetadata(modelId);
+  const info = catalog
+    ? catalog.getModelInfo(modelId)
+    : resolveBuiltinModelInfo(modelId);
+  const m = meta.normalized;
+  const modalities: ModelModality[] = [];
+  if (/(embedding|embed|rerank)/.test(m)) {
+    modalities.push("embedding");
+  } else if (
+    /(dall-e|imagen|gemini-image|image-gen|gpt-image|-image-preview|-image$)/.test(m)
+  ) {
+    modalities.push("image_gen");
+  } else if (/(tts|whisper|lyria|gemini-music|audio)/.test(m)) {
+    modalities.push("audio");
+  } else if (/(veo|sora|gemini-video)/.test(m)) {
+    modalities.push("video");
+  } else if (!/(^|[-_/])moderation/.test(m)) {
+    modalities.push("chat");
+  }
+  const isChatModel = modalities.includes("chat");
+  const isSmall = /(nano|lite|8b|7b|mini|flash|haiku|3\.5-turbo)/.test(m);
+  const tier: ModelTier = !isChatModel
+    ? "fast"
+    : meta.hasXHighTag ||
+        meta.hasThinkingTag ||
+        /^(o[134](-|$)|deepseek-r1|deepseek-reasoner|qwq)/.test(m) ||
+        m.includes("hydrogen") ||
+        m.includes("neon")
+      ? "reasoning"
+      : /(opus|sonnet-4|gpt-5|gpt-4\.1|gpt-4o|gemini-4-pro|gemini-3-pro|gemini-2\.5-pro|codex)/.test(m) &&
+          !isSmall
+        ? "frontier"
+        : /(nano|lite|8b|7b)/.test(m)
+          ? "fast"
+          : /(mini|flash|haiku|deepseek-chat|deepseek-v3|gpt-4o-mini|gpt-4\.1-mini|gpt-5-mini)/.test(m)
+            ? "balanced"
+            : "balanced";
+  const [priorQuality, quotaScarcity] = !isChatModel
+    ? [0, 0]
+    : tier === "reasoning"
+      ? [0.92, 0.95]
+      : tier === "frontier"
+        ? [0.88, 0.8]
+        : tier === "balanced"
+          ? [0.78, 0.42]
+          : [0.65, 0.15];
+  const builtinMatch = hasBuiltinModelRule(modelId);
+  return {
+    rawModelId: modelId.trim(),
+    bareModelId: meta.bareModelId,
+    family: meta.family,
+    tier,
+    modalities,
+    isChatModel,
+    context: info.context ?? 128_000,
+    vision: Boolean(info.vision),
+    tools: Boolean(info.tools),
+    reasoning: Boolean(info.reasoning),
+    thoughtSignatureRequired:
+      meta.family === "gemini" &&
+      (m.includes("gemini-3") || m.includes("gemini-4")) &&
+      isChatModel,
+    priorQuality: builtinMatch ? priorQuality : Math.min(priorQuality, 0.72),
+    quotaScarcity,
+    ...(info.rates ? { rates: info.rates } : {}),
+    inferredFromFallback: !builtinMatch,
+  };
 }

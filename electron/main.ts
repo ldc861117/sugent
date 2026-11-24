@@ -17,6 +17,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadConfig } from "../src/config.js";
 import { App } from "../src/app.js";
+import { HotCoreSupervisor, hasVerifiedActiveOrPendingSlot } from "../src/sugent/index.js";
 import { findAppRoot } from "../src/magpie/supervisor.js";
 import { initFileLog, logFilePath, logger, registerSecret, setConsoleLog } from "../src/log.js";
 import { normalizeLang, onLangChange, setLangPref, setSystemLang, t } from "../src/i18n/index.js";
@@ -28,6 +29,11 @@ const log = logger("desktop");
 const SMOKE = process.env.AMB_ELECTRON_SMOKE; // 冒烟测试：截图到该路径后退出
 
 let core: App | undefined;
+let supervisor: HotCoreSupervisor | undefined;
+let activeDataDir = "";
+let cachedZoom = 1;
+let cachedCloseToTray = true;
+const seenAttentionKeys = new Set<string>();
 let win: BrowserWindow | undefined;
 let tray: Tray | undefined;
 let companion: SugentCompanionController | undefined;
@@ -191,7 +197,7 @@ function titleBarOverlay(): Electron.TitleBarOverlay {
   return {
     color: titleBarDark ? "rgba(0, 0, 0, 0)" : "rgba(255, 255, 255, 0)",
     symbolColor: titleBarDark ? "#ececec" : "#1a1a1a", // = --fg
-    height: Math.round(TITLE_BAR_H * (core?.config.ui.zoom ?? 1)),
+    height: Math.round(TITLE_BAR_H * (core?.config.ui.zoom ?? cachedZoom)),
   };
 }
 function updateTitleBar(): void {
@@ -227,17 +233,20 @@ function createWindow(): void {
       if (/^https?:/i.test(url)) void shell.openExternal(url);
     }
   });
-  win.webContents.on("did-finish-load", () => win?.webContents.setZoomFactor(core?.config.ui.zoom ?? 1));
+  win.webContents.on("did-finish-load", () => win?.webContents.setZoomFactor(core?.config.ui.zoom ?? cachedZoom));
   win.on("close", (e) => {
-    if (!quitting && tray && core?.config.ui.closeToTray !== false) {
+    const closeToTray = core ? core.config.ui.closeToTray !== false : cachedCloseToTray;
+    if (!quitting && tray && closeToTray) {
       e.preventDefault();
       win?.hide();
     }
   });
   win.on("closed", () => {
     win = undefined;
-    if (!quitting && core?.config.ui.closeToTray === false) app.quit();
+    const closeToTray = core ? core.config.ui.closeToTray !== false : cachedCloseToTray;
+    if (!quitting && !closeToTray) app.quit();
   });
+  companion?.bindMainWindow(win);
   void win.loadURL(entryUrl);
 }
 
@@ -247,6 +256,34 @@ function openNeeds(): void {
   const go = () => void win?.webContents.executeJavaScript(`location.hash = "#/needs"`).catch(() => {});
   if (win?.webContents.isLoading()) win.webContents.once("did-finish-load", go);
   else go();
+}
+
+/** 从桌面伴侣移交上下文到主工作台 */
+function handoffToMain(payload: { hash?: string; draftText?: string; source?: string } = {}): void {
+  const rawHash = typeof payload.hash === "string" && payload.hash.trim() ? payload.hash.trim() : "#/chat/default";
+  const normalized = {
+    hash: rawHash.startsWith("#") ? rawHash : `#${rawHash.startsWith("/") ? rawHash : `/${rawHash}`}`,
+    ...(typeof payload.draftText === "string" ? { draftText: payload.draftText } : {}),
+    ...(typeof payload.source === "string" ? { source: payload.source } : {}),
+  };
+  showWindow();
+  const target = win;
+  if (!target || target.isDestroyed()) return;
+  const run = () => {
+    if (target.isDestroyed()) return;
+    const js = `(() => {
+      const p = ${JSON.stringify(normalized)};
+      if (typeof window.__sugentCompanionHandoff === "function") {
+        window.__sugentCompanionHandoff(p);
+      } else {
+        if (p.draftText) try { sessionStorage.setItem("sugent-handoff-draft", p.draftText); } catch {}
+        if (p.hash) location.hash = p.hash;
+      }
+    })()`;
+    void target.webContents.executeJavaScript(js).catch(() => {});
+  };
+  if (target.webContents.isLoading()) target.webContents.once("did-finish-load", run);
+  else run();
 }
 
 /** 「需要你」的件数（托盘菜单、提示、角标用） */
@@ -263,7 +300,15 @@ function onAttention(items: AttentionItem[]): void {
   app.setBadgeCount(needsCount);
   if (isWin) win?.setOverlayIcon(needsCount ? overlayDot() : null, needsCount ? `${needsCount} 件事需要你` : "");
   renderTray?.();
-  const fresh = core?.attention.takeNew(items) ?? [];
+  const fresh = core
+    ? core.attention.takeNew(items)
+    : items.filter((it) => {
+        if (it.kind === "suggest") return false;
+        const k = `${it.id}:${it.since}`;
+        if (seenAttentionKeys.has(k)) return false;
+        seenAttentionKeys.add(k);
+        return true;
+      });
   const looking = !!win && win.isVisible() && win.isFocused();
   if (looking || !fresh.length || !Notification.isSupported()) return;
   // 一下来好几件时只发最早的两条，其余在「需要你」里
@@ -316,7 +361,17 @@ function buildTray(): void {
           checked: canAutostart && app.getLoginItemSettings().openAtLogin,
           click: (item) => setAutostart(item.checked),
         },
-        { label: t("desktop.trayOpenDataDir"), click: () => void shell.openPath(core!.config.dataDir) },
+        ...(supervisor
+          ? [
+              {
+                label: t("desktop.trayHotReloadCore"),
+                click: () => {
+                  void supervisor?.hotReload({ reason: "tray_menu" });
+                },
+              },
+            ]
+          : []),
+        { label: t("desktop.trayOpenDataDir"), click: () => void shell.openPath(activeDataDir || core!.config.dataDir) },
         { type: "separator" },
         { label: t("desktop.trayQuit"), click: () => app.quit() },
       ]),
@@ -331,24 +386,138 @@ let renderTray: (() => void) | undefined;
 function setAutostart(on: boolean): void {
   app.setLoginItemSettings({ openAtLogin: on, args: ["--hidden"] });
   renderTray?.();
+  supervisor?.pushDesktopState({ autostart: { supported: canAutostart, on: canAutostart && app.getLoginItemSettings().openAtLogin } });
+}
+
+function handleSupervisedDesktopRpc(method: string, args: unknown[], dataDir: string): unknown {
+  if (method === "setAutostart") return setAutostart(Boolean(args[0]));
+  if (method === "applyZoom") {
+    cachedZoom = Number(args[0]) || 1;
+    win?.webContents.setZoomFactor(cachedZoom);
+    return updateTitleBar();
+  }
+  if (method === "setTitleBarTheme") {
+    const dark = Boolean(args[0]);
+    if (dark !== titleBarDark) { titleBarDark = dark; updateTitleBar(); }
+    return;
+  }
+  if (method === "openDataDir") return void shell.openPath(dataDir);
+  if (method === "openPath" && typeof args[0] === "string") return void shell.openPath(args[0]);
+  if (method === "showItemInFolder" && typeof args[0] === "string") return shell.showItemInFolder(args[0]);
+  if (method === "openInBrowser") return entryUrl && void shell.openExternal(entryUrl);
+  if (method === "openExternal" && typeof args[0] === "string" && /^https?:/i.test(args[0])) return void shell.openExternal(args[0]);
+  if (method === "downloadUpdate") {
+    const st = downloadDesktopUpdate();
+    supervisor?.pushDesktopState({ updateStatus: st });
+    return st;
+  }
+  if (method === "installUpdate") return installDesktopUpdate();
+  if (method === "requestRelaunchQuit") return app.quit();
+  if (method === "toggleCompanion") {
+    const st = companion?.toggle(typeof args[0] === "boolean" ? args[0] : undefined) ?? { supported: false, visible: false, expanded: false };
+    supervisor?.pushDesktopState({ companionState: st });
+    return st;
+  }
+  if (method === "showCompanionQuickBar") {
+    const st = companion?.showQuickBar() ?? { supported: false, visible: false, expanded: false };
+    supervisor?.pushDesktopState({ companionState: st });
+    return st;
+  }
+  if (method === "notifyCompanion" && args[0] && typeof args[0] === "object") return companion?.pushSignal(args[0] as Record<string, unknown>);
+  if (method === "handoffCompanionToMain") return handoffToMain((args[0] as Record<string, unknown>) || {});
+  if (method === "requestHotReloadCore") {
+    const o = (args[0] && typeof args[0] === "object" ? args[0] : {}) as { reason?: string };
+    setTimeout(() => void supervisor?.hotReload({ reason: o.reason ?? "rpc" }), 80);
+    return { ok: true, scheduled: true, reason: o.reason ?? "rpc" };
+  }
+  if (method === "requestStageHotBundle" && supervisor) {
+    const o = (args[1] && typeof args[1] === "object" ? args[1] : {}) as { allowUnsigned?: boolean };
+    const staged = supervisor.slotManager.stageBundleBuffer(Buffer.from(String(args[0] ?? ""), "base64"), o);
+    if (!staged.ok) return { ok: false, activeSlot: supervisor.slotManager.getState().activeSlot ?? "factory", error: staged.reason ?? staged.errorCode };
+    setTimeout(() => void supervisor?.hotReload({ reason: "ota_bundle_swap" }), 80);
+    return { ok: true, scheduled: true, stagedSlot: staged.slot, manifest: staged.manifest };
+  }
+  if (method === "requestRollbackHotSlot" && supervisor) {
+    const rb = supervisor.slotManager.rollbackToPrevious();
+    if (!rb.ok) return { ok: false, activeSlot: rb.activeSlot ?? "factory", error: rb.reason };
+    setTimeout(() => void supervisor?.hotReload({ reason: "manual_slot_rollback" }), 80);
+    return { ok: true, scheduled: true, targetSlot: rb.activeSlot };
+  }
+  if (method === "requestFactoryResetHotSlot" && supervisor) {
+    supervisor.slotManager.resetToFactoryGolden();
+    setTimeout(() => void supervisor?.hotReload({ reason: "factory_golden_reset" }), 80);
+    return { ok: true, scheduled: true, targetSlot: "factory" };
+  }
+  return undefined;
+}
+
+async function bootSupervisedShell(
+  dataDir: string,
+  config: ReturnType<typeof loadConfig>,
+  sysLang: string,
+): Promise<{ url: string; companionUrl: string }> {
+  const appRoot = findAppRoot(path.dirname(fileURLToPath(import.meta.url)));
+  let latestCompanionUrl = "";
+  let firstReady = true;
+  supervisor = new HotCoreSupervisor({
+    dataDir,
+    defaultEntryPath: path.join(appRoot, "dist", "src", "sugent", "hot-core-entry.js"),
+    defaultUiDir: path.join(appRoot, "ui"),
+    ...(config.ui.port > 0 ? { port: config.ui.port } : {}),
+    token: config.ui.token,
+    extraEnv: {
+      ...(app.isPackaged ? {} : { SUGENT_UI_HOT_RELOAD: process.env.SUGENT_UI_HOT_RELOAD ?? "1" }),
+      SUGENT_SYSTEM_LANG: sysLang,
+      AMB_FILE_LOG: "1",
+    },
+    onAttention: (items) => onAttention(items as AttentionItem[]),
+    onCoreLog: (line) => line && log.info(`[core] ${line}`),
+    desktopRpcHandler: (method, args) => handleSupervisedDesktopRpc(method, args, dataDir),
+    onCoreReady: (info) => {
+      entryUrl = `${info.url.replace(/\/$/, "")}/?token=${encodeURIComponent(info.token)}`;
+      latestCompanionUrl = `${info.url.replace(/\/$/, "")}/companion?token=${encodeURIComponent(info.token)}`;
+      companion?.updateUrl(latestCompanionUrl);
+      if (!firstReady && win && !win.isDestroyed()) void win.loadURL(entryUrl);
+      firstReady = false;
+    },
+  });
+  supervisor.pushDesktopState({
+    autostart: { supported: canAutostart, on: canAutostart && app.getLoginItemSettings().openAtLogin },
+    updateStatus: { ...updateStatus },
+  });
+  const ready = await supervisor.start();
+  return { url: ready.url, companionUrl: latestCompanionUrl };
 }
 
 async function boot(): Promise<void> {
   const dataDir = process.env.AMB_DATA_DIR ? path.resolve(process.env.AMB_DATA_DIR) : path.join(app.getPath("userData"), "data");
+  activeDataDir = dataDir;
   fs.mkdirSync(dataDir, { recursive: true });
   // 尽早打开日志文件：配置读取失败、启动失败也能留下记录
   initFileLog(path.join(dataDir, "logs"));
   const config = loadConfig({ dataDir });
   // 语言：跟随系统时用系统的首选语言（不支持的语言用英文）；偏好本身在 config.ui.lang
-  setSystemLang(app.getPreferredSystemLanguages().map(normalizeLang).find(Boolean) ?? normalizeLang(app.getLocale()) ?? "en");
+  const sysLang = app.getPreferredSystemLanguages().map(normalizeLang).find(Boolean) ?? normalizeLang(app.getLocale()) ?? "en";
+  setSystemLang(sysLang);
   setLangPref(config.ui.lang);
   // 桌面版：仅回环 + 每次启动随机令牌；端口沿用配置（默认 3600，被占用时自动换随机端口）
   config.ui.host = "127.0.0.1";
   if (!config.ui.token) config.ui.token = crypto.randomBytes(24).toString("base64url");
   registerSecret(config.ui.token);
-  core = new App(config);
+  cachedZoom = config.ui.zoom ?? 1;
+  cachedCloseToTray = config.ui.closeToTray !== false;
   configureUpdater();
-  core.desktop = {
+
+  const useSupervised = !SMOKE && (process.env.SUGENT_HOT_SHELL === "1" || hasVerifiedActiveOrPendingSlot(dataDir));
+  let webUrl = "";
+  let companionUrl = "";
+  if (useSupervised) {
+    const started = await bootSupervisedShell(dataDir, config, sysLang);
+    webUrl = started.url;
+    companionUrl = started.companionUrl;
+  } else {
+    core = new App(config);
+    core.desktop = {
     autostart: () => ({ supported: canAutostart, on: canAutostart && app.getLoginItemSettings().openAtLogin }),
     setAutostart,
     applyZoom: (z) => {
@@ -382,15 +551,19 @@ async function boot(): Promise<void> {
     companionState: () => companion?.state() ?? { supported: false, visible: false, expanded: false },
     toggleCompanion: (v) => companion?.toggle(v) ?? { supported: false, visible: false, expanded: false },
     showCompanionQuickBar: () => companion?.showQuickBar() ?? { supported: false, visible: false, expanded: false },
-  };
-  await core.start();
-  if (!core.web) throw new Error(t("desktop.uiNotStarted"));
+    notifyCompanion: (payload) => companion?.pushSignal(payload),
+    handoffCompanionToMain: (payload) => handoffToMain(payload),
+    };
+    await core.start();
+    if (!core.web) throw new Error(t("desktop.uiNotStarted"));
+    webUrl = core.web.url;
+    entryUrl = `${webUrl.replace(/\/$/, "")}/?token=${encodeURIComponent(config.ui.token)}`;
+    companionUrl = `${webUrl.replace(/\/$/, "")}/companion?token=${encodeURIComponent(config.ui.token)}`;
+  }
   startDesktopUpdateChecks();
   // 规则的定时器：电脑醒来、解锁时马上重新看一遍（睡着时错过的按宽限期补跑一次或记为跳过）
   powerMonitor.on("resume", () => core?.tasks.scheduler.wake());
   powerMonitor.on("unlock-screen", () => core?.tasks.scheduler.wake());
-  entryUrl = `${core.web.url.replace(/\/$/, "")}/?token=${encodeURIComponent(config.ui.token)}`;
-  const companionUrl = `${core.web.url.replace(/\/$/, "")}/companion?token=${encodeURIComponent(config.ui.token)}`;
   if (!SMOKE) {
     const appRoot = findAppRoot(path.dirname(fileURLToPath(import.meta.url)));
     companion = new SugentCompanionController({
@@ -405,15 +578,18 @@ async function boot(): Promise<void> {
           else run();
         }
       },
+      getMainWindow: () => (win && !win.isDestroyed() ? win : undefined),
+      onHandoffToMain: (payload) => handoffToMain(payload),
     });
     companion.initVisible();
+    supervisor?.pushDesktopState({ companionState: companion.state() });
   }
   log.info(`数据目录：${dataDir}`);
-  log.info(`管理界面：${core.web.url}`);
+  log.info(`管理界面：${webUrl}`);
   if (!SMOKE) buildTray();
   // 「需要你」：托盘、角标、系统通知
-  if (!SMOKE) core.attention.onChange(onAttention);
-  if (!SMOKE) {
+  if (!SMOKE && core) core.attention.onChange(onAttention);
+  if (!SMOKE && core) {
     setTimeout(() => {
       if (!quitting) core?.markDesktopBootHealthy(process.pid, app.getVersion());
     }, 1500).unref();
@@ -483,11 +659,10 @@ if (!app.requestSingleInstanceLock()) {
     quitting = true;
     companion?.destroy();
     if (updateCheckTimer) clearInterval(updateCheckTimer);
-    if (stopped || !core) return;
+    if (stopped || (!core && !supervisor)) return;
     e.preventDefault();
     const force = setTimeout(() => app.exit(1), 10_000);
-    core
-      .stop()
+    Promise.all([core?.stop(), supervisor?.stop()])
       .catch((err) => log.error(`退出时出错：${(err as Error).message}`))
       .finally(() => {
         clearTimeout(force);

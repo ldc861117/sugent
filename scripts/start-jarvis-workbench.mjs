@@ -32,6 +32,11 @@ let appRef = null;
 
 const demoModels = {
   async listModels() {
+    const synced = appRef?.stewardService
+      ?.getRoutingDashboard()
+      .pool.entries.filter((e) => e.profile.isChatModel)
+      .map((e) => e.rawModelId);
+    if (synced && synced.length > 0) return synced;
     if (stewardModel) return [stewardModel, "gemini-4-hydrogen-xhigh"];
     return [
       "deepseek/deepseek-chat",
@@ -95,10 +100,10 @@ if (liveGatewayEnabled) {
     preset: "custom-openai",
     baseUrl: gatewayUrl,
     apiKey: gatewayKey,
-    models: [m, "gemini-4-hydrogen-xhigh"],
     defaultModel: m,
     setDefault: true,
   });
+  await app.syncProviderModels("custom-gateway", true).catch(() => []);
   await app.updateProviderRouting({
     assessor: localEnv.SUGENT_MODEL_ASSESSOR || m,
     steward: m,

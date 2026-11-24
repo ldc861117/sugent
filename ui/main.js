@@ -292,6 +292,37 @@ function App() {
   const openStudio = () => go("/studio");
   useEffect(() => {
     window.__openSugentJarvisWorkbench = () => go("/steward");
+    let lastHandoff = { sig: "", at: 0 };
+    const handleHandoff = (payload) => {
+      if (!payload || typeof payload !== "object") return;
+      const draftText = typeof payload.draftText === "string" ? payload.draftText : "";
+      const rawHash = String(payload.hash || "/chat/default").replace(/^#/, "");
+      const target = rawHash.startsWith("/") ? rawHash : `/${rawHash}`;
+      const sig = `${target}|${draftText}`;
+      const now = Date.now();
+      if (lastHandoff.sig === sig && now - lastHandoff.at < 400) return;
+      lastHandoff = { sig, at: now };
+      if (draftText) {
+        try { sessionStorage.setItem("sugent-handoff-draft", draftText); } catch { /* ignore */ }
+      }
+      const detail = { ...payload, hash: target, draftText };
+      window.dispatchEvent(new CustomEvent("sugent:handoff-draft", { detail }));
+      go(target);
+    };
+    window.__sugentCompanionHandoff = handleHandoff;
+    let bc = null;
+    try {
+      if (typeof BroadcastChannel !== "undefined") {
+        bc = new BroadcastChannel("sugent-companion-bus");
+        bc.onmessage = (ev) => {
+          if (ev?.data?.kind === "handoff") handleHandoff(ev.data);
+        };
+      }
+    } catch { /* ignore */ }
+    return () => {
+      try { bc?.close(); } catch { /* ignore */ }
+      if (window.__sugentCompanionHandoff === handleHandoff) delete window.__sugentCompanionHandoff;
+    };
   }, []);
   // 「需要你」里的重新扫码：去这个机器人的对话，打开信息面板（渠道在最上面）
   const relogin = () => openSettings("connections");
@@ -429,3 +460,4 @@ function App() {
 }
 
 render(html`<${App} />`, document.getElementById("app"));
+void import("./lib/hot-reload.js").then((m) => m.connectHotReload()).catch(() => {});
