@@ -540,6 +540,15 @@
   -webkit-user-select: none;
   user-select: none;
 }
+.comp-stage[data-interactive="1"] {
+  cursor: pointer;
+}
+.comp-stage[data-dragging="1"] {
+  cursor: grabbing;
+}
+.comp-orb .comp-stage[data-interactive="1"] {
+  cursor: inherit;
+}
 .comp-stage-canvas,
 .comp-stage-fallback {
   display: block;

@@ -115,6 +115,10 @@ export default {
     syncNodeStats: "Local graph nodes: {nodes} · Clock v{clock}",
     syncPushedToast: "Uploaded zero-knowledge encrypted snapshot (v{clock})",
     syncPulledToast: "Merged encrypted snapshot ({nodes} nodes)",
+    syncModelsBtn: "Sync models",
+    syncModelsRunning: "Syncing…",
+    syncModelsDoneToast: "Aligned {count} chat models",
+    modelCountBadge: "{count} models",
   },
   line: {
     label: "Route",

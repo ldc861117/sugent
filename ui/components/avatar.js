@@ -231,7 +231,9 @@ export function BotAvatar({
   dragVx = 0,
   dropOver = false,
   coolingProgress = 0,
+  externalPointer = null,
   onDoubleClick,
+  onContextMenu,
 }) {
   const studio = useAvatarStudio(false);
   const rawKey = char ? char : neutral ? MAIN_CHAR : charOf(bot || (id || name ? { id, name } : null));
@@ -319,12 +321,14 @@ export function BotAvatar({
       dropOver=${dropOver}
       coolingProgress=${coolingProgress}
       interactive=${lively || pokeable}
+      externalPointer=${externalPointer}
       onDoubleClick=${onDoubleClick}
+      onContextMenu=${onContextMenu}
     />`;
   }
   return html`<div class=${cls} style=${style} data-char=${key} data-state=${st} data-shot=${shot || undefined} data-eyes=${eyes}
       data-eye-style=${eyeStyle} data-motion-personality=${motionPersonality} data-has-glow=${hasGlow ? "1" : undefined}
-      aria-hidden="true" onClick=${pokeable ? poke : undefined}>
+      aria-hidden="true" onClick=${pokeable ? poke : undefined} onContextMenu=${onContextMenu || undefined}>
     ${lively && html`<i class="bf-shadow"></i>`}
     <i class="bf-aura"></i>
     <div class="bf-body">

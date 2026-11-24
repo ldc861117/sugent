@@ -13,6 +13,7 @@ import {
 } from "./avatar-rig.js";
 import {
   CANONICAL_POSE_SHEET_META,
+  inferPoseSheetLayout,
   rigPoseSheetImageBuffer,
   type PoseSheetLayoutMode,
 } from "./avatar-pose-rig.js";
@@ -201,10 +202,13 @@ export function buildVisorToyGenerationPrompt(stylePrompt: string): string {
 export function buildPoseSheetGenerationPrompt(stylePrompt: string): string {
   const cleanStyle = stylePrompt.trim().slice(0, 600);
   return [
-    "Using the attached 3x2 pose-sheet reference strictly for the 3-column by 2-row pose layout and compact 2.5-head stylized designer-collectible vinyl/ceramic figurine proportions (large expressive sculpted head ~40% of total height, compact torso, charming hands, sturdy compact legs — NEVER lanky realistic anatomy dummy proportions), design a cohesive full-body desktop companion character in this style:",
+    "Using the attached 3x3 square pose-sheet reference strictly for the 3-column by 3-row pose layout and compact 2.5-head stylized designer-collectible vinyl/ceramic figurine proportions (large expressive sculpted head ~40% of total height, compact torso, charming hands, sturdy compact legs — NEVER lanky realistic anatomy dummy proportions), design a cohesive full-body desktop companion character in this style:",
     cleanStyle,
-    "Exact 6-pose 3x2 layout (NO grid lines, NO borders, NO frames, NO text, NO labels, NO numbers): Top row left-to-right: (1) idle — seated calmly on an invisible ledge with legs dangling forward and hands resting neatly, (2) listening — poised attentive upright posture, head tilted warmly with one hand gently raised near chest/chin listening intently (NOT slouched), (3) thinking — calm thoughtful stance with one hand resting neatly under chin gazing slightly upward. Bottom row left-to-right: (4) working — leaning gently forward operating a compact slim glowing pad held with both hands, (5) waiting — standing upright waving one hand warmly toward viewer, (6) sleep — seated low curled comfortably hugging knees or resting head peacefully on arms.",
-    "Rendering rules: consistent character design and uniform 2.5-head figurine scale across all 6 poses, soft diffused studio lighting, generous clean margin inside each of the 6 cells, isolated cleanly on a pure solid flat uniform #7D8EA3 muted slate-grey studio backdrop with ZERO cast floor shadows, ZERO dividing lines, ZERO borders, ZERO watermarks, and ZERO words.",
+    "Exact 9-pose 3x3 square layout (NO grid lines, NO borders, NO frames, NO text, NO labels, NO numbers):",
+    "- Top row left-to-right (IDENTICAL symmetric forward-seated body on an invisible ledge with legs dangling straight forward and hands resting symmetrically at sides — ONLY the 3D head yaw angle changes!): (1) idle_left — seated body facing front, head genuinely turned 35 degrees to the viewer's LEFT looking left; (2) idle — exact same symmetric seated body, head facing STRAIGHT FRONT (0 degrees) making warm direct eye contact with viewer; (3) idle_right — exact same symmetric seated body, head genuinely turned 35 degrees to the viewer's RIGHT looking right.",
+    "- Middle row left-to-right: (4) listening — poised attentive upright posture, head tilted warmly with one hand gently raised near ear/chest listening intently, (5) thinking — calm thoughtful upright stance with one hand resting neatly under chin gazing slightly upward, (6) working — leaning gently forward operating a compact slim glowing pad held with both hands.",
+    "- Bottom row left-to-right: (7) waiting — standing upright facing viewer waving one hand warmly, (8) ack — cheerful responsive nod with both hands clasped warmly near chest celebrating completion, (9) sleep — seated low curled comfortably hugging knees peacefully asleep.",
+    "Rendering rules: consistent character design and uniform 2.5-head figurine scale across all 9 poses, soft diffused studio lighting, generous clean margin inside each of the 9 cells, isolated cleanly on a pure solid flat uniform #7D8EA3 muted slate-grey studio backdrop with ZERO cast floor shadows, ZERO dividing lines, ZERO borders, ZERO watermarks, and ZERO words.",
   ].join("\n\n");
 }
 
@@ -522,9 +526,9 @@ export class SugentAvatarStudio {
       auraHue?: number;
       motionPersonality?: AvatarMotionPersonality;
     },
-    layout: PoseSheetLayoutMode = "grid_3x2",
+    layout?: PoseSheetLayoutMode,
   ): { pack: AvatarPackManifest; state: AvatarStudioState; warnings: string[] } {
-    const rigged = rigPoseSheetImageBuffer(imageBuffer, { layout });
+    const rigged = rigPoseSheetImageBuffer(imageBuffer, layout ? { layout } : {});
     const id = `ava-${Date.now().toString(36)}-${crypto.randomBytes(2).toString("hex")}`;
     const dir = path.join(this.storeDir, id);
     fs.mkdirSync(dir, { recursive: true });
@@ -536,7 +540,7 @@ export class SugentAvatarStudio {
       id,
       schemaVersion: "pose_sheet_v2",
       name: meta.name.trim().slice(0, 48) || "定制雕塑搭档",
-      about: meta.about.trim().slice(0, 120) || "由 3×2 全身素体定制生成并自动切分对齐。",
+      about: meta.about.trim().slice(0, 120) || "由 3×3 全身素体定制生成并自动切分对齐。",
       kind: "custom",
       ...(meta.stylePrompt ? { stylePrompt: meta.stylePrompt.slice(0, 400) } : {}),
       spriteUrl: "/amb/static/design/bots/sugent-core.png",
@@ -630,10 +634,10 @@ export class SugentAvatarStudio {
       return { ok: true, ...saved, wireProtocol };
     }
     const refPng = fs.readFileSync(this.mannequinAssetPath);
-    const { imageBuffer, wireProtocol } = await callGeminiImageModel(ep, refPng, buildPoseSheetGenerationPrompt(style), this.opts.fetchImpl, { aspectRatio: "3:2" });
+    const { imageBuffer, wireProtocol } = await callGeminiImageModel(ep, refPng, buildPoseSheetGenerationPrompt(style), this.opts.fetchImpl, { aspectRatio: "1:1" });
     const saved = this.persistPoseSheetPack(imageBuffer, {
       name: input.name?.trim() || style.slice(0, 16),
-      about: `Gemini (${ep.model}) 3×2 全身雕塑生成`,
+      about: `Gemini (${ep.model}) 3×3 全身雕塑生成`,
       stylePrompt: style,
       accentColor: input.accentColor,
       eyeStyle: input.eyeStyle,
@@ -650,16 +654,12 @@ export class SugentAvatarStudio {
     const cleaned = raw.includes(",") ? raw.split(",")[1] ?? "" : raw;
     const buf = Buffer.from(cleaned, "base64");
     if (!buf.length) throw new Error("图片数据为空");
-    let layout: PoseSheetLayoutMode | undefined = input.layout;
-    if (!layout) {
-      const dim = decodeImageBufferToRgba(buf);
-      layout = dim.width / Math.max(1, dim.height) >= 1.25 ? "grid_3x2" : "single";
-    }
+    const layout: PoseSheetLayoutMode = input.layout ?? inferPoseSheetLayout(buf);
     const saved = this.persistPoseSheetPack(
       buf,
       {
         name: input.name?.trim() || "本地定制形象",
-        about: layout === "single" ? "本地单图立绘自动装配" : "本地 3×2 姿态板自动切分装配",
+        about: layout === "single" ? "本地单图立绘自动装配" : layout === "grid_3x3" ? "本地 3×3 姿态板自动切分装配" : "本地 3×2 姿态板自动切分装配",
         stylePrompt: input.stylePrompt,
         accentColor: input.accentColor,
         eyeStyle: input.eyeStyle,

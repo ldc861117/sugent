@@ -271,6 +271,30 @@ export function ChatScreen({ bot, models, modelsError, reloadModels, defaultMode
     });
   }, [fillReq && fillReq.at]);
 
+  useEffect(() => {
+    const applyDraft = (draft, targetHash) => {
+      if (!draft) return;
+      if (targetHash) {
+        const m = String(targetHash).replace(/^#/, "").match(/^\/chat\/([^/?#]+)/);
+        if (m && decodeURIComponent(m[1]) !== bot.id) return;
+      }
+      try { sessionStorage.removeItem("sugent-handoff-draft"); } catch { /* ignore */ }
+      setText(draft);
+      setSlashOff(true);
+      requestAnimationFrame(() => {
+        ta.current?.focus();
+        autoGrow(ta.current);
+      });
+    };
+    try {
+      const stored = sessionStorage.getItem("sugent-handoff-draft");
+      if (stored) applyDraft(stored);
+    } catch { /* ignore */ }
+    const onHandoff = (e) => applyDraft(e?.detail?.draftText, e?.detail?.hash);
+    window.addEventListener("sugent:handoff-draft", onHandoff);
+    return () => window.removeEventListener("sugent:handoff-draft", onHandoff);
+  }, [bot.id]);
+
   // ended：刚接着的那条消息结束了 { since, ms }，存下的回复照样显示"用时"（和一直停在这页时一样）
   const load = useCallback(async (ended) => {
     try {
@@ -439,6 +463,8 @@ export function ChatScreen({ bot, models, modelsError, reloadModels, defaultMode
     if (isError(finalText)) {
       setCue({ kind: "error", at: Date.now() });
       failed(errText(finalText));
+    } else if (finalText && bot.id === "default") {
+      setCue({ kind: "done", at: Date.now(), notice: plainSnippet(finalText).slice(0, 48) });
     }
     load({ since: t.startedAt, ms: Date.now() - t.startedAt });
   };
@@ -498,6 +524,7 @@ export function ChatScreen({ bot, models, modelsError, reloadModels, defaultMode
       if (isActive(gs) && guideStep(gs)) refreshGuide();
     }
     if (isError(finalText)) setCue({ kind: "error", at: Date.now() });
+    else if (finalText && bot.id === "default") setCue({ kind: "done", at: Date.now(), notice: plainSnippet(finalText).slice(0, 48) });
     if (reloadAfter.current) {
       reloadAfter.current = false;
       return load();
@@ -711,6 +738,42 @@ export function ChatScreen({ bot, models, modelsError, reloadModels, defaultMode
   // 头像跟着对话走：等你批准 > 还没出字（思考）/ 出字了（回复）> 你在输入（在听）
   const replying = generating && (items || []).some((x) => x.live && x.text);
   const face = pending > 0 ? "waiting" : generating ? (replying ? "replying" : "thinking") : text.trim() ? "listening" : "idle";
+  const companionBc = useRef(null);
+  const lastSigFace = useRef(null);
+  const lastSigCueAt = useRef(0);
+  useEffect(() => {
+    if (bot.id !== "default") return;
+    try {
+      if (typeof BroadcastChannel !== "undefined") companionBc.current = new BroadcastChannel("sugent-companion-bus");
+    } catch { /* ignore */ }
+    return () => {
+      try { companionBc.current?.close(); } catch { /* ignore */ }
+      companionBc.current = null;
+      lastSigFace.current = null;
+      lastSigCueAt.current = 0;
+    };
+  }, [bot.id]);
+  useEffect(() => {
+    if (bot.id !== "default") return;
+    const hasNewCue = !!(cue?.at && cue.at !== lastSigCueAt.current && (cue.kind === "done" || cue.kind === "error"));
+    const faceChanged = lastSigFace.current !== face;
+    if (!hasNewCue && !faceChanged) return;
+    if (!hasNewCue && lastSigFace.current === null && face === "idle") {
+      lastSigFace.current = face;
+      return;
+    }
+    lastSigFace.current = face;
+    if (hasNewCue) lastSigCueAt.current = cue.at;
+    const payload = {
+      kind: "main_state",
+      state: face,
+      ...(hasNewCue ? { cue: cue.kind } : {}),
+      ...(hasNewCue && cue.notice ? { notice: cue.notice } : {}),
+      at: Date.now(),
+    };
+    try { companionBc.current?.postMessage(payload); } catch { /* ignore */ }
+    void api("/steward/companion/signal", { method: "POST", body: payload }).catch(() => {});
+  }, [bot.id, face, cue && cue.at]);
   const toBottomBtn = usePresence(!atBottom);
   // 点发送 / 停止不抢输入框的焦点：光标留在原处，接着就能打下一句（键盘 Tab 过去照样能按）
   const keepFocus = (e) => e.preventDefault();

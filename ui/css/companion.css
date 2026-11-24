@@ -89,6 +89,44 @@
     line-height: var(--lh-snug);
   }
 
+  .comp-approval-cmd {
+    font-family: var(--code);
+    font-size: var(--fs-2xs);
+    color: var(--muted);
+    word-break: break-all;
+  }
+
+  .comp-handoff {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-2-5);
+    border-radius: var(--r-well);
+    background: var(--accent-wash);
+    font-size: var(--fs-xs);
+    color: var(--fg);
+  }
+
+  .comp-handoff-text {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .comp-reply-wrap {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1-5);
+  }
+
+  .comp-reply-foot {
+    display: flex;
+    justify-content: flex-end;
+    gap: var(--space-1-5);
+  }
+
   .comp-reply {
     max-height: 92px;
     overflow-y: auto;
@@ -144,6 +182,66 @@
   .comp-pill.cooling {
     background: var(--amber-wash);
     border: var(--hairline) solid var(--amber);   /* 描边：防社死冷静撤回警示条 */
+  }
+
+  .comp-pill.done-pill {
+    cursor: pointer;
+    background: var(--accent-wash);
+    border: var(--hairline) solid var(--accent-line);   /* 描边：主窗口完工快捷跳转胶囊 */
+    transition: background var(--t-fast), transform var(--t-fast);
+  }
+
+  .comp-pill.done-pill:hover {
+    background: var(--grain), var(--glass-sheet);
+  }
+
+  .comp-pill-text {
+    max-width: 196px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .comp-ctx-menu {
+    min-width: 176px;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-0-5);
+    padding: var(--space-1-5);
+    border-radius: var(--r-pane);
+    background: var(--grain), var(--glass-sheet);
+    backdrop-filter: var(--glass-filter-lg);
+    border: var(--hairline) solid var(--glass-edge);   /* 描边：浏览器预览右键玻璃菜单 */
+    box-shadow: var(--shadow-pop);
+    z-index: var(--z-popover);
+    --rise: var(--space-1);
+    animation: rise-in var(--dur-fast) var(--ease-spring);
+  }
+
+  .comp-ctx-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    width: 100%;
+    padding: var(--space-1-5) var(--space-2-5);
+    border-radius: var(--r-md);
+    font-size: var(--fs-xs);
+    color: var(--fg);
+    text-align: left;
+    transition: background var(--t-fast);
+  }
+
+  .comp-ctx-item:hover {
+    background: var(--sel);
+  }
+
+  .comp-ctx-item.danger {
+    color: var(--red);
+  }
+
+  .comp-ctx-sep {
+    height: var(--hairline);
+    margin: var(--space-0-5) var(--space-1);
+    background: var(--line-2);
   }
 
   .comp-orb {

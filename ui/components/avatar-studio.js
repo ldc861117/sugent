@@ -1,4 +1,4 @@
-import { useRef, useState } from "preact/hooks";
+import { useEffect, useRef, useState } from "preact/hooks";
 import { html, Button, Seg } from "./ui.js";
 import { BotAvatar, setAvatarStudioState, useAvatarStudio } from "./avatar.js";
 import { api } from "../lib/api.js";
@@ -30,6 +30,21 @@ export function AvatarStudioScreen() {
   const [prompt, setPrompt] = useState("");
   const [busy, setBusy] = useState(false);
   const fileRef = useRef(null);
+  const bcRef = useRef(null);
+
+  useEffect(() => {
+    try {
+      if (typeof BroadcastChannel !== "undefined") bcRef.current = new BroadcastChannel("sugent-companion-bus");
+    } catch { /* ignore */ }
+    return () => {
+      try { bcRef.current?.close(); } catch { /* ignore */ }
+      bcRef.current = null;
+    };
+  }, []);
+
+  const notifyCompanionStudio = () => {
+    try { bcRef.current?.postMessage({ kind: "studio_updated", at: Date.now() }); } catch { /* ignore */ }
+  };
 
   const triggerSwing = () => {
     setSwingDemo({ dragging: true, vx: 14 });
@@ -42,6 +57,7 @@ export function AvatarStudioScreen() {
     try {
       const next = await api("/steward/avatars/activate", { method: "POST", body: { id: p.id } });
       setAvatarStudioState(next);
+      notifyCompanionStudio();
       toast(t("steward.studio.activatedToast", { name: p.name }));
     } catch (e) { failed(e); } finally { setBusy(false); }
   };
@@ -52,6 +68,7 @@ export function AvatarStudioScreen() {
     try {
       const res = await api("/steward/avatars/customize", { method: "PUT", body: { id: active.id, ...patch } });
       if (res?.state) setAvatarStudioState(res.state);
+      notifyCompanionStudio();
       toast(t("steward.studio.savedToast"));
     } catch (e) { failed(e); } finally { setBusy(false); }
   };
@@ -75,6 +92,7 @@ export function AvatarStudioScreen() {
         },
       });
       if (res?.state) setAvatarStudioState(res.state);
+      notifyCompanionStudio();
       setStageCue({ kind: "hello", at: Date.now() });
       toast(t("steward.studio.generatedToast", { name: res.pack?.name || "" }));
     } catch (e) { failed(e); } finally { setBusy(false); }
@@ -96,6 +114,7 @@ export function AvatarStudioScreen() {
         body: { name: name.trim() || file.name.replace(/\.[^.]+$/, ""), dataBase64: dataUrl, layout: importLayout },
       });
       if (res?.state) setAvatarStudioState(res.state);
+      notifyCompanionStudio();
       setStageCue({ kind: "hello", at: Date.now() });
       toast(t("steward.studio.importedToast", { name: res.pack?.name || "" }));
     } catch (err) { failed(err); } finally {
@@ -109,6 +128,7 @@ export function AvatarStudioScreen() {
     try {
       const next = await api(`/steward/avatars/${encodeURIComponent(p.id)}`, { method: "DELETE" });
       setAvatarStudioState(next);
+      notifyCompanionStudio();
       toast(t("steward.studio.deletedToast"));
     } catch (e) { failed(e); } finally { setBusy(false); }
   };

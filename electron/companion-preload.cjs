@@ -16,4 +16,17 @@ contextBridge.exposeInMainWorld("sugentCompanion", {
     ipcRenderer.on("companion:context", handler);
     return () => ipcRenderer.removeListener("companion:context", handler);
   },
+  onPointer: (fn) => {
+    const handler = (_e, data) => fn(data);
+    ipcRenderer.on("companion:pointer", handler);
+    return () => ipcRenderer.removeListener("companion:pointer", handler);
+  },
+  onSignal: (fn) => {
+    const handler = (_e, data) => fn(data);
+    ipcRenderer.on("companion:signal", handler);
+    return () => ipcRenderer.removeListener("companion:signal", handler);
+  },
+  showContextMenu: (opts) => ipcRenderer.send("companion:show-context-menu", opts || {}),
+  handoffToMain: (payload) => ipcRenderer.send("companion:handoff", payload || {}),
+  setDockMode: (mode) => ipcRenderer.send("companion:set-dock-mode", String(mode || "screen")),
 });

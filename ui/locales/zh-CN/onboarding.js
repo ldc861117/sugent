@@ -115,6 +115,10 @@ export default {
     syncNodeStats: "本机图谱节点：{nodes} 个 · 时钟 v{clock}",
     syncPushedToast: "已完成端侧零知识加密上传（v{clock}）",
     syncPulledToast: "已拉取并合并图谱（共 {nodes} 个节点）",
+    syncModelsBtn: "同步模型",
+    syncModelsRunning: "同步中…",
+    syncModelsDoneToast: "已对齐 {count} 个对话模型",
+    modelCountBadge: "{count} 个模型",
   },
   line: {
     label: "线路",

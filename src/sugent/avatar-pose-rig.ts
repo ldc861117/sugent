@@ -1,8 +1,28 @@
 import { decodeImageBufferToRgba, encodeRgbaToPng } from "./avatar-rig.js";
 
 export const POSE_KEYS = ["idle", "listening", "thinking", "working", "waiting", "sleep"] as const;
-export type AvatarPoseKey = (typeof POSE_KEYS)[number];
-export type PoseSheetLayoutMode = "grid_3x2" | "single";
+export const POSE_KEYS_3X3 = [
+  "idle_left",
+  "idle",
+  "idle_right",
+  "listening",
+  "thinking",
+  "working",
+  "waiting",
+  "ack",
+  "sleep",
+] as const;
+export type CoreAvatarPoseKey = (typeof POSE_KEYS)[number];
+export type AvatarPoseKey = (typeof POSE_KEYS_3X3)[number];
+export type PoseSheetLayoutMode = "grid_3x3" | "grid_3x2" | "single";
+
+export interface PoseEyeSpots {
+  left: [number, number];
+  right: [number, number];
+  r: number;
+  bgRgb: [number, number, number];
+  eyeRgb: [number, number, number];
+}
 
 export interface PoseCellMetrics {
   key: AvatarPoseKey;
@@ -13,16 +33,17 @@ export interface PoseCellMetrics {
   headEndY: number;
   torsoEndY: number;
   coverage: number;
+  eyeSpots?: PoseEyeSpots;
   fallbackFrom?: AvatarPoseKey;
 }
 
 export interface PoseSheetRigMetadata {
-  grid: [3, 2];
+  grid: [3, 3] | [3, 2];
   cellSize: number;
   sheetSize: [number, number];
   portraitSize: number;
   layoutMode: PoseSheetLayoutMode;
-  cells: Record<AvatarPoseKey, PoseCellMetrics>;
+  cells: Partial<Record<AvatarPoseKey, PoseCellMetrics>> & Record<CoreAvatarPoseKey, PoseCellMetrics>;
 }
 
 export interface RigPoseSheetOptions {
@@ -39,11 +60,14 @@ export interface RiggedPoseSheetResult {
 }
 
 export const POSE_HEIGHT_RATIOS: Record<AvatarPoseKey, number> = {
+  idle_left: 0.86,
   idle: 0.86,
+  idle_right: 0.86,
   listening: 0.92,
   thinking: 0.95,
   working: 0.9,
   waiting: 1.0,
+  ack: 0.94,
   sleep: 0.72,
 };
 
@@ -63,12 +87,12 @@ function makeDefaultCell(key: AvatarPoseKey, idx: number): PoseCellMetrics {
 }
 
 export const CANONICAL_POSE_SHEET_META: PoseSheetRigMetadata = {
-  grid: [3, 2],
+  grid: [3, 3],
   cellSize: 384,
-  sheetSize: [1152, 768],
+  sheetSize: [1152, 1152],
   portraitSize: 256,
-  layoutMode: "grid_3x2",
-  cells: Object.fromEntries(POSE_KEYS.map((k, i) => [k, makeDefaultCell(k, i)])) as Record<AvatarPoseKey, PoseCellMetrics>,
+  layoutMode: "grid_3x3",
+  cells: Object.fromEntries(POSE_KEYS_3X3.map((k, i) => [k, makeDefaultCell(k, i)])) as PoseSheetRigMetadata["cells"],
 };
 
 const clampByte = (v: number) => (v < 0 ? 0 : v > 255 ? 255 : Math.round(v));
@@ -78,7 +102,7 @@ const medianNum = (a: number[]) => {
   return s[Math.floor(s.length / 2)]!;
 };
 
-function removePoseSheetBackground(rgba: Uint8Array, w: number, h: number, gridMode: boolean): { rgba: Uint8Array; alpha: Float32Array } {
+function removePoseSheetBackground(rgba: Uint8Array, w: number, h: number, gridRows: number): { rgba: Uint8Array; alpha: Float32Array } {
   const n = w * h;
   const out = new Uint8Array(rgba);
   let transCount = 0;
@@ -122,10 +146,10 @@ function removePoseSheetBackground(rgba: Uint8Array, w: number, h: number, gridM
   };
   for (let x = 0; x < w; x++) { trySeed(x); trySeed((h - 1) * w + x); }
   for (let y = 1; y < h - 1; y++) { trySeed(y * w); trySeed(y * w + w - 1); }
-  if (gridMode) {
-    for (let r = 0; r < 2; r++) for (let c = 0; c < 3; c++) {
+  if (gridRows > 0) {
+    for (let r = 0; r < gridRows; r++) for (let c = 0; c < 3; c++) {
       const xL = Math.round((c * w) / 3) + 6, xR = Math.round(((c + 1) * w) / 3) - 7;
-      const yT = Math.round((r * h) / 2) + 6, yB = Math.round(((r + 1) * h) / 2) - 7;
+      const yT = Math.round((r * h) / gridRows) + 6, yB = Math.round(((r + 1) * h) / gridRows) - 7;
       for (const sx of [xL, xR]) for (const sy of [yT, yB]) {
         if (sx >= 0 && sx < w && sy >= 0 && sy < h && colorDist(sy * w + sx) < 16 && grad[sy * w + sx]! < 10) trySeed(sy * w + sx);
       }
@@ -145,7 +169,7 @@ function removePoseSheetBackground(rgba: Uint8Array, w: number, h: number, gridM
     let sqh = 0, sqt = 0;
     const isNeutralShadow = (i: number) => {
       const cy = (i / w) | 0;
-      const rowH = gridMode ? h / 2 : h;
+      const rowH = gridRows > 0 ? h / gridRows : h;
       const localY = (cy % rowH) / Math.max(1, rowH);
       if (localY <= 0.78) return false;
       const p = i * 4;
@@ -206,7 +230,7 @@ function removePoseSheetBackground(rgba: Uint8Array, w: number, h: number, gridM
   return { rgba: out, alpha };
 }
 
-function suppressGridLines(rgba: Uint8Array, alpha: Float32Array, w: number, h: number): void {
+function suppressGridLines(rgba: Uint8Array, alpha: Float32Array, w: number, h: number, rows: number): void {
   const clearPx = (i: number) => { alpha[i] = 0; rgba[i * 4 + 3] = 0; };
   const marginCol = Math.max(6, Math.round(w * 0.03));
   for (const target of [Math.round(w / 3), Math.round((w * 2) / 3)]) {
@@ -223,16 +247,18 @@ function suppressGridLines(rgba: Uint8Array, alpha: Float32Array, w: number, h: 
     }
   }
   const marginRow = Math.max(6, Math.round(h * 0.03));
-  const midY = Math.round(h / 2);
-  for (let y = Math.max(5, midY - marginRow); y <= Math.min(h - 6, midY + marginRow); y++) {
-    let lineHits = 0;
-    for (let x = 0; x < w; x++) {
-      const i = y * w + x;
-      if (alpha[i]! > 0.15 && alpha[i - w * 3]! < 0.2 && alpha[i + w * 3]! < 0.2) lineHits++;
-    }
-    if (lineHits > w * 0.55) for (let dy = -2; dy <= 2; dy++) for (let x = 0; x < w; x++) {
-      const idx = (y + dy) * w + x;
-      if (alpha[idx - w * 3]! < 0.2 && alpha[idx + w * 3]! < 0.2) clearPx(idx);
+  const rowTargets = rows === 3 ? [Math.round(h / 3), Math.round((h * 2) / 3)] : [Math.round(h / 2)];
+  for (const midY of rowTargets) {
+    for (let y = Math.max(5, midY - marginRow); y <= Math.min(h - 6, midY + marginRow); y++) {
+      let lineHits = 0;
+      for (let x = 0; x < w; x++) {
+        const i = y * w + x;
+        if (alpha[i]! > 0.15 && alpha[i - w * 3]! < 0.2 && alpha[i + w * 3]! < 0.2) lineHits++;
+      }
+      if (lineHits > w * 0.55) for (let dy = -2; dy <= 2; dy++) for (let x = 0; x < w; x++) {
+        const idx = (y + dy) * w + x;
+        if (alpha[idx - w * 3]! < 0.2 && alpha[idx + w * 3]! < 0.2) clearPx(idx);
+      }
     }
   }
 }
@@ -258,7 +284,7 @@ interface RawCellBox {
   key: AvatarPoseKey; col: number; row: number;
   x0: number; y0: number; x1: number; y1: number;
   minX: number; minY: number; maxX: number; maxY: number;
-  rawW: number; rawH: number; cx: number; headCx: number; coverage: number;
+  rawW: number; rawH: number; cx: number; headCx: number; lowerCx: number; neckRatio: number; coverage: number;
 }
 
 function measureCellBox(rgba: Uint8Array, alpha: Float32Array, fullW: number, key: AvatarPoseKey, col: number, row: number, x0: number, y0: number, x1: number, y1: number): RawCellBox {
@@ -290,12 +316,36 @@ function measureCellBox(rgba: Uint8Array, alpha: Float32Array, fullW: number, ke
   }
   const rawW = maxX >= minX ? maxX - minX + 1 : 0, rawH = maxY >= minY ? maxY - minY + 1 : 0;
   const cx = fg ? sumX / fg : (x0 + x1) * 0.5;
-  let topSumX = 0, topFg = 0;
+  let topSumX = 0, topFg = 0, lowSumX = 0, lowFg = 0, maxHeadSpan = 0;
   const topLim = minY + Math.ceil(rawH * 0.36);
-  for (let y = minY; y <= Math.min(maxY, topLim); y++) for (let x = minX; x <= maxX; x++) {
-    if (alpha[y * fullW + x]! > 0.18) { topSumX += x; topFg++; }
+  const lowStart = minY + Math.floor(rawH * 0.54);
+  for (let y = minY; y <= Math.min(maxY, topLim); y++) {
+    let rMin = maxX + 1, rMax = minX - 1;
+    for (let x = minX; x <= maxX; x++) if (alpha[y * fullW + x]! > 0.18) {
+      topSumX += x; topFg++; if (x < rMin) rMin = x; if (x > rMax) rMax = x;
+    }
+    if (rMax >= rMin && rMax - rMin + 1 > maxHeadSpan) maxHeadSpan = rMax - rMin + 1;
   }
-  return { key, col, row, x0, y0, x1, y1, minX, minY, maxX, maxY, rawW, rawH, cx, headCx: topFg ? topSumX / topFg : cx, coverage: fg / cn };
+  for (let y = Math.max(minY, lowStart); y <= maxY; y++) for (let x = minX; x <= maxX; x++) {
+    if (alpha[y * fullW + x]! > 0.18) { lowSumX += x; lowFg++; }
+  }
+  let neckRatio = 0.44, minSpan = Infinity;
+  if (rawH >= 32) {
+    for (let y = minY + Math.floor(rawH * 0.32); y <= minY + Math.floor(rawH * 0.54); y++) {
+      let rMin = maxX + 1, rMax = minX - 1;
+      for (let x = minX; x <= maxX; x++) if (alpha[y * fullW + x]! > 0.25) { if (x < rMin) rMin = x; if (x > rMax) rMax = x; }
+      const span = rMax >= rMin ? rMax - rMin + 1 : Infinity;
+      if (span < minSpan) { minSpan = span; neckRatio = (y - minY) / rawH; }
+    }
+    if (!(minSpan < maxHeadSpan * 0.88)) neckRatio = 0.44;
+  }
+  return {
+    key, col, row, x0, y0, x1, y1, minX, minY, maxX, maxY, rawW, rawH, cx,
+    headCx: topFg ? topSumX / topFg : cx,
+    lowerCx: lowFg ? lowSumX / lowFg : cx,
+    neckRatio: Math.max(0.34, Math.min(0.52, neckRatio)),
+    coverage: fg / cn,
+  };
 }
 
 function samplePremulCell(
@@ -316,12 +366,77 @@ function samplePremulCell(
   return [clampByte(pr / pa), clampByte(pg / pa), clampByte(pb / pa), clampByte(pa * 255)];
 }
 
+function detectCellEyeSpots(
+  sheetRgba: Uint8Array, sheetW: number, ox: number, oy: number, cellSize: number,
+  outMinX: number, outMinY: number, outMaxX: number, headEndPx: number,
+): PoseEyeSpots | undefined {
+  const y0 = Math.max(4, outMinY + 6), y1 = Math.min(cellSize - 5, headEndPx - 4);
+  const x0 = Math.max(4, outMinX + 6), x1 = Math.min(cellSize - 5, outMaxX - 6);
+  if (y1 - y0 < 16 || x1 - x0 < 16) return undefined;
+  const rs: number[] = [], gs: number[] = [], bs: number[] = [];
+  for (let dy = y0; dy <= y1; dy += 2) for (let dx = x0; dx <= x1; dx += 2) {
+    const p = ((oy + dy) * sheetW + ox + dx) * 4;
+    if (sheetRgba[p + 3]! > 225) { rs.push(sheetRgba[p]!); gs.push(sheetRgba[p + 1]!); bs.push(sheetRgba[p + 2]!); }
+  }
+  if (rs.length < 40) return undefined;
+  const bgR = medianNum(rs), bgG = medianNum(gs), bgB = medianNum(bs);
+  const bgLuma = 0.299 * bgR + 0.587 * bgG + 0.114 * bgB;
+  if (bgLuma > 135) return undefined;
+  const cw = x1 - x0 + 1, ch = y1 - y0 + 1;
+  const seen = new Uint8Array(cw * ch), q = new Int32Array(cw * ch);
+  const spots: Array<{ cx: number; cy: number; area: number; r: number; g: number; b: number }> = [];
+  const maxArea = Math.max(14, Math.round(cellSize * cellSize * 0.0028));
+  const isEyePx = (dx: number, dy: number) => {
+    const p = ((oy + dy) * sheetW + ox + dx) * 4;
+    if (sheetRgba[p + 3]! < 225) return false;
+    for (const [nx, ny] of [[dx - 4, dy], [dx + 4, dy], [dx, dy - 4], [dx, dy + 4]] as const) {
+      if (nx < 0 || nx >= cellSize || ny < 0 || ny >= cellSize) return false;
+      if (sheetRgba[((oy + ny) * sheetW + ox + nx) * 4 + 3]! < 210) return false;
+    }
+    const l = 0.299 * sheetRgba[p]! + 0.587 * sheetRgba[p + 1]! + 0.114 * sheetRgba[p + 2]!;
+    return l - bgLuma > 52;
+  };
+  for (let ly = 0; ly < ch; ly++) for (let lx = 0; lx < cw; lx++) {
+    const li = ly * cw + lx;
+    if (seen[li] || !isEyePx(x0 + lx, y0 + ly)) continue;
+    let hd = 0, tl = 0, sx = 0, sy = 0, sr = 0, sg = 0, sb = 0;
+    q[tl++] = li; seen[li] = 1;
+    while (hd < tl) {
+      const c = q[hd++]!, cx = x0 + (c % cw), cy = y0 + ((c / cw) | 0);
+      const p = ((oy + cy) * sheetW + ox + cx) * 4;
+      sx += cx; sy += cy; sr += sheetRgba[p]!; sg += sheetRgba[p + 1]!; sb += sheetRgba[p + 2]!;
+      for (const [nx, ny] of [[cx - 1, cy], [cx + 1, cy], [cx, cy - 1], [cx, cy + 1]] as const) {
+        if (nx < x0 || nx > x1 || ny < y0 || ny > y1) continue;
+        const ni = (ny - y0) * cw + (nx - x0);
+        if (!seen[ni] && isEyePx(nx, ny)) { seen[ni] = 1; q[tl++] = ni; }
+      }
+    }
+    if (tl >= 2 && tl <= maxArea) spots.push({ cx: sx / tl, cy: sy / tl, area: tl, r: sr / tl, g: sg / tl, b: sb / tl });
+  }
+  if (spots.length !== 2) return undefined;
+  spots.sort((a, b) => a.cx - b.cx);
+  const [sL, sR] = [spots[0]!, spots[1]!];
+  const sep = sR.cx - sL.cx;
+  if (Math.abs(sL.cy - sR.cy) > cellSize * 0.048 || sep < cellSize * 0.05 || sep > cellSize * 0.36) return undefined;
+  const radPx = Math.max(2.2, Math.sqrt((sL.area + sR.area) / (2 * Math.PI)));
+  return {
+    left: [Number((sL.cx / cellSize).toFixed(4)), Number((sL.cy / cellSize).toFixed(4))],
+    right: [Number((sR.cx / cellSize).toFixed(4)), Number((sR.cy / cellSize).toFixed(4))],
+    r: Number((radPx / cellSize).toFixed(4)),
+    bgRgb: [clampByte(bgR), clampByte(bgG), clampByte(bgB)],
+    eyeRgb: [clampByte((sL.r + sR.r) * 0.5), clampByte((sL.g + sR.g) * 0.5), clampByte((sL.b + sR.b) * 0.5)],
+  };
+}
+
 export function rigPoseSheetImageBuffer(imageBuffer: Buffer, opts: RigPoseSheetOptions = {}): RiggedPoseSheetResult {
-  const layout: PoseSheetLayoutMode = opts.layout ?? "grid_3x2";
   const cellSize = opts.cellSize ?? 384;
   const portraitSize = opts.portraitSize ?? 256;
   const { width: w, height: h, rgba: srcRgba } = decodeImageBufferToRgba(imageBuffer);
-  const { rgba, alpha } = removePoseSheetBackground(srcRgba, w, h, layout === "grid_3x2");
+  const layout: PoseSheetLayoutMode = opts.layout ?? (w / Math.max(1, h) >= 1.22 ? "grid_3x2" : "grid_3x3");
+  const gridRows = layout === "single" ? 0 : layout === "grid_3x3" ? 3 : 2;
+  const outRows: 2 | 3 = layout === "grid_3x3" ? 3 : 2;
+  const activeKeys: readonly AvatarPoseKey[] = layout === "grid_3x3" ? POSE_KEYS_3X3 : POSE_KEYS;
+  const { rgba, alpha } = removePoseSheetBackground(srcRgba, w, h, gridRows);
   const warnings: string[] = [];
 
   let rawCells: RawCellBox[];
@@ -329,12 +444,14 @@ export function rigPoseSheetImageBuffer(imageBuffer: Buffer, opts: RigPoseSheetO
     const one = measureCellBox(rgba, alpha, w, "idle", 0, 0, 0, 0, w, h);
     rawCells = POSE_KEYS.map((key, i) => ({ ...one, key, col: i % 3, row: Math.floor(i / 3) }));
   } else {
-    suppressGridLines(rgba, alpha, w, h);
+    suppressGridLines(rgba, alpha, w, h, outRows);
     const x1 = findSeam(alpha, w, h, Math.round(w / 3), "x");
     const x2 = findSeam(alpha, w, h, Math.round((w * 2) / 3), "x");
-    const y1 = findSeam(alpha, w, h, Math.round(h / 2), "y");
-    const xs = [0, x1, x2, w], ys = [0, y1, h];
-    rawCells = POSE_KEYS.map((key, i) => {
+    const ys = outRows === 3
+      ? [0, findSeam(alpha, w, h, Math.round(h / 3), "y"), findSeam(alpha, w, h, Math.round((h * 2) / 3), "y"), h]
+      : [0, findSeam(alpha, w, h, Math.round(h / 2), "y"), h];
+    const xs = [0, x1, x2, w];
+    rawCells = activeKeys.map((key, i) => {
       const col = i % 3, row = Math.floor(i / 3);
       return measureCellBox(rgba, alpha, w, key, col, row, xs[col]!, ys[row]!, xs[col + 1]!, ys[row + 1]!);
     });
@@ -346,23 +463,29 @@ export function rigPoseSheetImageBuffer(imageBuffer: Buffer, opts: RigPoseSheetO
 
   const refHList = (healthy.filter((c) => c.key !== "sleep").length ? healthy.filter((c) => c.key !== "sleep") : usable)
     .map((c) => (layout === "single" ? c.rawH : c.rawH / POSE_HEIGHT_RATIOS[c.key]));
-  const refStandH = medianNum(refHList) || h * 0.4;
+  const refStandH = medianNum(refHList) || h / Math.max(2, outRows) * 0.8;
   const baseScale = (cellSize * 0.78) / Math.max(1, refStandH);
+  const calcScale = (c: RawCellBox) => Math.min(baseScale, (cellSize * 0.86) / Math.max(1, c.rawW), (cellSize * 0.82) / Math.max(1, c.rawH));
+  const seatedSet = new Set<AvatarPoseKey>(["idle_left", "idle", "idle_right"]);
+  const healthySeated = healthy.filter((c) => seatedSet.has(c.key));
+  const seatedScale = layout === "grid_3x3" && healthySeated.length ? medianNum(healthySeated.map(calcScale)) : 0;
 
-  const sheetW = cellSize * 3, sheetH = cellSize * 2;
+  const sheetW = cellSize * 3, sheetH = cellSize * outRows;
   const sheetRgba = new Uint8Array(sheetW * sheetH * 4);
-  const cells = {} as Record<AvatarPoseKey, PoseCellMetrics>;
+  const cells = {} as PoseSheetRigMetadata["cells"];
 
   for (const cell of rawCells) {
     const isHealthy = healthy.includes(cell);
     const src = isHealthy ? cell : (usable.find((u) => u.key === "idle") ?? usable.find((u) => u.key === "listening") ?? usable[0]!);
-    if (!isHealthy && layout === "grid_3x2") warnings.push(`姿态 ${cell.key} 覆盖率异常(${cell.coverage.toFixed(3)})，已借用 ${src.key}`);
-    const scale = Math.min(baseScale, (cellSize * 0.86) / Math.max(1, src.rawW), (cellSize * 0.82) / Math.max(1, src.rawH));
-    const anchorX = Math.max(cellSize * 0.04 + (src.cx - src.minX) * scale, Math.min(cellSize * 0.96 - (src.maxX - src.cx) * scale, cellSize * 0.5));
+    if (!isHealthy && layout !== "single") warnings.push(`姿态 ${cell.key} 覆盖率异常(${cell.coverage.toFixed(3)})，已借用 ${src.key}`);
+    const isSeatedTrio = layout === "grid_3x3" && seatedSet.has(cell.key);
+    const scale = isSeatedTrio && seatedScale > 0 ? Math.min(seatedScale, (cellSize * 0.9) / Math.max(1, src.rawW)) : calcScale(src);
+    const pivotX = isSeatedTrio ? src.lowerCx : src.cx;
+    const anchorX = Math.max(cellSize * 0.04 + (pivotX - src.minX) * scale, Math.min(cellSize * 0.96 - (src.maxX - pivotX) * scale, cellSize * 0.5));
     const ox = cell.col * cellSize, oy = cell.row * cellSize;
     let outMinX = cellSize, outMinY = cellSize, outMaxX = 0, outMaxY = 0, outFg = 0;
     for (let dy = 0; dy < cellSize; dy++) for (let dx = 0; dx < cellSize; dx++) {
-      const sx = src.cx + (dx - anchorX) / scale;
+      const sx = pivotX + (dx - anchorX) / scale;
       const sy = src.maxY - (cellSize * 0.88 - dy) / scale;
       const [r, g, b, a] = samplePremulCell(rgba, w, sx, sy, src.minX, src.minY, src.maxX, src.maxY);
       if (a === 0) continue;
@@ -374,13 +497,16 @@ export function rigPoseSheetImageBuffer(imageBuffer: Buffer, opts: RigPoseSheetO
     const ny = outMaxY >= outMinY ? outMinY / cellSize : 0.14;
     const nw = outMaxX >= outMinX ? (outMaxX - outMinX + 1) / cellSize : 0.56;
     const nh = outMaxY >= outMinY ? (outMaxY - outMinY + 1) / cellSize : 0.74;
+    const headEndY = Number((ny + nh * src.neckRatio).toFixed(4));
+    const eyeSpots = detectCellEyeSpots(sheetRgba, sheetW, ox, oy, cellSize, outMinX, outMinY, outMaxX, Math.round(headEndY * cellSize));
     cells[cell.key] = {
       key: cell.key, col: cell.col, row: cell.row,
       bbox: [Number(nx.toFixed(4)), Number(ny.toFixed(4)), Number(nw.toFixed(4)), Number(nh.toFixed(4))],
       baselineY: 0.88,
-      headEndY: Number((ny + nh * 0.44).toFixed(4)),
+      headEndY,
       torsoEndY: Number((ny + nh * 0.74).toFixed(4)),
       coverage: Number((outFg / (cellSize * cellSize)).toFixed(4)),
+      ...(eyeSpots ? { eyeSpots } : {}),
       ...(src !== cell ? { fallbackFrom: src.key } : {}),
     };
   }
@@ -406,7 +532,7 @@ export function rigPoseSheetImageBuffer(imageBuffer: Buffer, opts: RigPoseSheetO
     poseSheetPng: encodeRgbaToPng(sheetW, sheetH, sheetRgba),
     portraitPng: encodeRgbaToPng(portraitSize, portraitSize, portraitRgba),
     poseMeta: {
-      grid: [3, 2],
+      grid: [3, outRows],
       cellSize,
       sheetSize: [sheetW, sheetH],
       portraitSize,
@@ -415,4 +541,29 @@ export function rigPoseSheetImageBuffer(imageBuffer: Buffer, opts: RigPoseSheetO
     },
     warnings,
   };
+}
+
+export function inferPoseSheetLayout(imageBuffer: Buffer): PoseSheetLayoutMode {
+  const { width: w, height: h, rgba } = decodeImageBufferToRgba(imageBuffer);
+  if (w / Math.max(1, h) >= 1.22) return "grid_3x2";
+  if (w < 192 || h < 192 || Math.abs(w - h) > Math.max(w, h) * 0.22) return "single";
+  const { alpha } = removePoseSheetBackground(rgba, w, h, 3);
+  const seamRatio = (pos: number, axis: "x" | "y") => {
+    const span = axis === "x" ? h : w;
+    let hits = 0;
+    for (let s = 0; s < span; s++) if ((axis === "x" ? alpha[s * w + pos]! : alpha[pos * w + s]!) > 0.2) hits++;
+    return hits / Math.max(1, span);
+  };
+  const x1 = findSeam(alpha, w, h, Math.round(w / 3), "x"), x2 = findSeam(alpha, w, h, Math.round((w * 2) / 3), "x");
+  const y1 = findSeam(alpha, w, h, Math.round(h / 3), "y"), y2 = findSeam(alpha, w, h, Math.round((h * 2) / 3), "y");
+  if (seamRatio(x1, "x") > 0.14 || seamRatio(x2, "x") > 0.14 || seamRatio(y1, "y") > 0.14 || seamRatio(y2, "y") > 0.14) return "single";
+  const xs = [0, x1, x2, w], ys = [0, y1, y2, h];
+  let occupied = 0;
+  for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++) {
+    let fg = 0;
+    const area = Math.max(1, (xs[c + 1]! - xs[c]!) * (ys[r + 1]! - ys[r]!));
+    for (let y = ys[r]!; y < ys[r + 1]!; y += 2) for (let x = xs[c]!; x < xs[c + 1]!; x += 2) if (alpha[y * w + x]! > 0.2) fg += 4;
+    if (fg / area >= 0.035) occupied++;
+  }
+  return occupied >= 6 ? "grid_3x3" : "single";
 }

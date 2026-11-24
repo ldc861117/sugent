@@ -290,4 +290,132 @@ describe("Sugent Avatar Rig & Gemini Studio", () => {
     expect(compHtml.status).toBe(200);
     expect(compHtml.text).toContain("companion.js");
   });
+
+  it("bridges companion signal HTTP API and DesktopHooks for live studio & handoff sync", async () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "sugent-comp-sig-data-"));
+    const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "sugent-comp-sig-home-"));
+    const cfg = loadConfig({
+      dataDir,
+      env: {
+        AMB_MAGPIE_BASE_URL: `${HTTP_PROTO}${LOOPBACK}:43199/v1`,
+        AMB_UI_PORT: "0",
+        AMB_AGENT: "off",
+        AMB_WEIXIN_API_BASE: `${HTTP_PROTO}${LOOPBACK}:9`,
+      },
+    });
+    const app = new App(cfg, { printQrToTerminal: false, fileLog: false, stewardHomeDir: homeDir });
+    const notified: Array<Record<string, unknown>> = [];
+    const handoffs: Array<{ hash?: string; draftText?: string; source?: string }> = [];
+    app.desktop = {
+      autostart: () => ({ supported: false, on: false }),
+      setAutostart: () => {},
+      applyZoom: () => {},
+      openDataDir: () => {},
+      openInBrowser: () => {},
+      openExternal: () => {},
+      companionState: () => ({ supported: true, visible: true, expanded: false, dockEdge: "bottom", facing: "left", dockMode: "screen" }),
+      notifyCompanion: (payload) => notified.push(payload),
+      handoffCompanionToMain: (payload) => handoffs.push(payload),
+    };
+    await app.start();
+    cleanups.push(async () => {
+      await app.stop();
+      fs.rmSync(dataDir, { recursive: true, force: true });
+      fs.rmSync(homeDir, { recursive: true, force: true });
+    });
+
+    const callApi = async (pathname: string, method = "GET", body?: unknown) => {
+      const res = await app.web!.inject(`/amb/api${pathname}`, {
+        method,
+        headers: body !== undefined ? { "content-type": "application/json" } : {},
+        ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+      });
+      return { status: res.status, json: res.text ? JSON.parse(res.text) : {} };
+    };
+
+    const initComp = await callApi("/steward/companion");
+    expect(initComp.status).toBe(200);
+    expect(initComp.json.supported).toBe(true);
+    expect(initComp.json.lastSignal).toBeNull();
+
+    const blankB64 = fs.readFileSync(BLANK_PNG_PATH).toString("base64");
+    const imp = await callApi("/steward/avatars/import", "POST", { name: "Signal Test", dataBase64: blankB64 });
+    expect(imp.status).toBe(200);
+    const customId = imp.json.pack.id as string;
+    expect(notified.at(-1)?.kind).toBe("studio_updated");
+
+    const cust = await callApi("/steward/avatars/customize", "PUT", { id: customId, eyeColor: "#00ffee" });
+    expect(cust.status).toBe(200);
+    expect(notified.at(-1)?.kind).toBe("studio_updated");
+
+    const act = await callApi("/steward/avatars/activate", "POST", { id: "sugent-core" });
+    expect(act.status).toBe(200);
+    expect(notified.at(-1)?.kind).toBe("studio_updated");
+
+    const del = await callApi(`/steward/avatars/${encodeURIComponent(customId)}`, "DELETE");
+    expect(del.status).toBe(200);
+    expect(notified.filter((n) => n.kind === "studio_updated")).toHaveLength(4);
+    expect(handoffs).toHaveLength(0);
+
+    const badSig = await callApi("/steward/companion/signal", "POST", { kind: "unknown_kind" });
+    expect(badSig.status).toBe(400);
+
+    const clientAt = Date.now() - 500;
+    const mainSig = await callApi("/steward/companion/signal", "POST", {
+      kind: "main_state",
+      state: "thinking",
+      cue: "done",
+      notice: "Draft ready",
+      at: clientAt,
+    });
+    expect(mainSig.status).toBe(200);
+    expect(mainSig.json.ok).toBe(true);
+    expect(mainSig.json.signal).toMatchObject({
+      kind: "main_state",
+      state: "thinking",
+      cue: "done",
+      notice: "Draft ready",
+      at: clientAt,
+    });
+    expect(notified.at(-1)).toMatchObject({ kind: "main_state", state: "thinking", cue: "done" });
+    expect(handoffs).toHaveLength(0);
+
+    const afterMain = await callApi("/steward/companion");
+    expect(afterMain.status).toBe(200);
+    expect(afterMain.json.lastSignal).toMatchObject({ kind: "main_state", state: "thinking", cue: "done" });
+
+    const studioSig = await callApi("/steward/companion/signal", "POST", { kind: "studio_updated" });
+    expect(studioSig.status).toBe(200);
+    expect(studioSig.json.signal.kind).toBe("studio_updated");
+    expect(notified.at(-1)?.kind).toBe("studio_updated");
+    expect((await callApi("/steward/companion")).json.lastSignal.kind).toBe("studio_updated");
+
+    const handoffSig = await callApi("/steward/companion/signal", "POST", {
+      kind: "handoff",
+      hash: "#/chat/default",
+      draftText: "Continue reviewing contract",
+      source: "companion",
+    });
+    expect(handoffSig.status).toBe(200);
+    expect(handoffSig.json.ok).toBe(true);
+    expect(handoffSig.json.signal).toMatchObject({
+      kind: "handoff",
+      hash: "#/chat/default",
+      draftText: "Continue reviewing contract",
+      source: "companion",
+    });
+    expect(notified.at(-1)).toMatchObject({ kind: "handoff", hash: "#/chat/default" });
+    expect(handoffs).toEqual([
+      { hash: "#/chat/default", draftText: "Continue reviewing contract", source: "companion" },
+    ]);
+
+    const afterHandoff = await callApi("/steward/companion");
+    expect(afterHandoff.status).toBe(200);
+    expect(afterHandoff.json.lastSignal).toMatchObject({
+      kind: "handoff",
+      hash: "#/chat/default",
+      draftText: "Continue reviewing contract",
+      source: "companion",
+    });
+  });
 });
