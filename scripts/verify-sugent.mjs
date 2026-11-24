@@ -107,6 +107,18 @@ import {
   quarantineSelfEvolutionArtifact,
   listQuarantinedArtifacts,
   runGardenerCycle,
+  ModelPoolSyncer,
+  RoutingExperienceStore,
+  AdaptiveModelRouter,
+  HotBundleSlotManager,
+  HotReloadBus,
+  HotCoreSupervisor,
+  generateHotBundleKeyPair,
+  createSignedHotBundle,
+  verifyHotBundleArchive,
+  hasVerifiedActiveOrPendingSlot,
+  OwnerChannelStewardRouter,
+  resolveUnifiedCausalLedgerDir,
 } from "../dist/src/sugent/index.js";
 import { normalizeSettings } from "../dist/src/agent/settings.js";
 
@@ -860,6 +872,146 @@ import { normalizeSettings } from "../dist/src/agent/settings.js";
   }
 }
 
+// 21. CLIProxyAPI 全量模型对齐、熔断避让、经验后验反转与离线主权契约校验
+{
+  const rtDir = fs.mkdtempSync(path.join(os.tmpdir(), "sugent-rt-verify-"));
+  try {
+    const reg = new ProviderRegistry(rtDir);
+    reg.upsertProvider({ id: "cp", preset: "custom-openai", baseUrl: "http://127.0.0.1:8317/v1", apiKey: "sk-verify", enabled: true, setDefault: true, models: ["gpt-5-nano", "claude-sonnet-4-6", "gemini-4-hydrogen-xhigh", "text-embedding-3-small"] });
+    const cat = new SugentModelCatalog(rtDir);
+    const pool = new ModelPoolSyncer({ dataDir: rtDir, providers: reg, catalog: cat });
+    assert.equal(pool.listChatCandidates().length, 3);
+
+    const exp = new RoutingExperienceStore({ dataDir: rtDir });
+    const router = new AdaptiveModelRouter({ pool, experience: exp, providers: reg, catalog: cat });
+    const quick = router.planRoute({ role: "steward", text: "记个待办", hasTools: true });
+    assert.equal(quick?.primary.rawModelId, "gpt-5-nano");
+
+    pool.recordInfraFailure("cp/gpt-5-nano", 429);
+    const quickAfter429 = router.planRoute({ role: "steward", text: "记个待办", hasTools: true });
+    assert.notEqual(quickAfter429?.primary.rawModelId, "gpt-5-nano");
+    assert.ok(quickAfter429?.skippedCoolingModels.includes("gpt-5-nano"));
+
+    const nl = exp.applyNaturalLanguageDirective("以后写代码优先使用 claude-sonnet-4-6", pool.listChatCandidates().map((e) => e.targetId));
+    assert.equal(nl.matched, true);
+    const coding = router.planRoute({ role: "executor", text: "修复 TypeScript 编译错误", hasTools: true });
+    assert.equal(coding?.primary.rawModelId, "claude-sonnet-4-6");
+  } finally {
+    fs.rmSync(rtDir, { recursive: true, force: true });
+  }
+}
+
+// 22. 分层热启动与热更新引擎契约验证 (L0-L3)
+{
+  const hotDir = fs.mkdtempSync(path.join(os.tmpdir(), "sugent-hot-verify-"));
+  const srcDir = path.join(hotDir, "src-bundle");
+  const uiDir = path.join(hotDir, "ui");
+  try {
+    assert.equal(hasVerifiedActiveOrPendingSlot(hotDir), false);
+    fs.mkdirSync(path.join(srcDir, "dist", "src", "sugent"), { recursive: true });
+    fs.mkdirSync(path.join(srcDir, "ui"), { recursive: true });
+    fs.writeFileSync(path.join(srcDir, "dist", "src", "sugent", "hot-core-entry.js"), "export const ok = true;\n");
+    fs.writeFileSync(path.join(srcDir, "ui", "index.html"), "<html>ok</html>\n");
+    const keys = generateHotBundleKeyPair();
+    const packed = createSignedHotBundle({ sourceRoot: srcDir, version: "0.2.0", privateKeyPem: keys.privateKeyPem, includePaths: ["dist", "ui"] });
+    const ver = verifyHotBundleArchive(packed.buffer, { trustedPublicKeys: [keys.publicKeyPem] });
+    assert.equal(ver.ok, true);
+
+    const mgr = new HotBundleSlotManager(hotDir);
+    const staged = mgr.stageBundleBuffer(packed.buffer, { trustedPublicKeys: [keys.publicKeyPem] });
+    assert.equal(staged.ok, true);
+    mgr.commitPendingSlot();
+    assert.equal(hasVerifiedActiveOrPendingSlot(hotDir), true);
+    assert.equal(mgr.resolveBootTarget({ entryPath: "/f/entry.js", uiDir }).slot, staged.slot);
+    mgr.resetToFactoryGolden();
+    assert.equal(mgr.resolveBootTarget({ entryPath: "/f/entry.js", uiDir }).slot, "factory");
+
+    const pluginsDir = path.join(hotDir, "self-repo", "extensions", "plugins");
+    fs.mkdirSync(pluginsDir, { recursive: true });
+    fs.writeFileSync(path.join(pluginsDir, "verify.mjs"), "export const n = 7;\n");
+    fs.writeFileSync(path.join(pluginsDir, "verify.json"), JSON.stringify({ id: "sugent-ext-verify", apiVersion: 1 }));
+    const bus = new HotReloadBus({ dataDir: hotDir, uiDir });
+    const rel = bus.reloadExtensions();
+    assert.equal(rel.pluginCount, 1);
+    assert.deepEqual(rel.validIds, ["sugent-ext-verify"]);
+    assert.equal((await bus.loadHotPluginModule(path.join(pluginsDir, "verify.mjs"))).n, 7);
+    bus.close();
+  } finally {
+    fs.rmSync(hotDir, { recursive: true, force: true });
+  }
+}
+
+// 23. Wave P0 统一因果账本、技能结晶沙盒门禁、唯一幕僚通道桥与安全信封契约验证
+{
+  const p0Dir = fs.mkdtempSync(path.join(os.tmpdir(), "sugent-p0-verify-"));
+  try {
+    // 23.1 统一因果账本路径与历史迁移零丢账
+    const legacyDir = path.join(p0Dir, "sugent-ledger");
+    const leg = new CausalLedger(legacyDir);
+    leg.append({ roundId: "rnd-legacy", kind: "round_triggered", at: "2026-11-23T08:00:00.000Z", title: "历史轮次" });
+    const unifiedDir = resolveUnifiedCausalLedgerDir(p0Dir);
+    assert.equal(unifiedDir, path.join(p0Dir, "sugent-stewardship"));
+    const unified = new CausalLedger(unifiedDir);
+    assert.equal(unified.traceRound("rnd-legacy")?.title, "历史轮次");
+
+    // 23.2 技能结晶候选门禁与 12 个激活上限淘汰
+    const kg = new SugentKnowledgeGraph(path.join(p0Dir, "kg"));
+    const skillsDir = path.join(p0Dir, "skills");
+    for (let i = 1; i <= 14; i += 1) {
+      kg.applyDelta({
+        nodes: [{ id: `wf:p0-${i}`, kind: "workflow", name: `Flow ${i}`, summary: `flow ${i}`, tags: [], reinforcements: 3 + i, steps: ["step1", "step2"] }],
+        edges: [],
+      });
+    }
+    assert.equal(kg.crystallizeSkillsToDir(skillsDir, { gated: true, maxActiveSkills: 12 }).length, 0);
+    assert.equal(kg.listSkillCandidates().length, 14);
+    for (let i = 1; i <= 14; i += 1) assert.equal(kg.approveSkillCandidate(`wf:p0-${i}`), true);
+    assert.equal(kg.crystallizeSkillsToDir(skillsDir, { gated: true, maxActiveSkills: 12 }).length, 12);
+    assert.equal(fs.readdirSync(skillsDir).length, 12);
+
+    // 23.3 主理人跨渠道唯一幕僚路由与公私隔离
+    let converseCalls = 0;
+    let retryCalls = 0;
+    const ownerRouter = new OwnerChannelStewardRouter({
+      steward: {
+        async converse(input) {
+          converseCalls += 1;
+          return { ok: true, intent: "llm_agent", reply: `已由唯一幕僚响应(${input.channel}): ${input.text}` };
+        },
+        async retryLastTurnStronger() {
+          retryCalls += 1;
+          return { ok: true, intent: "llm_agent", reply: "已升级至前沿模型重新推理" };
+        },
+      },
+    });
+    const guestRes = await ownerRouter.tryHandleInbound({ channel: "weixin", peerId: "guest", isGroup: false, isOwnerPeer: false, text: "查家底" });
+    assert.equal(guestRes.handled, false);
+    const groupRes = await ownerRouter.tryHandleInbound({ channel: "feishu", peerId: "grp", isGroup: true, isOwnerPeer: true, text: "查家底" });
+    assert.equal(groupRes.handled, false);
+    const ownerRes = await ownerRouter.tryHandleInbound({ channel: "weixin", peerId: "owner-1", isGroup: false, isOwnerPeer: true, text: "看今日重点" });
+    assert.equal(ownerRes.handled, true);
+    assert.equal(converseCalls, 1);
+    const retryRes = await ownerRouter.tryHandleInbound({ channel: "weixin", peerId: "owner-1", isGroup: false, isOwnerPeer: true, text: "换更强模型重试" });
+    assert.equal(retryRes.handled, true);
+    assert.equal(retryCalls, 1);
+
+    // 23.4 宿主 RuleEvents 安全信封越权剥离与只读隔离
+    const capturedEvents = [];
+    const enveloped = createEnvelopedRuleEventSink(
+      { emitRuleEvent(_src, ev) { capturedEvents.push(ev); return ["rule-1"]; } },
+      { privilegedFieldMode: "strip", resolveWorkspaceDir: () => path.join(p0Dir, "ws") },
+    );
+    enveloped.emitRuleEvent("github:sugent/repo", { id: "ev-1", type: "push", title: "raw untrusted", cwd: "/root", permission: "all" });
+    assert.equal(capturedEvents.length, 1);
+    assert.equal(capturedEvents[0].cwd, undefined);
+    assert.equal(capturedEvents[0].permission, undefined);
+    assert.equal(capturedEvents[0].title, undefined);
+    assert.ok(fs.existsSync(path.join(p0Dir, "ws", capturedEvents[0].contextFile)));
+  } finally {
+    fs.rmSync(p0Dir, { recursive: true, force: true });
+  }
+}
+
 console.log(
-  "verify:sugent — 全部核心契约断言通过 (M1.1–M1.6 / M2.1 / Cowork 联邦 / P0 Broker + P1 幕僚耳麦 + P2 BYOK 诊断与零知识加密同步 / Sprint 1–3 / M1–M4 Vibe Coding 闭环 / 能力自感知与全文读取 / 形象工坊与桌宠契约 / M-Auto 1–4 双环自治与 SIM 演进)",
+  "verify:sugent — 全部核心契约断言通过 (M1.1–M1.6 / M2.1 / Cowork 联邦 / P0 Broker + P1 幕僚耳麦 + P2 BYOK 诊断与零知识加密同步 / Sprint 1–3 / M1–M4 Vibe Coding 闭环 / 能力自感知与全文读取 / 形象工坊与桌宠契约 / M-Auto 1–4 双环自治与 SIM 演进 / M1–M3 全量模型同步与经验驱动自适应路由 / L0–L3 分层热启动与热更新 / Wave P0 双脑归一与宿主主循环合龙)",
 );

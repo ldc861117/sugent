@@ -105,6 +105,13 @@ export interface RuntimeOptions {
   access?: AccessControl;
   /** P1 幕僚耳麦与明牌数字助理入站钩子（未开启时返回 undefined，零侵入保留原行为） */
   conciergeIntercept?: (ev: InboundEvent) => { handled: boolean; ack?: string } | undefined;
+  /** P0 主理人微信/飞书私聊直连唯一幕僚大脑薄钩子（非主理人或未启用时返回 handled=false 回退原通路） */
+  ownerStewardIntercept?: (
+    ev: InboundEvent,
+    conversationId: string,
+    text: string,
+    onBeforeReply?: () => Promise<void>,
+  ) => Promise<{ handled: boolean; reply?: string } | undefined>;
   /**
    * 模型请求失败后调用：核对 Key 是否已失效（例如在 Modelflare 控制台被删）并重新签发。
    * 返回 true = 换了 Key，这条消息自动再试一次（只在还没有任何输出时）。缺省不重试。
@@ -388,6 +395,30 @@ export class BotRuntime {
       if (reply !== null) {
         await out.apply({ type: "text", text: reply });
         return;
+      }
+    }
+
+    if (this.opts.ownerStewardIntercept && ev.channel !== "web") {
+      let typingStarted = false;
+      const ensureTyping = async () => {
+        if (!typingStarted) {
+          typingStarted = true;
+          await out.apply({ type: "typing", on: true });
+        }
+      };
+      try {
+        const stewardOut = await this.opts.ownerStewardIntercept(ev, conv.id, text, ensureTyping);
+        if (stewardOut?.handled) {
+          if (!run.userStored) store.addMessage(conv.id, "user", text);
+          run.userStored = true;
+          const replyText = stewardOut.reply || t("runtime.emptyReply");
+          store.addMessage(conv.id, "assistant", replyText);
+          await out.apply({ type: "text", text: replyText });
+          this.answered(conv.id, run);
+          return;
+        }
+      } finally {
+        if (typingStarted) await out.apply({ type: "typing", on: false });
       }
     }
 

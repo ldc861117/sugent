@@ -194,6 +194,7 @@ export interface VibeCodingPipelineOptions {
   gateRunner?: IndependentGateRunner;
   commandRunner?: CommandExecPort;
   notifyChannel?: (event: VibeNotificationEvent) => Promise<void> | void;
+  requestCoreHotReload?: (opts?: { reason?: string }) => Promise<{ ok: boolean; error?: string }>;
   nowIso?: () => string;
   maxVerifyRetries?: number;
 }
@@ -286,6 +287,23 @@ export class VibeCodingPipelineOrchestrator {
       hopCount: rec.hopCount,
       originTriggerId: rec.pipelineId,
     };
+  }
+
+  private appendCausal(
+    rec: VibePipelineRecord,
+    fact: Omit<Parameters<CausalLedger["append"]>[0], "roundId" | "at"> & { at?: string },
+  ): void {
+    if (!this.opts.causalLedger) return;
+    const { at, ...rest } = fact;
+    try {
+      this.opts.causalLedger.append({
+        ...rest,
+        roundId: rec.pipelineId,
+        at: at ?? this.nowIsoFn(),
+      });
+    } catch {
+      // isolate ledger disk I/O errors so pipeline state transitions remain uninterrupted
+    }
   }
   async startTask(input: {
     text: string;
@@ -389,10 +407,28 @@ export class VibeCodingPipelineOrchestrator {
     });
     if (dispatched.conversationId) record.conversationId = dispatched.conversationId;
     record.hopCount = dispatched.hopCount;
+    this.appendCausal(record, {
+      kind: "round_triggered",
+      at: nowIso,
+      title: `${binding.alias}: ${record.requirementText.slice(0, 60)}`,
+      source: channel,
+      eventType: "vibe_task",
+      targetRef: binding.repoRoot,
+      triggerId: `trg-${roundId}`,
+      hopCount: record.hopCount,
+      summary: `Vibe Phase 1 调研启动（${binding.alias}）`,
+    });
     if (!dispatched.ok) {
       record.stage = "failed";
       record.errorMessage = dispatched.message ?? dispatched.errorCode ?? "派单失败";
       record.updatedAtIso = this.nowIsoFn();
+      this.appendCausal(record, {
+        kind: "round_completed",
+        at: record.updatedAtIso,
+        outcome: "failed",
+        hopCount: record.hopCount,
+        summary: record.errorMessage,
+      });
       this.pipelines.set(pipelineId, record);
       this.save();
       return { ok: false, message: record.errorMessage, pipeline: record };
@@ -431,6 +467,13 @@ export class VibeCodingPipelineOrchestrator {
       rec.suspendedRoundId = roundId;
       rec.planSummaryLines = summaryLines;
       rec.updatedAtIso = nowIso;
+      this.appendCausal(rec, {
+        kind: "approval_requested",
+        at: nowIso,
+        approvalId: `ap-${rec.pipelineId}`,
+        hopCount: rec.hopCount,
+        summary: summaryLines[0],
+      });
       this.save();
       await this.emitNotice(rec, summaryLines, []);
       return rec;
@@ -503,6 +546,15 @@ export class VibeCodingPipelineOrchestrator {
         rec.stage = dispatched.ok ? "developing" : "failed";
         if (!dispatched.ok) rec.errorMessage = dispatched.message ?? "自愈派单失败";
         rec.updatedAtIso = this.nowIsoFn();
+        if (!dispatched.ok) {
+          this.appendCausal(rec, {
+            kind: "round_completed",
+            at: rec.updatedAtIso,
+            outcome: "failed",
+            hopCount: rec.hopCount,
+            summary: rec.errorMessage,
+          });
+        }
         this.save();
         if (!dispatched.ok) await this.emitNotice(rec, [`[1/3] 「${rec.repoAlias}」门禁自愈中断。`, `[2/3] 原因：${rec.errorMessage}`, `[3/3] 请人工介入检查工作区。`], []);
         return rec;
@@ -510,6 +562,13 @@ export class VibeCodingPipelineOrchestrator {
       rec.stage = "failed";
       rec.errorMessage = "客观门禁连续未通过，已停止自动重试";
       rec.updatedAtIso = this.nowIsoFn();
+      this.appendCausal(rec, {
+        kind: "round_completed",
+        at: rec.updatedAtIso,
+        outcome: "failed",
+        hopCount: rec.hopCount,
+        summary: rec.errorMessage,
+      });
       this.save();
       await this.emitNotice(rec, [`[1/3] 「${rec.repoAlias}」客观门禁未通过。`, `[2/3] 失败详情：${failLogs.slice(0, 120)}`, `[3/3] 请在桌面端查看日志或重新派单。`], []);
       return rec;
@@ -525,6 +584,8 @@ export class VibeCodingPipelineOrchestrator {
       if (bRes.exitCode !== 0) {
         rec.stage = "failed";
         rec.errorMessage = `编译构建失败: ${bRes.outputTail.slice(0, 200)}`;
+        rec.updatedAtIso = this.nowIsoFn();
+        this.appendCausal(rec, { kind: "round_completed", at: rec.updatedAtIso, outcome: "failed", hopCount: rec.hopCount, summary: rec.errorMessage });
         this.save();
         await this.emitNotice(rec, [`[1/3] 「${rec.repoAlias}」编译失败。`, `[2/3] ${rec.errorMessage}`, `[3/3] 请检查桌面端构建日志。`], []);
         return rec;
@@ -535,6 +596,8 @@ export class VibeCodingPipelineOrchestrator {
       if (pRes.exitCode !== 0) {
         rec.stage = "failed";
         rec.errorMessage = `应用打包失败: ${pRes.outputTail.slice(0, 200)}`;
+        rec.updatedAtIso = this.nowIsoFn();
+        this.appendCausal(rec, { kind: "round_completed", at: rec.updatedAtIso, outcome: "failed", hopCount: rec.hopCount, summary: rec.errorMessage });
         this.save();
         await this.emitNotice(rec, [`[1/3] 「${rec.repoAlias}」打包失败。`, `[2/3] ${rec.errorMessage}`, `[3/3] 原运行包未受任何影响。`], []);
         return rec;
@@ -562,23 +625,38 @@ export class VibeCodingPipelineOrchestrator {
       if (tier === "L1_extension_hotplug") this.syncExtensionHotplug(rec, binding, changedFiles);
       rec.stage = "completed";
       rec.updatedAtIso = this.nowIsoFn();
-      this.save();
       const label = tier === "L1_extension_hotplug" ? "L1 技能/插件热插拔生效（免重启）" : "客观门禁验证全部通过";
+      this.appendCausal(rec, {
+        kind: "round_completed",
+        at: rec.updatedAtIso,
+        outcome: "done",
+        hopCount: rec.hopCount,
+        summary: `${rec.repoAlias}：${label}（产物 ${rec.outboundDeliverables.length} 份）`,
+      });
+      this.save();
       await this.emitNotice(rec, [`[1/3] 「${rec.repoAlias}」定制开发已完成。`, `[2/3] 生效层级：${label}；产物 ${rec.outboundDeliverables.length} 份。`, `[3/3] 已将关键验证产物回传当前通道。`]);
       return rec;
     }
 
     const restartRoundId = `rst-${rec.currentRoundId}`;
+    const restartAt = this.nowIsoFn();
     this.opts.suspendedStore.suspend({
       roundId: restartRoundId,
       sessionId: rec.conversationId ?? rec.pipelineId,
       parentTrigger: this.makeTrigger(rec, rec.requirementText),
       approval: { approvalId: `ap-rst-${rec.pipelineId}`, prompt: "新版本构建与冒烟通过，等待确认重启", riskLevel: "high" },
-      suspendedAt: this.nowIsoFn(),
+      suspendedAt: restartAt,
     });
     rec.stage = "awaiting_restart_approval";
     rec.suspendedRoundId = restartRoundId;
-    rec.updatedAtIso = this.nowIsoFn();
+    rec.updatedAtIso = restartAt;
+    this.appendCausal(rec, {
+      kind: "approval_requested",
+      at: restartAt,
+      approvalId: `ap-rst-${rec.pipelineId}`,
+      hopCount: rec.hopCount,
+      summary: "新版本构建与冒烟通过，等待确认重启",
+    });
     this.save();
     await this.emitNotice(rec, [`[1/3] 「${rec.repoAlias}」新版本已通过门禁并就绪（${tier}）。`, `[2/3] 验收产物 ${rec.outboundDeliverables.length} 份已就位，支持 30 秒看门狗回滚。`, `[3/3] 回复「1」执行蓝绿安全重启，回复「3」暂不重启。`]);
     return rec;
@@ -608,10 +686,13 @@ export class VibeCodingPipelineOrchestrator {
     if (!parsed.action) return { ok: false, message: "请回复「1」批准、「2 补充要求」修改方案，或「3」取消。", pipeline: rec };
 
     if (parsed.action === "cancel") {
+      const cancelApprovalId = rec.stage === "awaiting_restart_approval" ? `ap-rst-${rec.pipelineId}` : `ap-${rec.pipelineId}`;
       this.safeResumeRound(rec.suspendedRoundId, { approved: false, decidedBy: "owner", note: "cancelled" });
       rec.stage = "cancelled";
       rec.suspendedRoundId = undefined;
       rec.updatedAtIso = this.nowIsoFn();
+      this.appendCausal(rec, { kind: "approval_decided", at: rec.updatedAtIso, approvalId: cancelApprovalId, approved: false, decidedBy: "owner", hopCount: rec.hopCount, summary: "cancelled" });
+      this.appendCausal(rec, { kind: "round_completed", at: rec.updatedAtIso, outcome: "stopped", hopCount: rec.hopCount, summary: `已取消「${rec.repoAlias}」定制开发任务` });
       this.save();
       return { ok: true, message: `已取消「${rec.repoAlias}」的定制开发任务。`, pipeline: rec };
     }
@@ -621,7 +702,9 @@ export class VibeCodingPipelineOrchestrator {
     }
     if (rec.stage === "awaiting_plan_approval" && harness) {
       if (parsed.action === "approve") {
+        const decidedAt = this.nowIsoFn();
         this.safeResumeRound(rec.suspendedRoundId, { approved: true, decidedBy: "owner" });
+        this.appendCausal(rec, { kind: "approval_decided", at: decidedAt, approvalId: `ap-${rec.pipelineId}`, approved: true, decidedBy: "owner", hopCount: rec.hopCount, summary: "批准 Phase 1 方案开工" });
         const prompt = `[Phase 2 已批准开工 · 任务 ${rec.pipelineId}]\n请按既定计划在当前隔离工作区实施改动并跑单测；完成后把验收截图或产物放入 .sugent-handoff/outbox/${rec.currentRoundId}/ 并调用 steward_report_milestone。`;
         const res = await harness.dispatchPhasePrompt({ workspacePath: rec.worktreePath, prompt, title: `VibeDev: ${rec.repoAlias}`, ...(rec.conversationId ? { conversationId: rec.conversationId } : {}), hopCount: rec.hopCount });
         rec.hopCount = res.hopCount;
@@ -629,12 +712,16 @@ export class VibeCodingPipelineOrchestrator {
         if (!res.ok) rec.errorMessage = res.message ?? "开工派单失败";
         rec.suspendedRoundId = undefined;
         rec.updatedAtIso = this.nowIsoFn();
+        if (!res.ok) {
+          this.appendCausal(rec, { kind: "round_completed", at: rec.updatedAtIso, outcome: "failed", hopCount: rec.hopCount, summary: rec.errorMessage });
+        }
         this.save();
         return { ok: res.ok, message: res.ok ? `已批准「${rec.repoAlias}」方案，研发引擎正在编码实现。` : (rec.errorMessage ?? "开工失败"), pipeline: rec };
       }
       if (parsed.action === "revise") {
         const fb = parsed.feedback?.trim() || "请补充更细致的改动范围与回滚方案";
         this.safeResumeRound(rec.suspendedRoundId, { approved: false, decidedBy: "owner", note: fb });
+        this.appendCausal(rec, { kind: "approval_decided", at: this.nowIsoFn(), approvalId: `ap-${rec.pipelineId}`, approved: false, decidedBy: "owner", hopCount: rec.hopCount, summary: fb });
         const revRoundId = `rev-${crypto.randomBytes(3).toString("hex")}`;
         this.opts.fileBridge.stageInboundRound({ workspaceRoot: rec.worktreePath, roundId: revRoundId, channel: rec.channel, requirementText: `方案修改意见：${fb}`, repoAlias: rec.repoAlias });
         const prompt = `[方案修改意见 · 轮次 ${revRoundId}]\n主人驳回原方案并补充要求：${fb}\n请更新 .sugent-handoff/inbox/${revRoundId}/SPEC_MANIFEST.md 对应的方案并重新申请拍板。`;
@@ -644,12 +731,26 @@ export class VibeCodingPipelineOrchestrator {
         rec.stage = res.ok ? "planning" : "failed";
         rec.suspendedRoundId = undefined;
         rec.updatedAtIso = this.nowIsoFn();
+        if (!res.ok) {
+          this.appendCausal(rec, { kind: "round_completed", at: rec.updatedAtIso, outcome: "failed", hopCount: rec.hopCount, summary: "打回方案派单失败" });
+        }
         this.save();
         return { ok: res.ok, message: res.ok ? `已将修改意见发回「${rec.repoAlias}」原会话重拟方案。` : "打回方案派单失败", pipeline: rec };
       }
     }
     if (rec.stage === "awaiting_restart_approval" && (parsed.action === "approve" || parsed.action === "relaunch_now")) {
       this.safeResumeRound(rec.suspendedRoundId, { approved: true, decidedBy: "owner" });
+      this.appendCausal(rec, { kind: "approval_decided", at: this.nowIsoFn(), approvalId: `ap-rst-${rec.pipelineId}`, approved: true, decidedBy: "owner", hopCount: rec.hopCount, summary: "批准新版本上线" });
+      if (rec.packagingTier !== "L3_blue_green_app" && this.opts.requestCoreHotReload && !input.dryRunRelaunch) {
+        const hot = await this.opts.requestCoreHotReload({ reason: `vibe:${rec.pipelineId}` });
+        rec.stage = hot.ok ? "completed" : "failed";
+        if (!hot.ok) rec.errorMessage = hot.error ?? "L2 核心热切失败";
+        rec.suspendedRoundId = undefined;
+        rec.updatedAtIso = this.nowIsoFn();
+        this.appendCausal(rec, { kind: "round_completed", at: rec.updatedAtIso, outcome: hot.ok ? "done" : "failed", hopCount: rec.hopCount, summary: hot.ok ? "L2 壳核热切换生效" : rec.errorMessage });
+        this.save();
+        return { ok: hot.ok, message: hot.ok ? `已通过 L2 壳核热切换使「${rec.repoAlias}」即时生效（免退出桌面壳）。` : (rec.errorMessage ?? "热切换失败"), pipeline: rec };
+      }
       const mode: RelaunchMode = rec.packagingTier === "L3_blue_green_app" ? "blue_green_app" : "process_reload";
       const defaultEntry = path.join(rec.worktreePath, "dist", "src", "main.js");
       this.opts.relauncher.stageAndTriggerRelaunch({
@@ -678,6 +779,13 @@ export class VibeCodingPipelineOrchestrator {
     rec.stage = notice.status === "succeeded" ? "completed" : notice.status === "rolled_back" ? "rolled_back" : "failed";
     if (notice.rollbackReason) rec.errorMessage = notice.rollbackReason;
     rec.updatedAtIso = this.nowIsoFn();
+    this.appendCausal(rec, {
+      kind: "round_completed",
+      at: rec.updatedAtIso,
+      outcome: notice.status === "succeeded" ? "done" : "failed",
+      hopCount: rec.hopCount,
+      summary: notice.summary,
+    });
     this.save();
     await this.emitNotice(
       rec,

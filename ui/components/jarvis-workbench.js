@@ -82,6 +82,16 @@ export function StewardHubScreen() {
       const res = await api(endpoint, { method: "POST", body });
       if (res?.workbench?.ledger) setWb(res.workbench);
       else await refresh();
+      if (res?.ok === false) failed(res.error || res.errorCode || t("common.error"));
+      else if (msg) toast(msg);
+    } catch (e) { failed(e); } finally { setBusy(false); }
+  };
+
+  const setRoutingPolicy = async (patch, msg) => {
+    setBusy(true);
+    try {
+      await api("/steward/routing/policy", { method: "PUT", body: patch });
+      await refresh();
       if (msg) toast(msg);
     } catch (e) { failed(e); } finally { setBusy(false); }
   };
@@ -115,6 +125,10 @@ export function StewardHubScreen() {
   const projects = (wb?.antigravity?.projects || []).slice(0, 8);
   const bindings = wb?.vibeCoding?.bindings || [];
   const pipelines = (wb?.vibeCoding?.pipelines || []).slice(0, 6);
+  const skillCandidates = wb?.skillCandidates || [];
+  const rt = wb?.routing;
+  const rtDecs = (rt?.recentDecisions || []).slice(0, 4);
+  const rtBoard = Object.entries(rt?.leaderboard || {}).filter(([, rows]) => Array.isArray(rows) && rows.length > 0).slice(0, 3);
   const stripSummaryLead = (s) => String(s || "").replace(/^客户来信要点：/, ""); // i18n-ignore
 
   return html`<section class="sg-page" data-screen="steward-hub">
@@ -153,6 +167,19 @@ export function StewardHubScreen() {
                 <button type="button" class="btn sm" disabled=${busy} onClick=${() => execConcierge(`/send B ${c.cardId} ${c.draftB.confirmHash}`, c.channel, t("steward.hub.sentActiveToast"))}>${t("steward.hub.sendActive")}</button>
                 <button type="button" class="btn sm" disabled=${busy} onClick=${() => execConcierge(`/ignore ${c.cardId}`, c.channel, t("steward.hub.ignoredToast"))}>${t("steward.hub.ignore")}</button>
               </div>`}
+        </div>`)}
+      </${HubCard}>`}
+
+      ${skillCandidates.length > 0 && html`<${HubCard} title=${t("steward.hub.skillGateTitle")} hint=${t("steward.hub.skillGateHint", { count: skillCandidates.length })}>
+        ${skillCandidates.map((sc) => html`<div key=${sc.nodeId} class="sg-row">
+          <div>
+            <strong>${sc.name}</strong> <span class="badge">${t("steward.hub.skillReinforce", { count: sc.reinforcements })}</span>
+            <div class="sg-card-hint">${sc.summary}</div>
+          </div>
+          <div class="sg-actions">
+            <button type="button" class="btn sm primary" disabled=${busy} onClick=${() => runAction("/steward/skill-candidates/decide", { nodeId: sc.nodeId, decision: "approve" }, t("steward.hub.skillApprovedToast", { name: sc.name }))}>${t("steward.hub.skillApproveBtn")}</button>
+            <button type="button" class="btn sm" disabled=${busy} onClick=${() => runAction("/steward/skill-candidates/decide", { nodeId: sc.nodeId, decision: "reject" }, t("steward.hub.skillRejectedToast", { name: sc.name }))}>${t("steward.hub.skillRejectBtn")}</button>
+          </div>
         </div>`)}
       </${HubCard}>`}
 
@@ -234,6 +261,35 @@ export function StewardHubScreen() {
           </div>`)}
         </${HubCard}>
       </div>
+
+      ${rt && html`<${HubCard} title=${t("steward.hub.routingTitle")} hint=${t("steward.hub.routingHint", { healthy: rt.pool?.healthyChatModels ?? 0, total: rt.pool?.chatModels ?? 0, cooling: rt.pool?.coolingChatModels ?? 0 })}>
+        <div class="sg-actions">
+          ${[["quota_saver", "steward.hub.strategyQuota"], ["balanced", "steward.hub.strategyBalanced"], ["quality_first", "steward.hub.strategyQuality"]].map(([id, key]) =>
+            html`<button type="button" key=${id} class=${`btn sm${rt.strategy === id ? " primary" : ""}`} disabled=${busy} onClick=${() => setRoutingPolicy({ strategy: id }, t("steward.hub.policyUpdatedToast"))}>${t(key)}</button>`)}
+          <button type="button" class="btn sm" disabled=${busy} onClick=${() => setRoutingPolicy(rt.mode === "shadow" ? { mode: "auto" } : rt.mode === "pinned" ? { mode: "auto", pinnedModel: null } : { mode: "shadow" }, t("steward.hub.policyUpdatedToast"))}>${rt.mode === "shadow" ? t("steward.hub.modeShadow") : rt.mode === "pinned" ? t("steward.hub.modePinned", { model: String(rt.pinnedModel || "").split("/").pop() || "-" }) : t("steward.hub.modeAuto")}</button>
+          <button type="button" class="btn sm" disabled=${busy} onClick=${() => runAction("/steward/routing/sync", { force: true }, t("steward.hub.poolSyncedToast"))}>${t("steward.hub.syncPoolBtn")}</button>
+          ${rtDecs.length > 0 && html`<button type="button" class="btn sm" disabled=${busy} onClick=${() => runAction("/steward/routing/retry-stronger", {}, t("steward.hub.retryStrongerToast"))}>${t("steward.hub.retryStrongerBtn")}</button>`}
+        </div>
+        ${rtDecs.length === 0 && html`<div class="sg-card-hint">${t("steward.hub.routingEmpty")}</div>`}
+        ${rtDecs.map((d) => html`<div key=${d.decisionId} class="sg-row">
+          <div><strong>${d.rawModelId}</strong> <span class="badge">${d.archetype}</span><div class="sg-card-hint">${d.reasonSummary}</div></div>
+          <span class="sg-card-hint">${d.escalatedFrom ? `↑ ${d.escalatedFrom}` : d.fallbackUsedFrom ? `↻ ${d.fallbackUsedFrom}` : t("steward.hub.routingScore", { score: Math.round((d.score || 0) * 100) })}</span>
+        </div>`)}
+        ${rtBoard.length > 0 && html`<div class="sg-card-hint">${t("steward.hub.leaderboardLabel")}${rtBoard.map(([arch, rows]) => `${arch}:${String(rows[0]?.targetId || "").split("/").pop()}(${Math.round((rows[0]?.posteriorQuality ?? 0) * 100)}%)`).join(" · ")}</div>`}
+      </${HubCard}>`}
+
+      ${wb?.hotUpdate && html`<${HubCard}
+        title=${t("steward.hub.hotUpdateTitle")}
+        hint=${t("steward.hub.hotUpdateHint", {
+          mode: t(wb.hotUpdate.supervised ? "steward.hub.hotUpdateSupervised" : "steward.hub.hotUpdateStandalone"),
+          slot: wb.hotUpdate.slots?.activeSlot || wb.hotUpdate.shell?.activeSlot || "factory",
+        })}>
+        <div class="sg-actions">
+          <button type="button" class="btn sm" disabled=${busy} onClick=${() => runAction("/steward/hot-update/reload-ui", {}, t("steward.hub.hotUpdateUiToast"))}>${t("steward.hub.hotUpdateUiBtn")}</button>
+          ${wb.hotUpdate.supervised && html`<button type="button" class="btn sm primary" disabled=${busy} onClick=${() => runAction("/steward/hot-update/reload-core", { reason: "workbench" }, t("steward.hub.hotUpdateCoreToast"))}>${t("steward.hub.hotUpdateCoreBtn")}</button>`}
+          ${(wb.hotUpdate.slots?.activeSlot || wb.hotUpdate.slots?.previousSlot) && html`<button type="button" class="btn sm" disabled=${busy} onClick=${() => runAction("/steward/hot-update/rollback", {}, t("steward.hub.hotUpdateRollbackToast"))}>${t("steward.hub.hotUpdateRollbackBtn")}</button>`}
+        </div>
+      </${HubCard}>`}
 
       <div class="sg-footer-meta">
         ${wb?.llmLive ? `${t("steward.hub.footerEngine", { model: wb.activeModel })} · ` : ""}${wb?.budgetStatus?.enabled ? `${t("steward.hub.footerBudget", { used: wb.budgetStatus.usedUsd.toFixed(2), limit: wb.budgetStatus.limitUsd.toFixed(2) })} · ` : ""}${t("steward.hub.footerArchives", { archives: (wb?.ledger?.resources || []).length, sessions: wb?.antigravity?.totalSessions ?? 0 })}

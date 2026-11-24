@@ -187,4 +187,84 @@ describe("VibeCodingPipelineOrchestrator & Multi-IM / Desktop API", () => {
     expect(artRes.status).toBe(200);
     expect(Buffer.from(artRes.json.dataBase64, "base64").toString("utf8")).toBe("RESULT_PNG");
   });
+
+  it("records full Vibe pipeline lifecycle into unified CausalLedger for sugent:why and migrates legacy sugent-ledger", async () => {
+    const { resolveUnifiedCausalLedgerDir } = await import("../src/sugent/causal-ledger.js");
+    const { parseWhyCliArgs } = await import("../src/cli/why.js");
+    const dataDir = makeTmp("sugent-vp-why-");
+    const repoDir = makeTmp("sugent-vp-why-repo-");
+    fs.mkdirSync(path.join(repoDir, "skills", "demo"), { recursive: true });
+    fs.writeFileSync(path.join(repoDir, "skills", "demo", "SKILL.md"), "# Demo\n");
+
+    const legacyLedger = new CausalLedger(path.join(dataDir, "sugent-ledger"));
+    legacyLedger.append({
+      roundId: "legacy-round-1",
+      kind: "round_triggered",
+      at: "2026-11-20T08:00:00.000Z",
+      title: "历史巡检任务",
+      source: "schedule",
+    });
+
+    const unifiedDir = resolveUnifiedCausalLedgerDir(dataDir);
+    expect(unifiedDir).toBe(path.join(dataDir, "sugent-stewardship"));
+    const causalLedger = new CausalLedger(unifiedDir);
+    expect(causalLedger.traceRound("legacy-round-1")?.title).toBe("历史巡检任务");
+    expect(parseWhyCliArgs([], { ...process.env, AMB_DATA_DIR: dataDir }).ledgerDir).toContain("sugent-stewardship");
+
+    const dispatcher = new AntigravityDispatcher({
+      runner: {
+        async getConversationMetadata() { return { exists: true, nestingDepth: 0, workspaceUris: [repoDir] }; },
+        async sendMessage() { return { ok: true, exitCode: 0 }; },
+        async newConversation() { return { conversationId: "33333333-3333-3333-3333-333333333333", exitCode: 0 }; },
+      },
+    });
+    const bindings = new RepoBindingRegistry({ dataDir });
+    const bound = bindings.upsertBinding({
+      bindingId: "repo-why-test",
+      alias: "Why测试仓",
+      repoRoot: repoDir,
+      verifyArgv: [],
+      restartMode: "extension_hotplug",
+      isSelfRepo: true,
+    });
+    const kg = new SugentKnowledgeGraph(path.join(dataDir, "kg"));
+    const ledger = new StewardshipLedger({ dataDir, knowledgeGraph: kg, budgetLedger: new LocalBudgetLedger(dataDir) });
+    const suspendedStore = new SuspendedRoundStore(unifiedDir);
+    const fileBridge = new HandoffFileBridge({ dataDir, ledger });
+    const harnesses = new CodingHarnessRegistry([new AntigravityCodingHarness(dispatcher)]);
+    const relauncher = new SafeRelaunchCoordinator({ dataDir });
+    const orch = new VibeCodingPipelineOrchestrator({
+      dataDir,
+      bindings,
+      fileBridge,
+      harnesses,
+      ledger,
+      suspendedStore,
+      causalLedger,
+      relauncher,
+      gateRunner: new IndependentGateRunner(async () => ({ exitCode: 0, outputTail: "OK" })),
+    });
+
+    const started = await orch.startTask({
+      text: "新增演示技能",
+      bindingQuery: bound.bindingId,
+      channel: "weixin",
+      useWorktree: false,
+    });
+    const pid = started.pipeline!.pipelineId;
+    await orch.onHarnessIdle(pid);
+    await orch.decide({ pipelineId: pid, rawReplyText: "1" });
+    const done = await orch.runVerificationAndPackage(pid, { changedFilesOverride: ["skills/demo/SKILL.md"] });
+    expect(done?.stage).toBe("completed");
+
+    const trace = causalLedger.traceRound(pid);
+    expect(trace).toBeDefined();
+    expect(trace!.facts.map((f) => f.kind)).toEqual(
+      expect.arrayContaining(["round_triggered", "approval_requested", "approval_decided", "round_completed"]),
+    );
+    const whyText = causalLedger.explainWhy(pid);
+    expect(whyText).toContain("Why测试仓");
+    expect(whyText).toContain("挂起拍板");
+    expect(whyText).toContain("批准");
+  });
 });

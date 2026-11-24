@@ -211,7 +211,7 @@ function isLoopback(host: string): boolean {
 export async function startWebServer(app: App, opts: { port?: number; host?: string } = {}): Promise<WebServer> {
   const cfg = app.config;
   const host = opts.host ?? cfg.ui.host;
-  const uiDir = path.join(findAppRoot(), "ui");
+  const uiDir = process.env.SUGENT_UI_DIR?.trim() || path.join(findAppRoot(), "ui");
   const vendor = vendorFiles();
   let token = cfg.ui.token;
   if (!isLoopback(host) && !token) {
@@ -226,6 +226,23 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
   const allowedHosts = () => new Set([`127.0.0.1:${boundPort}`, `localhost:${boundPort}`, `[::1]:${boundPort}`]);
 
   const live = new LiveTurns();
+  type CompanionSignalRecord = {
+    kind: string;
+    at: number;
+    state?: string;
+    cue?: string;
+    notice?: string;
+    hash?: string;
+    draftText?: string;
+    source?: string;
+  };
+  const COMPANION_SIGNAL_KINDS = new Set(["main_state", "handoff", "studio_updated", "toggle_quiet"]);
+  let lastCompanionSignal: CompanionSignalRecord | null = null;
+  const emitCompanionSignal = (signal: CompanionSignalRecord): CompanionSignalRecord => {
+    lastCompanionSignal = signal;
+    app.desktop?.notifyCompanion?.({ ...signal });
+    return signal;
+  };
   function startLive(botId: string, text: string): LiveTurn {
     const convId = consoleConvId(botId);
     const last = app.store.getConversation(convId) ? (app.store.listMessages(convId, 1).at(-1)?.id ?? 0) : 0;
@@ -313,10 +330,25 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
         return send(res, 200, { models: [], error: (e as Error).message });
       }
     }
+    if (p === "/hot-reload/stream" && m === "GET") {
+      app.hotReloadBus.attachSse(res);
+      return;
+    }
     // —— 多模型服务商管理接口（OpenAI / Anthropic / DeepSeek / Gemini / OpenRouter / Ollama / Cowork）——
     if (seg[0] === "providers") {
       if (seg.length === 1 && m === "GET") {
         return send(res, 200, app.providers.publicView());
+      }
+      if (seg.length === 2 && seg[1] === "sync-models" && m === "POST") {
+        const b = await readJson(req);
+        const results = await app.syncProviderModels(typeof b.providerId === "string" ? b.providerId : undefined, b.force !== false);
+        return send(res, 200, {
+          ok: true,
+          results,
+          ...app.providers.publicView(),
+          adaptiveRouting: app.stewardService.getRoutingDashboard(),
+          models: await app.runtime.listModels(true).catch(() => [] as string[]),
+        });
       }
       if (seg.length === 2 && seg[1] === "diagnostics" && m === "POST") {
         const b = await readJson(req);
@@ -612,12 +644,93 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
       if (sub === "capabilities" && m === "GET") {
         return send(res, 200, app.stewardService.getCapabilitySnapshot());
       }
+      if (sub === "skill-candidates" && m === "GET") {
+        const th = Number(url.searchParams.get("threshold") ?? "3");
+        return send(res, 200, app.stewardService.listSkillCandidates(Number.isFinite(th) && th > 0 ? th : 3));
+      }
+      if (sub === "skill-candidates/decide" && m === "POST") {
+        const b = await readJson(req);
+        if (!b || typeof b !== "object" || Array.isArray(b)) {
+          throw new HttpError(400, "body must be a JSON object");
+        }
+        if (b.decision !== "approve" && b.decision !== "reject") {
+          throw new HttpError(400, "decision must be approve or reject");
+        }
+        if (typeof b.nodeId !== "string" || !b.nodeId.trim()) {
+          throw new HttpError(400, "nodeId must be a non-empty string");
+        }
+        if (
+          b.maxActiveSkills !== undefined &&
+          (!Number.isInteger(b.maxActiveSkills) || b.maxActiveSkills <= 0)
+        ) {
+          throw new HttpError(400, "maxActiveSkills must be a positive integer");
+        }
+        return send(
+          res,
+          200,
+          app.stewardService.decideSkillCandidate({
+            nodeId: b.nodeId.trim(),
+            decision: b.decision,
+            ...(b.maxActiveSkills !== undefined ? { maxActiveSkills: b.maxActiveSkills } : {}),
+          }),
+        );
+      }
       if (sub === "files/read" && m === "POST") {
         const b = await readJson(req);
         if (b.action === "search") {
           return send(res, 200, { ok: true, matches: app.stewardService.searchAuthorizedFiles({ ...b, callerDomain: b.callerDomain ?? domain }) });
         }
         return send(res, 200, app.stewardService.readAuthorizedFile({ ...b, callerDomain: b.callerDomain ?? domain }));
+      }
+      if (sub === "routing" && m === "GET") {
+        return send(res, 200, app.stewardService.getRoutingDashboard());
+      }
+      if (sub === "routing/policy" && m === "PUT") {
+        const b = await readJson(req);
+        return send(res, 200, app.stewardService.updateRoutingPolicy({
+          ...(typeof b.strategy === "string" ? { strategy: b.strategy } : {}),
+          ...(typeof b.mode === "string" ? { mode: b.mode } : {}),
+          ...(b.pinnedModel !== undefined ? { pinnedModel: b.pinnedModel ? String(b.pinnedModel) : null } : {}),
+          ...(Array.isArray(b.blockedModels) ? { blockedModels: b.blockedModels.map(String) } : {}),
+          ...(typeof b.unblockModel === "string" ? { unblockModel: b.unblockModel } : {}),
+          ...(typeof b.resetBoosts === "boolean" ? { resetBoosts: b.resetBoosts } : {}),
+          ...(typeof b.directive === "string" ? { directive: b.directive } : {}),
+        }));
+      }
+      if (sub === "routing/sync" && m === "POST") {
+        const b = await readJson(req);
+        const results = await app.stewardService.syncModelPool({ ...(typeof b.providerId === "string" ? { providerId: b.providerId } : {}), force: b.force !== false });
+        return send(res, 200, { ok: true, results, routing: app.stewardService.getRoutingDashboard() });
+      }
+      if (sub === "routing/retry-stronger" && m === "POST") {
+        const b = await readJson(req);
+        return send(res, 200, await app.stewardService.retryLastTurnStronger(b.callerDomain ?? domain));
+      }
+      if (sub === "hot-update/status" && m === "GET") {
+        return send(res, 200, app.stewardService.getHotUpdateStatus());
+      }
+      if (sub === "hot-update/reload-ui" && m === "POST") {
+        const b = await readJson(req);
+        return send(res, 200, app.stewardService.triggerHotReloadUi(typeof b.file === "string" ? b.file : undefined));
+      }
+      if (sub === "hot-update/reload-core" && m === "POST") {
+        const b = await readJson(req);
+        return send(res, 200, await app.stewardService.triggerHotReloadCore({ reason: typeof b.reason === "string" ? b.reason : undefined }));
+      }
+      if (sub === "hot-update/stage-bundle" && m === "POST") {
+        const b = await readJson(req, 25_000_000);
+        if (typeof b.bundleBase64 !== "string" || !b.bundleBase64.trim()) {
+          return send(res, 400, { ok: false, error: "MISSING_BUNDLE_BASE64" });
+        }
+        return send(res, 200, await app.stewardService.stageHotBundle(b.bundleBase64, { allowUnsigned: b.allowUnsigned === true }));
+      }
+      if (sub === "hot-update/rollback" && m === "POST") {
+        await readJson(req);
+        return send(res, 200, await app.stewardService.rollbackHotSlot());
+      }
+      if (sub === "hot-update/factory-reset" && m === "POST") {
+        await readJson(req);
+        return send(res, 200, await app.stewardService.factoryResetHotSlot());
       }
       if (sub === "vibe/artifact" && m === "GET") {
         const pid = String(url.searchParams.get("pipelineId") ?? "");
@@ -648,7 +761,9 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
       if (sub === "avatars/generate" && m === "POST") {
         const b = await readJson(req);
         try {
-          return send(res, 200, await app.stewardService.avatarStudio.generateFromBlank(b));
+          const out = await app.stewardService.avatarStudio.generateFromBlank(b);
+          emitCompanionSignal({ kind: "studio_updated", at: Date.now() });
+          return send(res, 200, out);
         } catch (e) {
           throw new HttpError(400, (e as Error).message);
         }
@@ -656,29 +771,67 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
       if (sub === "avatars/import" && m === "POST") {
         const b = await readJson(req, 12_000_000);
         try {
-          return send(res, 200, app.stewardService.avatarStudio.importFromImage(b));
+          const out = app.stewardService.avatarStudio.importFromImage(b);
+          emitCompanionSignal({ kind: "studio_updated", at: Date.now() });
+          return send(res, 200, out);
         } catch (e) {
           throw new HttpError(400, (e as Error).message);
         }
       }
       if (sub === "avatars/activate" && m === "POST") {
         const b = await readJson(req);
-        return send(res, 200, app.stewardService.avatarStudio.setActivePack(String(b.id ?? "")));
+        const out = app.stewardService.avatarStudio.setActivePack(String(b.id ?? ""));
+        emitCompanionSignal({ kind: "studio_updated", at: Date.now() });
+        return send(res, 200, out);
       }
       if (sub === "avatars/customize" && m === "PUT") {
         const b = await readJson(req);
-        return send(res, 200, app.stewardService.avatarStudio.updatePackAppearance(b));
+        const out = app.stewardService.avatarStudio.updatePackAppearance(b);
+        emitCompanionSignal({ kind: "studio_updated", at: Date.now() });
+        return send(res, 200, out);
       }
       if (seg[1] === "avatars" && seg[2] && seg.length === 3 && m === "DELETE") {
-        return send(res, 200, app.stewardService.avatarStudio.deletePack(seg[2]));
+        const out = app.stewardService.avatarStudio.deletePack(seg[2]);
+        emitCompanionSignal({ kind: "studio_updated", at: Date.now() });
+        return send(res, 200, out);
       }
       if (sub === "companion" && m === "GET") {
-        return send(res, 200, app.desktop?.companionState?.() ?? { supported: false, visible: false, expanded: false });
+        const base = app.desktop?.companionState?.() ?? { supported: false, visible: false, expanded: false };
+        return send(res, 200, { ...base, lastSignal: lastCompanionSignal });
       }
       if (sub === "companion" && m === "POST") {
         const b = await readJson(req);
         const st = b.quickBar ? app.desktop?.showCompanionQuickBar?.() : app.desktop?.toggleCompanion?.(typeof b.visible === "boolean" ? b.visible : undefined);
         return send(res, 200, st ?? { supported: false, visible: false, expanded: false });
+      }
+      if (sub === "companion/signal" && m === "POST") {
+        const b = await readJson(req);
+        const kind = typeof b?.kind === "string" ? b.kind.trim() : "";
+        if (!kind || !COMPANION_SIGNAL_KINDS.has(kind)) {
+          throw new HttpError(400, "invalid companion signal kind");
+        }
+        const now = Date.now();
+        const clientAt = typeof b?.at === "number" && Number.isFinite(b.at) ? Math.round(b.at) : NaN;
+        const at = Number.isFinite(clientAt) && Math.abs(clientAt - now) <= 30_000 ? clientAt : now;
+        const signal: CompanionSignalRecord = {
+          kind,
+          at,
+          ...(typeof b.state === "string" && b.state.trim() ? { state: b.state.trim().slice(0, 64) } : {}),
+          ...(typeof b.cue === "string" && b.cue.trim() ? { cue: b.cue.trim().slice(0, 64) } : {}),
+          ...(typeof b.notice === "string" && b.notice.trim() ? { notice: b.notice.trim().slice(0, 320) } : {}),
+          ...(typeof b.hash === "string" && b.hash.trim() ? { hash: b.hash.trim().slice(0, 200) } : {}),
+          ...(typeof b.draftText === "string" && b.draftText.length > 0 ? { draftText: b.draftText.slice(0, 8000) } : {}),
+          ...(typeof b.source === "string" && b.source.trim() ? { source: b.source.trim().slice(0, 64) } : {}),
+        };
+        emitCompanionSignal(signal);
+        if (kind === "handoff") {
+          app.desktop?.handoffCompanionToMain?.({
+            hash: signal.hash,
+            draftText: signal.draftText,
+            source: signal.source,
+          });
+        }
+        return send(res, 200, { ok: true, signal });
       }
       throw new HttpError(404, "not found");
     }

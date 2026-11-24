@@ -20,11 +20,41 @@ import type { RepoBindingRecord, UpsertRepoBindingInput } from "./repo-binding.j
 import type { VibePipelineRecord } from "./vibe-coding-pipeline.js";
 import { formatCapabilityAwarenessPrompt, type CapabilityDescriptor } from "./capability-awareness.js";
 import type { AuthorizedFileMatch, ReadAuthorizedFileResult } from "./authorized-file-reader.js";
+import type {
+  AdaptiveRoutingDashboardSnapshot,
+  ResolvedRouteEndpoint,
+  RouteDecisionPlan,
+  RoutingRequestContext,
+} from "./adaptive-router.js";
+import type { ModelTier } from "./model-catalog.js";
+import type { ProviderSyncResult } from "./model-pool-sync.js";
+import type {
+  RoutingOperatingMode,
+  RoutingOutcomeEvent,
+  RoutingPolicyState,
+  RoutingStrategyPreset,
+  TaskArchetype,
+} from "./routing-experience-store.js";
 
 export interface StewardLlmEndpoint {
   baseUrl: string;
   apiKey: string;
   model: string;
+}
+
+export interface StewardRouteMeta {
+  decisionId: string;
+  archetype: TaskArchetype;
+  selectedModel: string;
+  targetId: string;
+  providerId: string;
+  strategy: RoutingStrategyPreset;
+  mode: RoutingOperatingMode;
+  reasonSummary: string;
+  fallbackFrom?: string;
+  escalatedFrom?: string;
+  skippedCoolingModels: string[];
+  canRetryStronger: boolean;
 }
 
 export interface StewardLlmToolsPort<TWorkbench extends StewardWorkbenchLike = StewardWorkbenchLike> {
@@ -91,7 +121,38 @@ export interface StewardLlmToolsPort<TWorkbench extends StewardWorkbenchLike = S
   decideVibeTask?(input: { pipelineId?: string; rawReplyText?: string; action?: "approve" | "revise" | "cancel" | "verify_now" | "relaunch_now"; feedback?: string; callerDomain?: CallerAccessDomain }): Promise<{ ok: boolean; message: string; pipeline?: VibePipelineRecord; workbench: TWorkbench }>;
   searchAuthorizedFiles?(input: { query?: string; projectQuery?: string; conversationId?: string; callerDomain?: CallerAccessDomain; limit?: number }): AuthorizedFileMatch[];
   readAuthorizedFile?(input: { filePath?: string; fileQuery?: string; projectQuery?: string; conversationId?: string; offsetChars?: number; maxChars?: number; callerDomain?: CallerAccessDomain }): ReadAuthorizedFileResult;
+  getRoutingDashboard?(): AdaptiveRoutingDashboardSnapshot;
+  syncModelPool?(opts?: { providerId?: string; force?: boolean }): Promise<ProviderSyncResult[]>;
+  updateRoutingPolicy?(patch: {
+    strategy?: RoutingStrategyPreset;
+    mode?: RoutingOperatingMode;
+    pinnedModel?: string | null;
+    directive?: string;
+  }): { matched?: boolean; summary?: string; policy: RoutingPolicyState };
+  manageHotUpdate?(input: {
+    action: "status" | "reload_ui" | "reload_core" | "rollback" | "factory_reset";
+    file?: string;
+    reason?: string;
+  }): Promise<Record<string, unknown>>;
+  delegateLocalTask?(input: LocalTaskDelegationInput): Promise<LocalTaskDelegationResult> | LocalTaskDelegationResult;
 }
+
+export interface LocalTaskDelegationInput {
+  title: string;
+  instruction: string;
+  requireDesktopGui?: boolean;
+  workspacePath?: string;
+  channel?: DropzoneChannel;
+}
+
+export interface LocalTaskDelegationResult {
+  ok: boolean;
+  taskId?: string;
+  status?: string;
+  errorCode?: string;
+  message?: string;
+}
+
 export const STEWARD_CAPABILITY_DESCRIPTORS: readonly CapabilityDescriptor[] = [
   { toolName: "query_personal_memory", title: "五维个人记忆检索", summary: "查询目标、待办、联系人禁忌、价值红线/墓碑、档案与图谱", whenToUse: ["查目标/待办/红线/联系人/历史档案"] },
   { toolName: "capture_note_or_todo", title: "静默记事与待办归档", summary: "快速记下随口交代的待办、临期提醒或本地档案", whenToUse: ["记一下/备忘/待办/存档案"] },
@@ -103,6 +164,9 @@ export const STEWARD_CAPABILITY_DESCRIPTORS: readonly CapabilityDescriptor[] = [
   { toolName: "manage_vibe_coding", title: "本地仓绑定与定制开发流水线", summary: "绑定本地源码仓、隔离 worktree 透传文件、方案拍板与安全重启", whenToUse: ["绑定仓库/定制开发/批复方案/安全重启"] },
   { toolName: "read_authorized_file", title: "受控本地项目与制品全文读取", summary: "在已注册项目、绑定仓与 brain 制品目录检索并分段读取完整 .md/日志全文（单次最高 24000 字）", whenToUse: ["要看完整报告/.md全文/每日复盘/排查截断摘要"] },
   { toolName: "manage_briefing_and_prefs", title: "简报巡检与隐私偏好", summary: "扫描今日提醒、开关免打扰或调整自治信任等级", whenToUse: ["今日简报/开免打扰/调整自治度"] },
+  { toolName: "manage_model_routing", title: "CLIProxyAPI 全量模型对齐与自适应路由", summary: "查看模型池与经验评分、同步全量可用模型、切换省配额/平衡/旗舰策略或设定偏好约束", whenToUse: ["同步模型池/查看当前自动选模情况/切换省钱或旗舰策略/以后某类任务优先或禁用某模型"] },
+  { toolName: "manage_hot_update", title: "分层热启动与热更新控制 (L0-L3)", summary: "查看热更新/A-B槽位状态、触发 UI 热刷新、Core 热重启、安全回滚槽位或恢复出厂金丝雀", whenToUse: ["热重启/热更新状态/UI热刷新/回滚槽位/恢复出厂镜像"] },
+  { toolName: "delegate_local_execution", title: "本机终端/文件/桌面操控异步下沉执行", summary: "将耗时终端命令、本地文件整理或原生桌面软件操控委托给后台 DSH 执行引擎异步推进", whenToUse: ["执行本机命令/整理本地文件夹/操控桌面软件/导出本地报表"] },
 ];
 const LLM_TOOLS = [
   {
@@ -256,6 +320,57 @@ const LLM_TOOLS = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "manage_model_routing",
+      description: "查看 CLIProxyAPI 模型池同步与自适应路由经验榜、手动触发模型全量同步，或根据主人自然语言指令调整路由策略（如优先/禁用/锁定某模型，或切换省配额/平衡/质量优先）。",
+      parameters: {
+        type: "object",
+        properties: {
+          action: { type: "string", enum: ["status", "sync", "set_policy"] },
+          directive: { type: "string", description: "主人的自然语言路由偏置指令" },
+          strategy: { type: "string", enum: ["quota_saver", "balanced", "quality_first"] },
+          mode: { type: "string", enum: ["auto", "shadow", "pinned"] },
+          pinnedModel: { type: "string" },
+        },
+        required: ["action"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "manage_hot_update",
+      description: "查询分层热更新与 A/B 槽位状态，触发 UI 热刷新 (L1)、Core 热重启 (L2)、回滚或恢复出厂金丝雀",
+      parameters: {
+        type: "object",
+        properties: {
+          action: { type: "string", enum: ["status", "reload_ui", "reload_core", "rollback", "factory_reset"] },
+          file: { type: "string", description: "reload_ui 可选变更文件名" },
+          reason: { type: "string", description: "reload_core 可选原因说明" },
+        },
+        required: ["action"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "delegate_local_execution",
+      description: "将需要本机终端脚本、批量文件读写或 CUA 原生桌面 GUI 操作的重执行任务下沉委托给后台执行引擎异步推进，并在需要审批或完工时推送卡片。",
+      parameters: {
+        type: "object",
+        properties: {
+          title: { type: "string", description: "简短任务标题" },
+          instruction: { type: "string", description: "完整的执行指令与验收目标" },
+          requireDesktopGui: { type: "boolean", description: "是否需要操作本机桌面 GUI 窗口" },
+          workspacePath: { type: "string", description: "可选目标本地目录" },
+        },
+        required: ["title", "instruction"],
+      },
+    },
+  },
 ];
 const shortProj = (k: string): string => k.replace(/^repo:[^/]+\//, "").replace(/^local:[^:]+:/, "");
 const tierLabel = (t: 0 | 1 | 2): string => (t === 0 ? "私密（仅本机）" : t === 1 ? "脱敏摘要" : "深度协同");
@@ -316,18 +431,51 @@ function buildSystemPrompt(wb: StewardWorkbenchLike): string {
     `重要联系人：${contacts.length ? contacts.join("；") : "暂无"}`,
   ].join("\n");
 }
+interface LlmToolCall {
+  id: string;
+  type?: string;
+  function?: { name?: string; arguments?: string };
+  extra_content?: unknown;
+}
+
+interface LlmChatResponse {
+  model?: string;
+  usage?: { prompt_tokens?: number; completion_tokens?: number };
+  choices?: Array<{
+    message?: { role?: string; content?: string | null; tool_calls?: LlmToolCall[] };
+  }>;
+}
+
+export interface StewardLlmAgentOptions<TWorkbench extends StewardWorkbenchLike = StewardWorkbenchLike> {
+  getEndpoint: () => StewardLlmEndpoint | undefined;
+  fetchImpl?: typeof fetch;
+  toolsPort: StewardLlmToolsPort<TWorkbench>;
+  recordUsageUsd?: (usd: number) => void;
+  resolveRoutePlan?: (ctx: RoutingRequestContext) => RouteDecisionPlan | undefined;
+  estimateCostUsd?: (modelId: string, usage: { inputTokens?: number; outputTokens?: number }) => number;
+  onRouteAttemptOutcome?: (ev: {
+    decisionId: string;
+    targetId: string;
+    archetype: TaskArchetype;
+    ok: boolean;
+    httpStatus?: number | "timeout" | "network";
+    ttftMs?: number;
+    totalLatencyMs?: number;
+    costUsd?: number;
+    toolCallCount?: number;
+    toolParseErrorCount?: number;
+    emptyReply?: boolean;
+    escalatedFrom?: string;
+    fallbackUsedFrom?: string;
+    signalSource: RoutingOutcomeEvent["signalSource"];
+  }) => void;
+}
+
 export class StewardLlmAgent<TWorkbench extends StewardWorkbenchLike = StewardWorkbenchLike> {
   private turnSeq = 0;
   private pendingDoubleConfirm?: { cardId: string; channel: ConciergeChannelKind; peerDisplayName: string; confirmHash: string; createdTurnSeq: number };
 
-  constructor(
-    private readonly opts: {
-      getEndpoint: () => StewardLlmEndpoint | undefined;
-      fetchImpl?: typeof fetch;
-      toolsPort: StewardLlmToolsPort<TWorkbench>;
-      recordUsageUsd?: (usd: number) => void;
-    },
-  ) {}
+  constructor(private readonly opts: StewardLlmAgentOptions<TWorkbench>) {}
 
   private async executeTool(name: string, args: Record<string, unknown>, domain: CallerAccessDomain, channel: DropzoneChannel): Promise<Record<string, unknown>> {
     const p = this.opts.toolsPort;
@@ -443,7 +591,30 @@ export class StewardLlmAgent<TWorkbench extends StewardWorkbenchLike = StewardWo
     if (name === "manage_antigravity") return this.executeAntigravityTool(args, wb, domain);
     if (name === "manage_vibe_coding") return this.executeVibeCodingTool(args, wb, domain, channel);
     if (name === "read_authorized_file") return this.executeAuthorizedFileTool(args, domain);
+    if (name === "manage_model_routing") return this.executeModelRoutingTool(args);
+    if (name === "manage_hot_update") return this.executeHotUpdateTool(args);
+    if (name === "delegate_local_execution") return this.executeLocalDelegationTool(args, channel);
     return this.executePrefsTool(args, wb, domain);
+  }
+
+  private async executeModelRoutingTool(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const p = this.opts.toolsPort;
+    const act = String(args.action ?? "status");
+    if (act === "sync" && p.syncModelPool) {
+      return { ok: true, results: await p.syncModelPool({ force: true }), dashboard: p.getRoutingDashboard?.() };
+    }
+    if (act === "set_policy" && p.updateRoutingPolicy) {
+      return {
+        ok: true,
+        ...p.updateRoutingPolicy({
+          ...(typeof args.strategy === "string" ? { strategy: args.strategy as RoutingStrategyPreset } : {}),
+          ...(typeof args.mode === "string" ? { mode: args.mode as RoutingOperatingMode } : {}),
+          ...(args.pinnedModel === null ? { pinnedModel: null } : typeof args.pinnedModel === "string" ? { pinnedModel: args.pinnedModel } : {}),
+          ...(typeof args.directive === "string" ? { directive: args.directive } : {}),
+        }),
+      };
+    }
+    return p.getRoutingDashboard ? { ok: true, dashboard: p.getRoutingDashboard() } : { ok: false, errorCode: "ROUTING_UNAVAILABLE" };
   }
 
   private executeAuthorizedFileTool(args: Record<string, unknown>, domain: CallerAccessDomain): Record<string, unknown> {
@@ -592,78 +763,234 @@ export class StewardLlmAgent<TWorkbench extends StewardWorkbenchLike = StewardWo
     const scan = p.scanCadence({ quietHoursActive: false, calibrationDue: true, callerDomain: domain });
     return { ok: true, urgentItems: scan.emitNow.filter((c) => c.urgency === "urgent"), routineItems: scan.emitNow.filter((c) => c.urgency !== "urgent"), queuedMorningItems: scan.workbench.cadence.state.morningDigestQueue };
   }
+
+  private async executeHotUpdateTool(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const fn = this.opts.toolsPort.manageHotUpdate;
+    if (!fn) return { ok: false, error: "HOT_UPDATE_UNAVAILABLE" };
+    const action = String(args.action ?? "status") as "status" | "reload_ui" | "reload_core" | "rollback" | "factory_reset";
+    return fn({
+      action,
+      ...(typeof args.file === "string" ? { file: args.file } : {}),
+      ...(typeof args.reason === "string" ? { reason: args.reason } : {}),
+    });
+  }
+
+  private async executeLocalDelegationTool(args: Record<string, unknown>, channel: DropzoneChannel): Promise<Record<string, unknown>> {
+    const fn = this.opts.toolsPort.delegateLocalTask;
+    if (!fn) return { ok: false, errorCode: "LOCAL_TASK_DELEGATION_UNAVAILABLE" };
+    const title = String(args.title ?? "").trim();
+    const instruction = String(args.instruction ?? "").trim();
+    if (!title || !instruction) return { ok: false, errorCode: "INVALID_DELEGATION_ARGS" };
+    const res = await fn({
+      title,
+      instruction,
+      ...(typeof args.requireDesktopGui === "boolean" ? { requireDesktopGui: args.requireDesktopGui } : {}),
+      ...(typeof args.workspacePath === "string" && args.workspacePath.trim() ? { workspacePath: args.workspacePath.trim() } : {}),
+      channel,
+    });
+    return { ...res };
+  }
+
+  private async invokeChat(ep: ResolvedRouteEndpoint, messages: Array<Record<string, unknown>>) {
+    const fetchFn = this.opts.fetchImpl ?? fetch;
+    const t0 = Date.now();
+    try {
+      const headers: Record<string, string> = { "Content-Type": "application/json", "User-Agent": "Sugent/0.1" };
+      if (ep.apiKey) headers.Authorization = `Bearer ${ep.apiKey}`;
+      const res = await fetchFn(`${ep.baseUrl.replace(/\/+$/, "")}/chat/completions`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ model: ep.rawModelId, messages, tools: LLM_TOOLS }),
+        signal: AbortSignal.timeout(75_000),
+      });
+      const latencyMs = Math.max(1, Date.now() - t0);
+      if (!res.ok) {
+        const tail = (await res.text().catch(() => "")).slice(0, 200);
+        return { ok: false as const, status: res.status, latencyMs, err: `HTTP ${res.status}: ${tail}` };
+      }
+      const data = (await res.json()) as LlmChatResponse;
+      return { ok: true as const, data, latencyMs };
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return { ok: false as const, status: /abort|timeout/i.test(msg) ? ("timeout" as const) : ("network" as const), latencyMs: Math.max(1, Date.now() - t0), err: msg };
+    }
+  }
+
+  private accountUsage(modelId: string, usage?: { prompt_tokens?: number; completion_tokens?: number }): number {
+    if (!usage) return 0;
+    const usd =
+      this.opts.estimateCostUsd?.(modelId, { inputTokens: usage.prompt_tokens, outputTokens: usage.completion_tokens }) ??
+      (((usage.prompt_tokens ?? 0) * 3 + (usage.completion_tokens ?? 0) * 15) / 1_000_000);
+    if (usd > 0) {
+      this.opts.recordUsageUsd?.(usd);
+      return usd;
+    }
+    return 0;
+  }
+
+  private async dispatchToolCalls(
+    assistantContent: string | null | undefined,
+    calls: LlmToolCall[],
+    messages: Array<Record<string, unknown>>,
+    toolCallsExecuted: string[],
+    domain: CallerAccessDomain,
+    channel: DropzoneChannel,
+  ): Promise<void> {
+    // Preserve msg.tool_calls verbatim (including extra_content.google.thought_signature) for Gemini 4 multi-turn tool loops.
+    messages.push({ role: "assistant", content: assistantContent ?? null, tool_calls: calls });
+    for (const tc of calls) {
+      const fn = String(tc.function?.name ?? "");
+      toolCallsExecuted.push(fn);
+      let parsedArgs: Record<string, unknown> = {};
+      try { parsedArgs = JSON.parse(String(tc.function?.arguments ?? "{}")) as Record<string, unknown>; } catch { parsedArgs = {}; }
+      const toolOut = await this.executeTool(fn, parsedArgs, domain, channel);
+      messages.push({ role: "tool", tool_call_id: tc.id, name: fn, content: JSON.stringify(toolOut) });
+    }
+  }
+
+  private buildRouteMeta(plan: RouteDecisionPlan, ep: ResolvedRouteEndpoint, fallbackFrom?: string, escalatedFrom?: string): StewardRouteMeta {
+    return {
+      decisionId: plan.decisionId, archetype: plan.archetype, selectedModel: ep.rawModelId, targetId: ep.targetId,
+      providerId: ep.providerId, strategy: plan.strategy, mode: plan.mode, reasonSummary: plan.reasonSummary,
+      ...(fallbackFrom ? { fallbackFrom } : {}), ...(escalatedFrom ? { escalatedFrom } : {}),
+      skippedCoolingModels: plan.skippedCoolingModels, canRetryStronger: Boolean(plan.escalationTarget),
+    };
+  }
+
+  private resolveTurnPlan(input: { text: string; historyChars: number; systemPromptChars: number; hasImages?: boolean; excludeTargetIds?: string[]; forceMinTier?: ModelTier }): RouteDecisionPlan | undefined {
+    const routed = this.opts.resolveRoutePlan?.({
+      role: "steward",
+      text: input.text,
+      historyChars: input.historyChars,
+      systemPromptChars: input.systemPromptChars,
+      hasImages: input.hasImages,
+      hasTools: true,
+      excludeTargetIds: input.excludeTargetIds,
+      forceMinTier: input.forceMinTier,
+    });
+    if (routed) return routed;
+    const legacy = this.opts.getEndpoint();
+    if (!legacy?.baseUrl || !legacy.apiKey) return undefined;
+    return {
+      decisionId: `rt-leg-${this.turnSeq}`,
+      archetype: "tool_orchestration",
+      classification: { archetype: "tool_orchestration", confidence: 1, estimatedInputTokens: 1000, signals: [] },
+      mode: "auto",
+      strategy: "balanced",
+      primary: { targetId: `default/${legacy.model}`, providerId: "default", rawModelId: legacy.model, baseUrl: legacy.baseUrl, apiKey: legacy.apiKey, tier: "balanced", family: "other", thoughtSignatureRequired: false },
+      infraFallbacks: [],
+      reasonSummary: `固定模型 ${legacy.model}`,
+      skippedCoolingModels: [],
+      scoredCandidates: [],
+    };
+  }
   async runTurn(input: {
     text: string;
     history?: Array<{ role: "user" | "assistant"; content: string }>;
     callerDomain?: CallerAccessDomain;
     channel?: DropzoneChannel;
-  }): Promise<{ ok: true; reply: string; modelUsed: string; toolCallsExecuted: string[]; workbench: TWorkbench } | { ok: false; fallbackReason: string }> {
-    const endpoint = this.opts.getEndpoint();
-    if (!endpoint?.baseUrl || !endpoint.apiKey) {
-      return { ok: false, fallbackReason: "no_endpoint" };
-    }
+    excludeTargetIds?: string[];
+    forceMinTier?: ModelTier;
+    hasImages?: boolean;
+  }): Promise<{ ok: true; reply: string; modelUsed: string; toolCallsExecuted: string[]; routeMeta?: StewardRouteMeta; workbench: TWorkbench } | { ok: false; fallbackReason: string }> {
     this.turnSeq += 1;
     const domain: CallerAccessDomain = input.callerDomain ?? "owner_private";
     const channel: DropzoneChannel = input.channel ?? "web_ui";
     const wb = this.opts.toolsPort.getWorkbench(domain);
-    const messages: Array<Record<string, unknown>> = [
-      { role: "system", content: buildSystemPrompt(wb) },
-      ...(input.history ?? []).slice(-10).map((m) => ({ role: m.role, content: m.content })),
-      { role: "user", content: input.text },
-    ];
-    const fetchFn = this.opts.fetchImpl ?? fetch;
-    const url = `${endpoint.baseUrl.replace(/\/+$/, "")}/chat/completions`;
+    const sysPrompt = buildSystemPrompt(wb);
+    const histMsgs = (input.history ?? []).slice(-10).map((m) => ({ role: m.role, content: m.content }));
+    const plan = this.resolveTurnPlan({ text: input.text, historyChars: histMsgs.reduce((s, m) => s + m.content.length, 0), systemPromptChars: sysPrompt.length, hasImages: input.hasImages, excludeTargetIds: input.excludeTargetIds, forceMinTier: input.forceMinTier });
+    if (!plan) return { ok: false, fallbackReason: "no_endpoint" };
+
+    const turnStartMs = Date.now();
+    const knownTools = new Set(LLM_TOOLS.map((t) => t.function.name));
+    const messages: Array<Record<string, unknown>> = [{ role: "system", content: sysPrompt }, ...histMsgs, { role: "user", content: input.text }];
     const toolCallsExecuted: string[] = [];
+    const tryQueue = [plan.primary, ...plan.infraFallbacks];
+    const triedTargets = new Set<string>();
+    let lockedEp: ResolvedRouteEndpoint | undefined, round0LatencyMs = 1, totalCostUsd = 0, toolParseErrors = 0;
+    let fallbackFrom: string | undefined, escalatedFrom: string | undefined, escalationTried = false, lastErr = "no_endpoint";
 
-    try {
-      for (let round = 0; round < 5; round++) {
-        const res = await fetchFn(url, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${endpoint.apiKey}`,
-            "User-Agent": "Sugent/0.1",
-          },
-          body: JSON.stringify({ model: endpoint.model, messages, tools: LLM_TOOLS }),
-          signal: AbortSignal.timeout(75_000),
-        });
-        if (!res.ok) {
-          const errBody = await res.text().catch(() => "");
-          return { ok: false, fallbackReason: `HTTP ${res.status}: ${errBody.slice(0, 200)}` };
-        }
-        const data = (await res.json()) as {
-          model?: string;
-          usage?: { prompt_tokens?: number; completion_tokens?: number };
-          choices?: Array<{ message?: { role?: string; content?: string | null; tool_calls?: Array<{ id: string; type?: string; function?: { name?: string; arguments?: string }; extra_content?: unknown }> } }>;
-        };
-        if (data.usage && this.opts.recordUsageUsd) {
-          const usd = ((data.usage.prompt_tokens ?? 0) * 3 + (data.usage.completion_tokens ?? 0) * 15) / 1_000_000;
-          if (usd > 0) this.opts.recordUsageUsd(usd);
-        }
-        const msg = data.choices?.[0]?.message;
-        if (!msg) return { ok: false, fallbackReason: "empty_choice" };
-
-        const calls = msg.tool_calls;
-        if (!calls || calls.length === 0) {
-          const reply = String(msg.content ?? "").trim();
-          if (!reply) return { ok: false, fallbackReason: "empty_reply" };
-          return { ok: true, reply, modelUsed: data.model || endpoint.model, toolCallsExecuted, workbench: this.opts.toolsPort.getWorkbench(domain) };
-        }
-
-        // Preserve msg.tool_calls verbatim (including extra_content.google.thought_signature) for Gemini 4 multi-turn tool loops.
-        messages.push({ role: "assistant", content: msg.content ?? null, tool_calls: calls });
+    for (let qi = 0; qi < tryQueue.length; qi++) {
+      const cand = tryQueue[qi]!;
+      if (triedTargets.has(cand.targetId)) continue;
+      triedTargets.add(cand.targetId);
+      const res = await this.invokeChat(cand, messages);
+      if (!res.ok) {
+        lastErr = res.err;
+        this.opts.onRouteAttemptOutcome?.({ decisionId: plan.decisionId, targetId: cand.targetId, archetype: plan.archetype, ok: false, httpStatus: res.status, signalSource: "infra_fallback" });
+        fallbackFrom ??= cand.rawModelId;
+        continue;
+      }
+      const msg = res.data.choices?.[0]?.message;
+      const calls = msg?.tool_calls;
+      let badTool = false;
+      if (calls?.length) {
         for (const tc of calls) {
-          const fnName = String(tc.function?.name ?? "");
-          toolCallsExecuted.push(fnName);
-          let parsedArgs: Record<string, unknown> = {};
-          try { parsedArgs = JSON.parse(String(tc.function?.arguments ?? "{}")) as Record<string, unknown>; } catch { parsedArgs = {}; }
-          const toolOut = await this.executeTool(fnName, parsedArgs, domain, channel);
-          messages.push({ role: "tool", tool_call_id: tc.id, name: fnName, content: JSON.stringify(toolOut) });
+          if (!knownTools.has(String(tc.function?.name ?? ""))) { badTool = true; toolParseErrors += 1; }
+          try { JSON.parse(String(tc.function?.arguments ?? "{}")); } catch { badTool = true; toolParseErrors += 1; }
         }
       }
-      return { ok: false, fallbackReason: "max_tool_rounds_exceeded" };
-    } catch (err) {
-      return { ok: false, fallbackReason: err instanceof Error ? err.message : String(err) };
+      const emptyText = !calls?.length && !String(msg?.content ?? "").trim();
+      if (!msg || emptyText || badTool) {
+        lastErr = !msg ? "empty_choice" : emptyText ? "empty_reply" : "malformed_tool_call";
+        this.opts.onRouteAttemptOutcome?.({ decisionId: plan.decisionId, targetId: cand.targetId, archetype: plan.archetype, ok: false, emptyReply: !msg || emptyText, toolParseErrorCount: badTool ? toolParseErrors : 0, signalSource: "quality_escalation" });
+        if (!escalationTried && plan.escalationTarget && !triedTargets.has(plan.escalationTarget.targetId)) {
+          escalationTried = true; escalatedFrom = cand.rawModelId; tryQueue.splice(qi + 1, 0, plan.escalationTarget);
+        }
+        continue;
+      }
+      totalCostUsd += this.accountUsage(res.data.model || cand.rawModelId, res.data.usage);
+      lockedEp = cand; round0LatencyMs = res.latencyMs;
+      if (!calls?.length) {
+        this.opts.onRouteAttemptOutcome?.({ decisionId: plan.decisionId, targetId: cand.targetId, archetype: plan.archetype, ok: true, ttftMs: res.latencyMs, totalLatencyMs: Math.max(1, Date.now() - turnStartMs), costUsd: totalCostUsd, toolCallCount: 0, escalatedFrom, fallbackUsedFrom: fallbackFrom, signalSource: "turn_complete" });
+        return { ok: true, reply: String(msg.content ?? "").trim(), modelUsed: res.data.model || cand.rawModelId, toolCallsExecuted, routeMeta: this.buildRouteMeta(plan, cand, fallbackFrom, escalatedFrom), workbench: this.opts.toolsPort.getWorkbench(domain) };
+      }
+      await this.dispatchToolCalls(msg.content, calls, messages, toolCallsExecuted, domain, channel);
+      break;
     }
+    if (!lockedEp) return { ok: false, fallbackReason: lastErr };
+    return this.runLockedToolRounds(plan, lockedEp, messages, toolCallsExecuted, domain, channel, turnStartMs, round0LatencyMs, totalCostUsd, fallbackFrom, escalatedFrom);
+  }
+
+  private async runLockedToolRounds(
+    plan: RouteDecisionPlan,
+    lockedEp: ResolvedRouteEndpoint,
+    messages: Array<Record<string, unknown>>,
+    toolCallsExecuted: string[],
+    domain: CallerAccessDomain,
+    channel: DropzoneChannel,
+    turnStartMs: number,
+    round0LatencyMs: number,
+    initialCostUsd: number,
+    fallbackFrom?: string,
+    escalatedFrom?: string,
+  ): Promise<{ ok: true; reply: string; modelUsed: string; toolCallsExecuted: string[]; routeMeta?: StewardRouteMeta; workbench: TWorkbench } | { ok: false; fallbackReason: string }> {
+    let totalCostUsd = initialCostUsd;
+    for (let round = 1; round < 5; round++) {
+      // Intra-turn stickiness: never switch model mid-tool-loop so Gemini 4 thought_signature stays valid.
+      const res = await this.invokeChat(lockedEp, messages);
+      if (!res.ok) {
+        this.opts.onRouteAttemptOutcome?.({ decisionId: plan.decisionId, targetId: lockedEp.targetId, archetype: plan.archetype, ok: false, httpStatus: res.status, signalSource: "infra_fallback" });
+        return { ok: false, fallbackReason: res.err };
+      }
+      totalCostUsd += this.accountUsage(res.data.model || lockedEp.rawModelId, res.data.usage);
+      const msg = res.data.choices?.[0]?.message;
+      if (!msg) {
+        this.opts.onRouteAttemptOutcome?.({ decisionId: plan.decisionId, targetId: lockedEp.targetId, archetype: plan.archetype, ok: false, emptyReply: true, signalSource: "quality_escalation" });
+        return { ok: false, fallbackReason: "empty_choice" };
+      }
+      if (!msg.tool_calls?.length) {
+        const reply = String(msg.content ?? "").trim();
+        if (!reply) {
+          this.opts.onRouteAttemptOutcome?.({ decisionId: plan.decisionId, targetId: lockedEp.targetId, archetype: plan.archetype, ok: false, emptyReply: true, signalSource: "quality_escalation" });
+          return { ok: false, fallbackReason: "empty_reply" };
+        }
+        this.opts.onRouteAttemptOutcome?.({ decisionId: plan.decisionId, targetId: lockedEp.targetId, archetype: plan.archetype, ok: true, ttftMs: round0LatencyMs, totalLatencyMs: Math.max(1, Date.now() - turnStartMs), costUsd: totalCostUsd, toolCallCount: toolCallsExecuted.length, escalatedFrom, fallbackUsedFrom: fallbackFrom, signalSource: "turn_complete" });
+        return { ok: true, reply, modelUsed: res.data.model || lockedEp.rawModelId, toolCallsExecuted, routeMeta: this.buildRouteMeta(plan, lockedEp, fallbackFrom, escalatedFrom), workbench: this.opts.toolsPort.getWorkbench(domain) };
+      }
+      await this.dispatchToolCalls(msg.content, msg.tool_calls, messages, toolCallsExecuted, domain, channel);
+    }
+    return { ok: false, fallbackReason: "max_tool_rounds_exceeded" };
   }
 }

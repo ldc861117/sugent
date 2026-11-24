@@ -55,8 +55,11 @@ import { detached, setLangPref, t, t as tr } from "./i18n/index.js";
 import { Attention, approvalItems, deliveryItem, type AttentionItem } from "./tasks/attention.js";
 import {
   ConciergeChannelBridge,
+  HotBundleSlotManager,
+  HotReloadBus,
   LLM_PROVIDER_PRESETS,
   LocalBudgetLedger,
+  OwnerChannelStewardRouter,
   ProviderRegistry,
   SugentAuthManager,
   SugentKnowledgeGraph,
@@ -64,6 +67,7 @@ import {
   SugentP2HostService,
   SugentStewardHostService,
   buildBrokerDesktopAuthConfig,
+  createEnvelopedRuleEventSink,
   decodeJwtPayloadUnsafe,
   deriveMagpieApiBases,
   normalizeProviderPresetId,
@@ -71,6 +75,7 @@ import {
   resolveSugentGatewayConfig,
   resolveUnifiedKnowledgeGraphDir,
   type GeminiWeb2ApiProbeResult,
+  type ProviderSyncResult,
   type PublicProviderItem,
   type SugentAuthConfig,
   type SugentAuthConfigPatch,
@@ -98,9 +103,16 @@ export interface DesktopHooks {
   downloadUpdate?(): DesktopUpdateStatus;
   installUpdate?(): void;
   requestRelaunchQuit?(): void;
-  companionState?(): { supported: boolean; visible: boolean; expanded: boolean };
-  toggleCompanion?(visible?: boolean): { supported: boolean; visible: boolean; expanded: boolean };
-  showCompanionQuickBar?(): { supported: boolean; visible: boolean; expanded: boolean };
+  companionState?(): { supported: boolean; visible: boolean; expanded: boolean; dockEdge?: string; facing?: string; dockMode?: string };
+  toggleCompanion?(visible?: boolean): { supported: boolean; visible: boolean; expanded: boolean; dockEdge?: string; facing?: string; dockMode?: string };
+  showCompanionQuickBar?(): { supported: boolean; visible: boolean; expanded: boolean; dockEdge?: string; facing?: string; dockMode?: string };
+  notifyCompanion?: (payload: Record<string, unknown>) => void;
+  handoffCompanionToMain?: (payload: { hash?: string; draftText?: string; source?: string }) => void;
+  hotUpdateStatus?(): Record<string, unknown>;
+  requestHotReloadCore?(opts?: { reason?: string }): Promise<{ ok: boolean; rolledBack?: boolean; elapsedMs?: number; bootId?: string; error?: string }>;
+  requestStageHotBundle?(bundleBase64: string, opts?: { allowUnsigned?: boolean }): Promise<{ ok: boolean; slot?: string; rolledBack?: boolean; error?: string }>;
+  requestRollbackHotSlot?(): Promise<{ ok: boolean; activeSlot?: string | null; error?: string }>;
+  requestFactoryResetHotSlot?(): Promise<{ ok: boolean; error?: string }>;
 }
 
 export interface DesktopUpdateStatus {
@@ -147,6 +159,9 @@ export interface AppOptions {
   deliveryLimits?: Pick<DeliveryOptions, "dailyCap" | "coalesceMs">;
   stewardHomeDir?: string;
   stewardFleetStatePath?: string;
+  enableOwnerStewardRouter?: boolean;
+  enableStewardPulseTimer?: boolean;
+  stewardPulseIntervalMs?: number;
 }
 
 interface BotChannels {
@@ -166,8 +181,11 @@ export class App {
   readonly localBudgets: LocalBudgetLedger;
   readonly knowledgeGraph: SugentKnowledgeGraph;
   readonly conciergeBridge: ConciergeChannelBridge;
+  readonly hotBundles: HotBundleSlotManager;
+  readonly hotReloadBus: HotReloadBus;
   readonly p2Service: SugentP2HostService;
   readonly stewardService: SugentStewardHostService;
+  readonly ownerStewardRouter: OwnerChannelStewardRouter;
   readonly models: ModelClient;
   readonly runtime: BotRuntime;
   readonly agent: AgentManager;
@@ -191,6 +209,9 @@ export class App {
   private offPwsh: (() => void) | undefined;
   private accountTimer: NodeJS.Timeout | undefined;
   private picksTimer: NodeJS.Timeout | undefined;
+  private modelPoolSyncTimer: NodeJS.Timeout | undefined;
+  private stewardPulseTimer: NodeJS.Timeout | undefined;
+  private activeOwnerConvByChannel = new Map<string, { botId: string; conversationId: string }>();
   private modelInfoCache: { at: number; data: Record<string, ModelInfo> } | undefined;
   private modelInfoLoading: Promise<Record<string, ModelInfo>> | undefined;
   private botBudgetCache: { at: number; data: Record<string, { limitUsd: number; remainUsd: number }> } | undefined;
@@ -254,6 +275,19 @@ export class App {
         },
       },
     });
+    const appRootDir = findAppRoot();
+    const hostNmDir = path.join(appRootDir, "node_modules");
+    this.hotBundles = new HotBundleSlotManager(config.dataDir, {
+      ...(!hostNmDir.includes(".asar") && fs.existsSync(hostNmDir) ? { hostNodeModulesDir: hostNmDir } : {}),
+    });
+    const resolvedUiDir = process.env.SUGENT_UI_DIR && fs.existsSync(process.env.SUGENT_UI_DIR)
+      ? path.resolve(process.env.SUGENT_UI_DIR)
+      : path.join(appRootDir, "ui");
+    this.hotReloadBus = new HotReloadBus({
+      dataDir: config.dataDir,
+      uiDir: resolvedUiDir,
+      enableWatchers: process.env.SUGENT_UI_HOT_RELOAD === "1" && !process.env.VITEST,
+    });
     this.p2Service = new SugentP2HostService({
       dataDir: config.dataDir,
       providers: this.providers,
@@ -268,7 +302,9 @@ export class App {
       knowledgeGraph: this.knowledgeGraph,
       localBudgets: this.localBudgets,
       providerRegistry: this.providers,
+      modelCatalog: this.modelCatalog,
       conciergeBridge: this.conciergeBridge,
+      llmFetch: ((input, init) => (this.desktop?.fetch ?? globalThis.fetch)(input, init)) as typeof fetch,
       recordUsageUsd: (usd) => this.recordLocalBotUsageCost("default", usd),
       getGatewayConfig: () => {
         const resolved = resolveSugentGatewayConfig(this.config, {});
@@ -285,7 +321,59 @@ export class App {
       },
       ...(opts.stewardHomeDir ? { homeDir: opts.stewardHomeDir } : {}),
       ...(opts.stewardFleetStatePath ? { fleetStatePath: opts.stewardFleetStatePath } : {}),
+      delegateLocalTask: async (input) => {
+        const ch = input.channel === "weixin" || input.channel === "feishu" ? input.channel : "web";
+        const active = this.activeOwnerConvByChannel.get(ch);
+        const botId = active?.botId ?? (this.store.listBots()[0]?.id || "default");
+        const fallbackPeer = ch !== "web" ? (this.access.owner(botId, ch)?.peerId || `steward-delegate-${ch}`) : `steward-delegate-${ch}`;
+        const conv =
+          (active?.conversationId ? this.store.getConversation(active.conversationId) : undefined) ??
+          this.store.ensureConversation(botId, ch, fallbackPeer, "Owner", "dm");
+        const created = this.tasks.create({
+          botId,
+          conversationId: conv.id,
+          title: input.title,
+          brief: input.instruction,
+          anytime: true,
+        });
+        if (!created.task) throw new Error(created.error ?? "FAILED_TO_CREATE_LOCAL_TASK");
+        return {
+          ok: true,
+          taskId: created.task.id,
+          status: "queued",
+          summary: `已创建本机后台任务「${created.task.title}」（ID: ${created.task.id}）`,
+        };
+      },
       requestRelaunchQuit: () => this.desktop?.requestRelaunchQuit?.(),
+      hotUpdatePort: {
+        getStatus: () => ({
+          supervised: Boolean(this.desktop?.requestHotReloadCore),
+          bus: this.hotReloadBus.getSnapshot(),
+          slots: this.hotBundles.getState(),
+          ...(this.desktop?.hotUpdateStatus ? { shell: this.desktop.hotUpdateStatus() } : {}),
+        }),
+        reloadUi: (file) => ({
+          ui: this.hotReloadBus.notifyUiChange(file || "ui/main.js"),
+          extensions: this.hotReloadBus.reloadExtensions(),
+        }),
+        reloadCore: (opts) =>
+          this.desktop?.requestHotReloadCore
+            ? this.desktop.requestHotReloadCore(opts)
+            : Promise.resolve({ ok: false, error: "DIRECT_MODE_NO_SUPERVISOR" }),
+        stageBundle: (bundleBase64, opts) =>
+          this.desktop?.requestStageHotBundle
+            ? this.desktop.requestStageHotBundle(bundleBase64, opts)
+            : Promise.resolve(this.hotBundles.stageBundleBuffer(Buffer.from(bundleBase64, "base64"), opts)),
+        rollbackSlot: () =>
+          this.desktop?.requestRollbackHotSlot
+            ? this.desktop.requestRollbackHotSlot()
+            : Promise.resolve(this.hotBundles.rollbackToPrevious()),
+        factoryReset: () => {
+          if (this.desktop?.requestFactoryResetHotSlot) return this.desktop.requestFactoryResetHotSlot();
+          this.hotBundles.resetToFactoryGolden();
+          return Promise.resolve({ ok: true });
+        },
+      },
       vibeNotifyChannel: async (ev) => {
         for (const [key, ch] of this.channels) {
           if ((ev.channel === "weixin" || ev.channel === "sugent_app") && ch.weixin) {
@@ -329,6 +417,8 @@ export class App {
       store: this.store,
       dataDir: config.dataDir,
       knowledgeGraph: this.knowledgeGraph,
+      skillCrystallizeGated: process.env.SUGENT_SKILL_GATE_MODE !== "open",
+      maxActiveCrystallizedSkills: 12,
       runtimeDir: config.agent.mode === "dsh" ? locateDshRuntime(findAppRoot()) : undefined,
       upstream,
       enabled: config.agent.mode === "dsh" && !opts.models,
@@ -397,7 +487,19 @@ export class App {
       },
     });
     this.agent.tasks = this.tasks;
-    this.ruleEvents = new RuleEvents(this.tasks);
+    this.ruleEvents = new RuleEvents(
+      createEnvelopedRuleEventSink(this.tasks, {
+        privilegedFieldMode: "strip",
+        resolveWorkspaceDir: () =>
+          path.join(config.dataDir, "workspaces", this.store.listBots()[0]?.id ?? "default"),
+      }),
+    );
+    this.ownerStewardRouter = new OwnerChannelStewardRouter({
+      steward: this.stewardService,
+      enabled: () =>
+        (opts.enableOwnerStewardRouter ?? (!opts.models && process.env.SUGENT_OWNER_STEWARD_BRIDGE !== "0")) &&
+        this.stewardService.hasLiveLlmEndpoint(),
+    });
     this.attention.addSource(() => approvalItems(this.store, this.agent.approvals.pendingAll()));
     this.attention.addSource(() => this.tasks.attention());
     this.attention.addSource(() => this.tasks.ruleAttention());
@@ -415,6 +517,28 @@ export class App {
       route: (botId, model) => this.routeModel(botId, model),
       access: this.access,
       conciergeIntercept: (ev) => this.conciergeBridge.interceptRuntimeReply(ev),
+      ownerStewardIntercept: async (ev, convId, text, onBeforeReply) => {
+        const acctKey = ev.account || ev.botId;
+        const ownerPeer = this.access.owner(acctKey, ev.channel)?.peerId;
+        const isGroup = ev.conversation.kind === "group";
+        const isOwnerPeer = Boolean(!isGroup && ownerPeer && ownerPeer === ev.conversation.id);
+        const inbound = {
+          botId: ev.botId,
+          account: acctKey,
+          channel: ev.channel,
+          peerId: ev.conversation.id,
+          isGroup,
+          isOwnerPeer,
+          text,
+        };
+        if (!this.ownerStewardRouter.canIntercept(inbound)) {
+          return { handled: false };
+        }
+        this.activeOwnerConvByChannel.set(ev.channel, { botId: ev.botId, conversationId: convId });
+        await onBeforeReply?.();
+        const res = await this.ownerStewardRouter.tryHandleInbound(inbound);
+        return res.handled ? { handled: true, reply: res.reply } : { handled: false };
+      },
       recoverKey: () => (this.account?.signedIn ? this.account.repairKeys(15_000) : Promise.resolve(false)),
     });
   }
@@ -454,6 +578,45 @@ export class App {
 
   markDesktopBootHealthy(pid: number, version: string): void {
     void this.stewardService.markBootHealthy(pid, version).catch((e) => log.warn("boot healthy mark failed", { message: (e as Error).message }));
+  }
+
+  isStewardPulseTimerActive(): boolean {
+    return Boolean(this.stewardPulseTimer);
+  }
+
+  async runStewardPulseTick(input: {
+    nowMs?: number;
+    forceMorningDrain?: boolean;
+    drainBoundary?: boolean;
+    forceGardener?: boolean;
+    gardenerIntervalMs?: number;
+  } = {}) {
+    const res = this.stewardService.runScheduledPulse(input);
+    if (res.morningDrain && res.morningDrain.emitNow.length > 0) {
+      const lines = [
+        `【早间对齐简报 · ${res.dateKey}】`,
+        ...res.morningDrain.emitNow.slice(0, 5).map((c, idx) => `${idx + 1}. ${c.title} — ${c.threeLineBody[0]}`),
+      ];
+      await this.pushToOwner(lines.join("\n")).catch(() => false);
+    }
+    if (res.boundaryDrain && res.boundaryDrain.emitNow.length > 0) {
+      const lines = [
+        "【心流间隙待办汇总】",
+        ...res.boundaryDrain.emitNow.slice(0, 5).map((c, idx) => `${idx + 1}. ${c.title} — ${c.threeLineBody[0]}`),
+      ];
+      await this.pushToOwner(lines.join("\n")).catch(() => false);
+    }
+    if (!res.morningDrain?.emitNow.length && res.scan.emitNow.length > 0) {
+      const urgent = res.scan.emitNow.filter((c) => c.urgency === "urgent");
+      if (urgent.length > 0) {
+        const lines = [
+          "【幕僚高优提醒】",
+          ...urgent.slice(0, 3).map((c) => `- ${c.title}：${c.threeLineBody[0]}`),
+        ];
+        await this.pushToOwner(lines.join("\n")).catch(() => false);
+      }
+    }
+    return res;
   }
 
   async prewarmAgent(): Promise<void> {
@@ -558,6 +721,13 @@ export class App {
     }
   }
 
+  async syncProviderModels(providerId?: string, force = false): Promise<ProviderSyncResult[]> {
+    return this.stewardService.syncModelPool({
+      ...(providerId ? { providerId } : {}),
+      force,
+    });
+  }
+
   async upsertDecoupledProvider(
     input: UpsertProviderInput,
   ): Promise<{ provider: PublicProviderItem; models: string[] }> {
@@ -568,39 +738,11 @@ export class App {
     });
     if (saved.apiKey) registerSecret(saved.apiKey);
 
-    let discoveredModels = saved.models ?? [];
-    if (saved.baseUrl && discoveredModels.length === 0) {
-      try {
-        const headers: Record<string, string> = { Accept: "application/json" };
-        if (saved.apiKey) {
-          if (saved.preset === "anthropic") {
-            headers["x-api-key"] = saved.apiKey;
-            headers["anthropic-version"] = "2023-06-01";
-          } else {
-            headers.Authorization = `Bearer ${saved.apiKey}`;
-          }
-        }
-        const f = this.desktop?.fetch ?? fetch;
-        const probeRes = await f(`${saved.baseUrl.replace(/\/+$/, "")}/models`, {
-          headers,
-          signal: AbortSignal.timeout(8_000),
-        });
-        if (probeRes.ok) {
-          const body = (await probeRes.json()) as { data?: Array<{ id?: unknown }>; models?: Array<{ id?: unknown; name?: unknown }> };
-          const list = Array.isArray(body.data)
-            ? body.data.map((m) => String(m.id ?? "").trim()).filter(Boolean)
-            : Array.isArray(body.models)
-              ? body.models.map((m) => String(m.id ?? m.name ?? "").trim()).filter(Boolean)
-              : [];
-          if (list.length > 0) {
-            discoveredModels = list;
-            this.providers.upsertProvider({ id: saved.id, models: discoveredModels });
-          }
-        }
-      } catch {
-        // Offline or non-OpenAI /models endpoint; proceed without blocking save
-      }
+    if (saved.baseUrl && saved.enabled) {
+      await this.syncProviderModels(saved.id, true).catch(() => []);
     }
+    const latestProvider = this.providers.getProvider(saved.id) ?? saved;
+    const discoveredModels = latestProvider.models ?? [];
 
     if (this.magpie && this.magpie.state === "running" && saved.enabled && saved.preset !== "modelflare-legacy") {
       await this.magpie.upsertGenericProvider({
@@ -1009,6 +1151,19 @@ export class App {
       this.picksTimer = setInterval(() => void this.syncModelPicks(), 3600_000);
       this.picksTimer.unref();
     }
+    void this.syncProviderModels(undefined, false).catch(() => {});
+    this.modelPoolSyncTimer = setInterval(() => {
+      void this.syncProviderModels(undefined, false).catch(() => {});
+    }, 10 * 60_000);
+    this.modelPoolSyncTimer.unref();
+    const enablePulse = this.opts.enableStewardPulseTimer ?? (!process.env.VITEST && !this.opts.noWeb);
+    if (enablePulse) {
+      const pulseMs = Math.max(5_000, this.opts.stewardPulseIntervalMs ?? 15 * 60_000);
+      this.stewardPulseTimer = setInterval(() => {
+        void this.runStewardPulseTick().catch((e) => log.warn("steward pulse tick failed", { message: (e as Error).message }));
+      }, pulseMs);
+      this.stewardPulseTimer.unref();
+    }
     if (pwshProbe.applicable) {
       pwshProbe.configure({ agent: this.agent.available, mode: this.config.agent.pwsh, fetch: () => this.desktop?.fetch });
       this.offPwsh = pwshProbe.onChange((e) => {
@@ -1058,8 +1213,17 @@ export class App {
     this.offPwsh?.();
     if (this.accountTimer) clearInterval(this.accountTimer);
     if (this.picksTimer) clearInterval(this.picksTimer);
+    if (this.modelPoolSyncTimer) {
+      clearInterval(this.modelPoolSyncTimer);
+      this.modelPoolSyncTimer = undefined;
+    }
+    if (this.stewardPulseTimer) {
+      clearInterval(this.stewardPulseTimer);
+      this.stewardPulseTimer = undefined;
+    }
     this.account?.cancelLogin();
     this.sugentAuth?.cancelLogin();
+    this.hotReloadBus.close();
     await this.web?.close();
     this.delivery.stop();
     await this.outbox.stop();

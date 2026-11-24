@@ -26,9 +26,9 @@ import {
   type AgentApiRunner,
   type DispatchOutcome,
 } from "./antigravity-dispatcher.js";
-import { CausalLedger } from "./causal-ledger.js";
+import { CausalLedger, resolveUnifiedCausalLedgerDir } from "./causal-ledger.js";
 import { resolveSugentGatewayConfig, selectModelForRole } from "./gateway.js";
-import type { SugentKnowledgeGraph } from "./knowledge-graph.js";
+import type { SkillCandidateSummary, SugentKnowledgeGraph } from "./knowledge-graph.js";
 import type { BotBudgetStatus, LocalBudgetLedger } from "./local-budget.js";
 import {
   createAttentionBudgetGate,
@@ -62,7 +62,14 @@ import {
   type StewardConversationResult,
   type StewardConversationTurnInput,
 } from "./steward-conversation.js";
-import { StewardLlmAgent, STEWARD_CAPABILITY_DESCRIPTORS, type StewardLlmEndpoint } from "./steward-llm-agent.js";
+import {
+  StewardLlmAgent,
+  STEWARD_CAPABILITY_DESCRIPTORS,
+  type LocalTaskDelegationInput,
+  type LocalTaskDelegationResult,
+  type StewardLlmEndpoint,
+  type StewardRouteMeta,
+} from "./steward-llm-agent.js";
 import { SugentStewardMcpServer } from "./steward-mcp.js";
 import { CapabilityAwarenessEngine, type CapabilityAwarenessSnapshot } from "./capability-awareness.js";
 import { AuthorizedFileReader, type AuthorizedFileMatch, type AuthorizedProjectRoot, type ReadAuthorizedFileResult } from "./authorized-file-reader.js";
@@ -77,13 +84,18 @@ import { SafeRelaunchCoordinator, writeBootHealthyStamp, type PostBootNotice } f
 import { SugentSIMStore } from "./self-improvement-memory.js";
 import { VibeCodingPipelineOrchestrator, type CommandExecPort, type VibeNotificationEvent, type VibePipelineRecord } from "./vibe-coding-pipeline.js";
 import { SugentAvatarStudio } from "./avatar-studio.js";
-import type { ProviderRegistry } from "./provider-registry.js";
+import { ProviderRegistry } from "./provider-registry.js";
+import { SugentModelCatalog, type ModelTier } from "./model-catalog.js";
+import { ModelPoolSyncer, type ProviderSyncResult } from "./model-pool-sync.js";
+import { RoutingExperienceStore, type RoutingOperatingMode, type RoutingPolicyState, type RoutingStrategyPreset, type TaskArchetype } from "./routing-experience-store.js";
+import { AdaptiveModelRouter, type AdaptiveRoutingDashboardSnapshot } from "./adaptive-router.js";
 
 export interface SugentStewardHostServiceOptions {
   dataDir: string;
   knowledgeGraph: SugentKnowledgeGraph;
   localBudgets: LocalBudgetLedger;
   providerRegistry?: ProviderRegistry;
+  modelCatalog?: SugentModelCatalog;
   getGatewayConfig?: () => SugentGatewayConfig;
   conciergeBridge?: ConciergeChannelBridge;
   homeDir?: string;
@@ -96,7 +108,16 @@ export interface SugentStewardHostServiceOptions {
   nowIso?: () => string;
   vibeNotifyChannel?: (ev: VibeNotificationEvent) => Promise<void> | void;
   requestRelaunchQuit?: () => void;
+  hotUpdatePort?: {
+    getStatus: () => Record<string, unknown>;
+    reloadUi: (file?: string) => Record<string, unknown>;
+    reloadCore: (opts?: { reason?: string }) => Promise<{ ok: boolean; error?: string; [k: string]: unknown }>;
+    stageBundle: (bundleBase64: string, opts?: { allowUnsigned?: boolean }) => Promise<Record<string, unknown>>;
+    rollbackSlot: () => Promise<Record<string, unknown>>;
+    factoryReset: () => Promise<Record<string, unknown>>;
+  };
   vibeCommandRunner?: CommandExecPort;
+  delegateLocalTask?: (input: LocalTaskDelegationInput) => Promise<LocalTaskDelegationResult>;
   manifestPath?: string;
   workspaceRoot?: string;
 }
@@ -166,6 +187,9 @@ export interface StewardWorkbenchSnapshot {
     lastBootNotice?: PostBootNotice;
   };
   capabilities: CapabilityAwarenessSnapshot;
+  skillCandidates?: SkillCandidateSummary[];
+  routing?: AdaptiveRoutingDashboardSnapshot;
+  hotUpdate?: Record<string, unknown>;
 }
 
 function writeJsonAtomic600(filePath: string, data: unknown): void {
@@ -343,12 +367,27 @@ export class SugentStewardHostService {
   readonly capabilityAwareness: CapabilityAwarenessEngine;
   readonly authorizedFiles: AuthorizedFileReader;
   readonly avatarStudio: SugentAvatarStudio;
+  readonly modelCatalog: SugentModelCatalog;
+  readonly modelPoolSync: ModelPoolSyncer;
+  readonly routingExperience: RoutingExperienceStore;
+  readonly adaptiveRouter: AdaptiveModelRouter;
   private readonly homeDir: string;
   private lastBootNotice?: PostBootNotice;
+  private lastRouteTurn?: {
+    text: string;
+    history?: Array<{ role: "user" | "assistant"; content: string }>;
+    channel?: DropzoneChannel;
+    decisionId: string;
+    targetId: string;
+    archetype: TaskArchetype;
+    tier: ModelTier;
+    atMs: number;
+  };
   private readonly budgetGate: ReturnType<typeof createAttentionBudgetGate>;
   private readonly nowIsoFn: () => string;
   private readonly viewedPath: string;
   private readonly prefsPath: string;
+  private readonly pulseStatePath: string;
   private readonly viewedWatermarks: Record<string, number> = {};
   private readonly recentDrops: RecentDropRecord[] = [];
   private readonly conversationEngine: StewardConversationEngine<StewardWorkbenchSnapshot>;
@@ -363,7 +402,7 @@ export class SugentStewardHostService {
     this.homeDir = homeDir;
     const nodeId = opts.nodeId ?? "local-mac";
     const nowMs = Date.parse(this.nowIsoFn()) || Date.now();
-    const stewardDir = path.join(opts.dataDir, "sugent-stewardship");
+    const stewardDir = resolveUnifiedCausalLedgerDir(opts.dataDir);
 
     this.ledger = new StewardshipLedger({
       dataDir: opts.dataDir,
@@ -416,6 +455,7 @@ export class SugentStewardHostService {
     this.budgetGate = createAttentionBudgetGate(createFileBudgetStorage(path.join(stewardDir, "cadence-budget.json")), 0);
     this.viewedPath = path.join(stewardDir, "viewed-sessions.json");
     this.prefsPath = path.join(stewardDir, "steward-prefs.json");
+    this.pulseStatePath = path.join(stewardDir, "pulse-state.json");
     this.loadViewedWatermarks();
     this.loadPrefs();
     this.repoBindings = new RepoBindingRegistry({ dataDir: opts.dataDir, nowIso: this.nowIsoFn });
@@ -433,6 +473,7 @@ export class SugentStewardHostService {
       relauncher: this.relauncher,
       commandRunner: opts.vibeCommandRunner,
       notifyChannel: opts.vibeNotifyChannel,
+      ...(opts.hotUpdatePort ? { requestCoreHotReload: (o) => opts.hotUpdatePort!.reloadCore(o) } : {}),
       nowIso: this.nowIsoFn,
     });
     this.capabilityAwareness = new CapabilityAwarenessEngine({
@@ -475,10 +516,31 @@ export class SugentStewardHostService {
           }
         : {}),
     });
+    this.modelCatalog = opts.modelCatalog ?? new SugentModelCatalog(opts.dataDir);
+    const registryForPool = opts.providerRegistry ?? new ProviderRegistry(opts.dataDir);
+    this.modelPoolSync = new ModelPoolSyncer({
+      dataDir: opts.dataDir,
+      providers: registryForPool,
+      catalog: this.modelCatalog,
+      fetchImpl: opts.llmFetch,
+    });
+    this.routingExperience = new RoutingExperienceStore({ dataDir: opts.dataDir });
+    this.adaptiveRouter = new AdaptiveModelRouter({
+      pool: this.modelPoolSync,
+      experience: this.routingExperience,
+      providers: registryForPool,
+      catalog: this.modelCatalog,
+      localBudgets: opts.localBudgets,
+      causalLedger: this.causalLedger,
+      getFallbackEndpoint: () => this.resolveLiveLlmEndpoint(),
+    });
     this.llmAgent = new StewardLlmAgent({
       getEndpoint: () => this.resolveLiveLlmEndpoint(),
       fetchImpl: opts.llmFetch,
       recordUsageUsd: opts.recordUsageUsd,
+      resolveRoutePlan: (ctx) => this.adaptiveRouter.planRoute(ctx),
+      estimateCostUsd: (model, usage) => this.modelCatalog.estimateCostUsd(model, usage),
+      onRouteAttemptOutcome: (ev) => this.adaptiveRouter.recordAttemptOutcome(ev),
       toolsPort: {
         getWorkbench: (d) => this.getWorkbench(d),
         queryLedger: (q, d) => this.ledger.queryContext(q, d),
@@ -508,15 +570,28 @@ export class SugentStewardHostService {
         decideVibeTask: (i) => this.decideVibeTask(i),
         searchAuthorizedFiles: (i) => this.searchAuthorizedFiles(i),
         readAuthorizedFile: (i) => this.readAuthorizedFile(i),
+        getRoutingDashboard: () => this.getRoutingDashboard(),
+        syncModelPool: (o) => this.syncModelPool(o),
+        updateRoutingPolicy: (patch) => this.updateRoutingPolicy(patch),
+        manageHotUpdate: (input) => this.executeHotUpdateAction(input),
+        ...(opts.delegateLocalTask ? { delegateLocalTask: opts.delegateLocalTask } : {}),
         ...(opts.conciergeBridge ? { executeConciergeCommand: (cmd, ch) => opts.conciergeBridge!.executeOwnerCommand(cmd, ch) } : {}),
       },
     });
   }
 
+  hasLiveLlmEndpoint(): boolean {
+    return Boolean(this.resolveLiveLlmEndpoint());
+  }
+
   private resolveLiveLlmEndpoint(): StewardLlmEndpoint | undefined {
     const gw = this.opts.getGatewayConfig?.() ?? resolveSugentGatewayConfig(undefined, {});
-    if (!gw.baseUrl || !gw.apiKey) return undefined;
-    return { baseUrl: gw.baseUrl, apiKey: gw.apiKey, model: selectModelForRole(gw, "steward") };
+    if (gw.baseUrl && gw.apiKey) return { baseUrl: gw.baseUrl, apiKey: gw.apiKey, model: selectModelForRole(gw, "steward") };
+    const def = this.opts.providerRegistry?.getDefaultProvider();
+    if (def?.enabled && def.baseUrl) {
+      return { baseUrl: def.baseUrl, apiKey: def.apiKey, model: def.defaultModel || def.models?.[0] || selectModelForRole(gw, "steward") };
+    }
+    return undefined;
   }
 
   async comprehendSession(input: ArtifactComprehensionInput): Promise<ArtifactComprehensionResult> {
@@ -572,9 +647,58 @@ export class SugentStewardHostService {
     return { quietHoursActive: this.quietHoursActive, workbench: this.getWorkbench(callerDomain) };
   }
 
+  async syncModelPool(opts?: { providerId?: string; force?: boolean }): Promise<ProviderSyncResult[]> {
+    if (opts?.providerId) return [await this.modelPoolSync.syncProvider(opts.providerId, { force: opts.force })];
+    return (await this.modelPoolSync.syncAllEnabled({ force: opts?.force })).results;
+  }
+
+  getRoutingDashboard(): AdaptiveRoutingDashboardSnapshot {
+    return this.adaptiveRouter.getDashboardSnapshot();
+  }
+
+  updateRoutingPolicy(patch: {
+    strategy?: RoutingStrategyPreset;
+    mode?: RoutingOperatingMode;
+    pinnedModel?: string | null;
+    blockedModels?: string[];
+    unblockModel?: string;
+    resetBoosts?: boolean;
+    directive?: string;
+  }) {
+    const hasDirectPatch =
+      patch.strategy !== undefined ||
+      patch.mode !== undefined ||
+      patch.pinnedModel !== undefined ||
+      patch.blockedModels !== undefined ||
+      patch.unblockModel !== undefined ||
+      patch.resetBoosts !== undefined;
+    if (hasDirectPatch) this.routingExperience.updatePolicy(patch);
+    if (patch.directive) {
+      const known = this.modelPoolSync.listChatCandidates().map((e) => e.targetId);
+      const res = this.routingExperience.applyNaturalLanguageDirective(patch.directive, known);
+      return { ...res, dashboard: this.getRoutingDashboard() };
+    }
+    return { matched: true, policy: this.routingExperience.getPolicy(), dashboard: this.getRoutingDashboard() };
+  }
+
+  async retryLastTurnStronger(callerDomain: CallerAccessDomain = "owner_private") {
+    const prev = this.lastRouteTurn;
+    if (!prev) return { ok: false as const, errorCode: "NO_PREVIOUS_TURN", workbench: this.getWorkbench(callerDomain) };
+    this.adaptiveRouter.recordAttemptOutcome({ decisionId: prev.decisionId, targetId: prev.targetId, archetype: prev.archetype, ok: false, signalSource: "explicit_retry_stronger" });
+    const tierUp: ModelTier = prev.tier === "fast" ? "balanced" : prev.tier === "balanced" ? "frontier" : "reasoning";
+    const out = await this.llmAgent.runTurn({ text: prev.text, history: prev.history, callerDomain, channel: prev.channel, excludeTargetIds: [prev.targetId], forceMinTier: tierUp });
+    if (!out.ok) return { ok: false as const, errorCode: out.fallbackReason, workbench: this.getWorkbench(callerDomain) };
+    const entry = out.routeMeta ? this.modelPoolSync.getEntry(out.routeMeta.targetId) : undefined;
+    this.lastRouteTurn = { ...prev, decisionId: out.routeMeta?.decisionId ?? prev.decisionId, targetId: out.routeMeta?.targetId ?? prev.targetId, tier: entry?.profile.tier ?? tierUp, atMs: Date.now() };
+    return { ok: true as const, intent: "llm_agent" as const, reply: out.reply, modelUsed: out.modelUsed, routeMeta: out.routeMeta, workbench: out.workbench };
+  }
+
   async converse(
     input: StewardConversationTurnInput & { history?: Array<{ role: "user" | "assistant"; content: string }> },
-  ): Promise<StewardConversationResult<StewardWorkbenchSnapshot> & { modelUsed?: string; toolCallsExecuted?: string[] }> {
+  ): Promise<StewardConversationResult<StewardWorkbenchSnapshot> & { modelUsed?: string; toolCallsExecuted?: string[]; routeMeta?: StewardRouteMeta }> {
+    if (this.lastRouteTurn && this.routingExperience.detectImplicitUserCorrection({ userText: this.lastRouteTurn.text, atMs: this.lastRouteTurn.atMs }, input.text)) {
+      this.adaptiveRouter.recordAttemptOutcome({ decisionId: this.lastRouteTurn.decisionId, targetId: this.lastRouteTurn.targetId, archetype: this.lastRouteTurn.archetype, ok: false, signalSource: "user_correction" });
+    }
     const llmOut = await this.llmAgent.runTurn({
       text: input.text,
       history: input.history,
@@ -582,6 +706,10 @@ export class SugentStewardHostService {
       channel: input.channel,
     });
     if (llmOut.ok) {
+      if (llmOut.routeMeta) {
+        const entry = this.modelPoolSync.getEntry(llmOut.routeMeta.targetId);
+        this.lastRouteTurn = { text: input.text, history: input.history, channel: input.channel, decisionId: llmOut.routeMeta.decisionId, targetId: llmOut.routeMeta.targetId, archetype: llmOut.routeMeta.archetype, tier: entry?.profile.tier ?? "balanced", atMs: Date.now() };
+      }
       return {
         ok: true,
         intent: "llm_agent",
@@ -589,6 +717,7 @@ export class SugentStewardHostService {
         workbench: llmOut.workbench,
         modelUsed: llmOut.modelUsed,
         toolCallsExecuted: llmOut.toolCallsExecuted,
+        ...(llmOut.routeMeta ? { routeMeta: llmOut.routeMeta } : {}),
       };
     }
     return this.conversationEngine.converse(input);
@@ -755,11 +884,13 @@ export class SugentStewardHostService {
     const supersededTierEdges = allTierEdges.filter((e) => Boolean(e.supersededAt)).length;
     const live = this.resolveLiveLlmEndpoint();
     const gw = this.opts.getGatewayConfig?.() ?? resolveSugentGatewayConfig(undefined, {});
+    const routing = this.getRoutingDashboard();
+    const latestDecision = routing.recentDecisions[0];
     return {
       callerDomain,
       quietHoursActive: this.quietHoursActive,
-      activeModel: live?.model ?? selectModelForRole(gw, "steward"),
-      llmLive: Boolean(live),
+      activeModel: latestDecision?.rawModelId ?? live?.model ?? selectModelForRole(gw, "steward"),
+      llmLive: Boolean(live) || routing.pool.healthyChatModels > 0,
       ledger,
       ...(budgetStatus ? { budgetStatus } : {}),
       trustKgStats: { activeTierEdges, supersededTierEdges },
@@ -786,6 +917,11 @@ export class SugentStewardHostService {
         ...(this.lastBootNotice ? { lastBootNotice: this.lastBootNotice } : {}),
       },
       capabilities: this.capabilityAwareness.snapshot(this.getAuthorizedProjectRoots(scan).length),
+      ...(callerDomain === "owner_private"
+        ? { skillCandidates: this.opts.knowledgeGraph.listSkillCandidates({ threshold: 3 }) }
+        : {}),
+      routing,
+      ...(this.opts.hotUpdatePort ? { hotUpdate: this.getHotUpdateStatus() } : {}),
     };
   }
 
@@ -1110,6 +1246,9 @@ export class SugentStewardHostService {
     callerDomain?: CallerAccessDomain;
   }): Promise<{ ok: boolean; message: string; pipeline?: VibePipelineRecord; workbench: StewardWorkbenchSnapshot }> {
     const res = await this.vibePipeline.decide(input);
+    if (input.action === "verify_now" && res.pipeline) {
+      this.adaptiveRouter.recordVibeGateFeedback(res.pipeline.stage !== "failed" && res.pipeline.lastVerification?.passed !== false);
+    }
     return { ...res, workbench: this.getWorkbench(input.callerDomain ?? "owner_private") };
   }
 
@@ -1130,6 +1269,9 @@ export class SugentStewardHostService {
       updated = await this.vibePipeline.onHarnessIdle(target.pipelineId, comp);
     } else if (target.stage === "developing") {
       updated = await this.vibePipeline.runVerificationAndPackage(target.pipelineId, { extraArtifactPaths: input.extraArtifactPaths, changedFilesOverride: input.changedFilesOverride });
+      if (updated && (updated.stage === "completed" || updated.stage === "awaiting_restart_approval" || updated.stage === "failed" || updated.lastVerification)) {
+        this.adaptiveRouter.recordVibeGateFeedback(updated.stage !== "failed" && updated.lastVerification?.passed !== false);
+      }
     } else {
       updated = target;
     }
@@ -1274,5 +1416,167 @@ export class SugentStewardHostService {
       maxStewardTokenBudget: partial.maxStewardTokenBudget ?? 1024,
       windowDays: partial.windowDays,
     });
+  }
+
+  getHotUpdateStatus(): Record<string, unknown> {
+    return this.opts.hotUpdatePort?.getStatus() ?? { supervised: false };
+  }
+
+  triggerHotReloadUi(file?: string): Record<string, unknown> {
+    return this.opts.hotUpdatePort?.reloadUi(file) ?? { ok: false, error: "HOT_UPDATE_UNAVAILABLE" };
+  }
+
+  async triggerHotReloadCore(opts?: { reason?: string }): Promise<Record<string, unknown>> {
+    if (!this.opts.hotUpdatePort) return { ok: false, error: "HOT_UPDATE_UNAVAILABLE" };
+    return this.opts.hotUpdatePort.reloadCore(opts);
+  }
+
+  async stageHotBundle(bundleBase64: string, opts?: { allowUnsigned?: boolean }): Promise<Record<string, unknown>> {
+    if (!this.opts.hotUpdatePort) return { ok: false, error: "HOT_UPDATE_UNAVAILABLE" };
+    return this.opts.hotUpdatePort.stageBundle(bundleBase64, opts);
+  }
+
+  async rollbackHotSlot(): Promise<Record<string, unknown>> {
+    if (!this.opts.hotUpdatePort) return { ok: false, error: "HOT_UPDATE_UNAVAILABLE" };
+    return this.opts.hotUpdatePort.rollbackSlot();
+  }
+
+  async factoryResetHotSlot(): Promise<Record<string, unknown>> {
+    if (!this.opts.hotUpdatePort) return { ok: false, error: "HOT_UPDATE_UNAVAILABLE" };
+    return this.opts.hotUpdatePort.factoryReset();
+  }
+
+  async executeHotUpdateAction(input: {
+    action: "status" | "reload_ui" | "reload_core" | "rollback" | "factory_reset";
+    file?: string;
+    reason?: string;
+  }): Promise<Record<string, unknown>> {
+    if (input.action === "status") return this.getHotUpdateStatus();
+    if (input.action === "reload_ui") return this.triggerHotReloadUi(input.file);
+    if (input.action === "reload_core") return this.triggerHotReloadCore({ reason: input.reason });
+    if (input.action === "rollback") return this.rollbackHotSlot();
+    if (input.action === "factory_reset") return this.factoryResetHotSlot();
+    return { ok: false, error: `UNKNOWN_ACTION:${String(input.action)}` };
+  }
+
+  listSkillCandidates(threshold = 3): { ok: true; candidates: SkillCandidateSummary[]; skillsRootDir: string } {
+    const skillsRootDir = path.join(this.opts.dataDir, "skills");
+    return {
+      ok: true,
+      candidates: this.opts.knowledgeGraph.listSkillCandidates({ threshold }),
+      skillsRootDir,
+    };
+  }
+
+  decideSkillCandidate(input: {
+    nodeId: string;
+    decision: "approve" | "reject";
+    maxActiveSkills?: number;
+    threshold?: number;
+  }): {
+    ok: boolean;
+    nodeId: string;
+    decision: "approve" | "reject";
+    crystallizedPaths: string[];
+    candidates: SkillCandidateSummary[];
+  } {
+    const nodeId = String(input.nodeId ?? "").trim();
+    const ok =
+      input.decision === "approve"
+        ? this.opts.knowledgeGraph.approveSkillCandidate(nodeId)
+        : this.opts.knowledgeGraph.rejectSkillCandidate(nodeId);
+    const skillsRootDir = path.join(this.opts.dataDir, "skills");
+    const crystallizedPaths = ok
+      ? this.opts.knowledgeGraph.crystallizeSkillsToDir(skillsRootDir, {
+          gated: true,
+          maxActiveSkills: input.maxActiveSkills ?? 12,
+          threshold: input.threshold ?? 3,
+        })
+      : [];
+    return {
+      ok,
+      nodeId,
+      decision: input.decision,
+      crystallizedPaths,
+      candidates: this.opts.knowledgeGraph.listSkillCandidates({ threshold: input.threshold ?? 3 }),
+    };
+  }
+
+  private readPulseState(): { lastMorningDateKey?: string; lastGardenerAtMs?: number; prevSurpriseMomentum?: number } {
+    try {
+      if (!fs.existsSync(this.pulseStatePath)) return {};
+      const raw = JSON.parse(fs.readFileSync(this.pulseStatePath, "utf8")) as Record<string, unknown>;
+      return {
+        ...(typeof raw.lastMorningDateKey === "string" ? { lastMorningDateKey: raw.lastMorningDateKey } : {}),
+        ...(typeof raw.lastGardenerAtMs === "number" ? { lastGardenerAtMs: raw.lastGardenerAtMs } : {}),
+        ...(typeof raw.prevSurpriseMomentum === "number" ? { prevSurpriseMomentum: raw.prevSurpriseMomentum } : {}),
+      };
+    } catch {
+      return {};
+    }
+  }
+
+  runScheduledPulse(input: {
+    nowMs?: number;
+    forceMorningDrain?: boolean;
+    drainBoundary?: boolean;
+    forceGardener?: boolean;
+    gardenerIntervalMs?: number;
+  } = {}): {
+    atIso: string;
+    dateKey: string;
+    scan: { emitNow: ProactiveCandidate[]; foldToMorningDigest: ProactiveCandidate[]; suppressedIds: string[] };
+    morningDrain?: { emitNow: ProactiveCandidate[]; supersededIds: string[] };
+    boundaryDrain?: { emitNow: ProactiveCandidate[]; supersededIds: string[] };
+    gardener?: GardenerCycleOutput;
+  } {
+    const nowMs = input.nowMs ?? (Date.parse(this.nowIsoFn()) || Date.now());
+    const nowDate = new Date(nowMs);
+    const atIso = nowDate.toISOString();
+    const dateKey = atIso.slice(0, 10);
+    const localDateKey = `${nowDate.getFullYear()}-${String(nowDate.getMonth() + 1).padStart(2, "0")}-${String(nowDate.getDate()).padStart(2, "0")}`;
+    const localHour = nowDate.getHours();
+    const state = this.readPulseState();
+
+    let morningDrain: { emitNow: ProactiveCandidate[]; supersededIds: string[] } | undefined;
+    const inMorningWindow = localHour >= 7 && localHour < 11;
+    if (input.forceMorningDrain || (inMorningWindow && state.lastMorningDateKey !== localDateKey)) {
+      const drained = this.drainMorning({ nextDateKey: localDateKey });
+      morningDrain = { emitNow: drained.emitNow, supersededIds: drained.supersededIds };
+      state.lastMorningDateKey = localDateKey;
+    }
+
+    let boundaryDrain: { emitNow: ProactiveCandidate[]; supersededIds: string[] } | undefined;
+    if (input.drainBoundary !== false && !this.quietHoursActive) {
+      const bDrained = this.drainFlowBoundary();
+      if (bDrained.emitNow.length > 0 || bDrained.supersededIds.length > 0) {
+        boundaryDrain = { emitNow: bDrained.emitNow, supersededIds: bDrained.supersededIds };
+      }
+    }
+
+    const scanned = this.scanCadence();
+    const scan = {
+      emitNow: scanned.emitNow,
+      foldToMorningDigest: scanned.foldToMorningDigest,
+      suppressedIds: scanned.suppressedIds,
+    };
+
+    let gardener: GardenerCycleOutput | undefined;
+    const gardenerIntervalMs = Math.max(60_000, input.gardenerIntervalMs ?? 7 * 86_400_000);
+    if (input.forceGardener || !state.lastGardenerAtMs || nowMs - state.lastGardenerAtMs >= gardenerIntervalMs) {
+      gardener = this.runGardener({ prevSurpriseMomentum: state.prevSurpriseMomentum ?? 0 });
+      state.lastGardenerAtMs = nowMs;
+      state.prevSurpriseMomentum = gardener.driftReport.surpriseMomentum;
+    }
+
+    writeJsonAtomic600(this.pulseStatePath, state);
+    return {
+      atIso,
+      dateKey,
+      scan,
+      ...(morningDrain ? { morningDrain } : {}),
+      ...(boundaryDrain ? { boundaryDrain } : {}),
+      ...(gardener ? { gardener } : {}),
+    };
   }
 }
