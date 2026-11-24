@@ -74,6 +74,10 @@ export interface AgentManagerOptions {
     listed(model: string): Promise<boolean | undefined>;
     endpoint(model: string): CompactEndpoint | undefined;
   };
+  /** 开启后，对话归档提取的 workflow 满 3 次先进入候选确认池，未批准前不直接落盘激活 */
+  skillCrystallizeGated?: boolean;
+  /** 单个机器人允许同时挂载的最大自动结晶技能数（默认 12，保护提示词缓存） */
+  maxActiveCrystallizedSkills?: number;
 }
 
 /** 一个进行中的回合（/status、/stop、排队提示、信息面板和故障排查用） */
@@ -659,7 +663,10 @@ export class AgentManager {
         const kgOut = await this.o.complete(botId, this.utilityModel(botId, model), KG_EXTRACTION_SYSTEM, recentTranscript(lines, 12_000));
         this.knowledgeGraph.applyDelta(parseKGDelta(kgOut));
       }
-      this.knowledgeGraph.crystallizeSkillsToDir(skillsDir);
+      this.knowledgeGraph.crystallizeSkillsToDir(skillsDir, {
+        gated: Boolean(this.o.skillCrystallizeGated),
+        maxActiveSkills: this.o.maxActiveCrystallizedSkills ?? 12,
+      });
     } catch (e) {
       log.warn("knowledge graph sync failed", { message: (e as Error).message.slice(0, 200) });
     }

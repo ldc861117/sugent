@@ -26,6 +26,25 @@ export type EntityKind =
   | "tool"
   | "concept";
 
+export type SkillGateStatus = "candidate" | "approved" | "rejected";
+
+export interface SkillCandidateSummary {
+  nodeId: string;
+  skillName: string;
+  name: string;
+  summary: string;
+  reinforcements: number;
+  steps: string[];
+  status: SkillGateStatus;
+  updatedAt: string;
+}
+
+export interface CrystallizeSkillsOptions {
+  threshold?: number;
+  gated?: boolean;
+  maxActiveSkills?: number;
+}
+
 export interface KGNode {
   id: string;
   kind: EntityKind;
@@ -36,6 +55,8 @@ export interface KGNode {
   reinforcements: number;
   /** 若 kind === 'workflow'，记录标准操作步骤以供固化为 SKILL.md */
   steps?: string[];
+  /** 技能结晶确认门禁状态（candidate -> approved / rejected） */
+  skillGateStatus?: SkillGateStatus;
   updatedAt: string;
 }
 
@@ -216,6 +237,7 @@ export class SugentKnowledgeGraph {
         throw new Error(`Refused to store secret-like content in Knowledge Graph node: ${input.id}`);
       }
       const existing = this.nodes.get(input.id);
+      const gateStatus = input.skillGateStatus ?? existing?.skillGateStatus;
       const merged: KGNode = {
         id: input.id,
         kind: input.kind,
@@ -224,6 +246,7 @@ export class SugentKnowledgeGraph {
         tags: Array.from(new Set([...(existing?.tags ?? []), ...(input.tags ?? [])])),
         reinforcements: (existing?.reinforcements ?? 0) + (input.reinforcements ?? 1),
         ...(input.steps ? { steps: input.steps } : existing?.steps ? { steps: existing.steps } : {}),
+        ...(gateStatus ? { skillGateStatus: gateStatus } : {}),
         updatedAt: now,
       };
       this.nodes.set(merged.id, merged);
@@ -468,11 +491,108 @@ export class SugentKnowledgeGraph {
     return out;
   }
 
+  listSkillCandidates(opts?: { threshold?: number; includeDecided?: boolean }): SkillCandidateSummary[] {
+    const threshold = opts?.threshold ?? SKILL_CRYSTALLIZE_THRESHOLD;
+    const includeDecided = Boolean(opts?.includeDecided);
+    const out: SkillCandidateSummary[] = [];
+    let dirty = false;
+    for (const node of this.nodes.values()) {
+      if (node.kind !== "workflow" || node.reinforcements < threshold || !node.steps?.length) continue;
+      if (!node.skillGateStatus) {
+        node.skillGateStatus = "candidate";
+        dirty = true;
+      }
+      if (!includeDecided && node.skillGateStatus !== "candidate") continue;
+      out.push({
+        nodeId: node.id,
+        skillName: node.id.replace(/[^a-zA-Z0-9_-]/g, "-").toLowerCase(),
+        name: node.name,
+        summary: node.summary,
+        reinforcements: node.reinforcements,
+        steps: [...node.steps],
+        status: node.skillGateStatus,
+        updatedAt: node.updatedAt,
+      });
+    }
+    if (dirty) this.save();
+    return out.sort((a, b) => b.reinforcements - a.reinforcements || b.updatedAt.localeCompare(a.updatedAt));
+  }
+
+  approveSkillCandidate(nodeId: string, now = new Date().toISOString()): boolean {
+    const node = this.nodes.get(nodeId.trim());
+    if (!node || node.kind !== "workflow") return false;
+    node.skillGateStatus = "approved";
+    node.updatedAt = now;
+    this.save();
+    this.appendJournal({ op: "approve_skill_candidate", id: node.id });
+    return true;
+  }
+
+  rejectSkillCandidate(nodeId: string, now = new Date().toISOString()): boolean {
+    const node = this.nodes.get(nodeId.trim());
+    if (!node || node.kind !== "workflow") return false;
+    node.skillGateStatus = "rejected";
+    node.updatedAt = now;
+    this.save();
+    this.appendJournal({ op: "reject_skill_candidate", id: node.id });
+    return true;
+  }
+
   /**
-   * 将达到阈值的 workflow 节点直接落盘生成 `<skillsRootDir>/<skillName>/SKILL.md` 文件
+   * 将达到阈值的 workflow 节点落盘生成 `<skillsRootDir>/<skillName>/SKILL.md` 文件；
+   * 开启 `gated: true` 时要求经过候选确认并强制执行 `maxActiveSkills` 上限淘汰。
    */
-  crystallizeSkillsToDir(skillsRootDir: string, threshold = SKILL_CRYSTALLIZE_THRESHOLD): string[] {
-    const crystallized = this.crystallizeSkills(threshold);
+  crystallizeSkillsToDir(
+    skillsRootDir: string,
+    thresholdOrOpts: number | CrystallizeSkillsOptions = SKILL_CRYSTALLIZE_THRESHOLD,
+  ): string[] {
+    const opts: CrystallizeSkillsOptions =
+      typeof thresholdOrOpts === "number" ? { threshold: thresholdOrOpts } : thresholdOrOpts;
+    const threshold = opts.threshold ?? SKILL_CRYSTALLIZE_THRESHOLD;
+    const gated = Boolean(opts.gated);
+    const maxActive =
+      opts.maxActiveSkills !== undefined
+        ? opts.maxActiveSkills > 0
+          ? opts.maxActiveSkills
+          : undefined
+        : gated
+          ? 12
+          : undefined;
+
+    let crystallized = this.crystallizeSkills(threshold);
+    if (gated) {
+      let dirty = false;
+      for (const item of crystallized) {
+        if (!item.node.skillGateStatus) {
+          item.node.skillGateStatus = "candidate";
+          dirty = true;
+        }
+      }
+      if (dirty) this.save();
+      crystallized = crystallized.filter((item) => item.node.skillGateStatus === "approved");
+    }
+    crystallized.sort(
+      (a, b) => b.node.reinforcements - a.node.reinforcements || b.node.updatedAt.localeCompare(a.node.updatedAt),
+    );
+    if (maxActive !== undefined && crystallized.length > maxActive) {
+      crystallized = crystallized.slice(0, maxActive);
+    }
+
+    const keepNames = new Set(crystallized.map((item) => item.skillName));
+    if ((gated || maxActive !== undefined) && fs.existsSync(skillsRootDir)) {
+      for (const entry of fs.readdirSync(skillsRootDir, { withFileTypes: true })) {
+        if (!entry.isDirectory() || keepNames.has(entry.name)) continue;
+        const skillFile = path.join(skillsRootDir, entry.name, "SKILL.md");
+        try {
+          if (fs.existsSync(skillFile) && fs.readFileSync(skillFile, "utf8").includes("自动结晶自 Sugent 知识图谱")) {
+            fs.rmSync(path.join(skillsRootDir, entry.name), { recursive: true, force: true });
+          }
+        } catch {
+          /* ignore cleanup failure */
+        }
+      }
+    }
+
     const writtenPaths: string[] = [];
     for (const item of crystallized) {
       const dir = path.join(skillsRootDir, item.skillName);

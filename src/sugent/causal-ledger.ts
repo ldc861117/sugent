@@ -119,6 +119,31 @@ function formatShortTime(iso: string): string {
   return m ? `${m[2]} ${m[3]}` : iso.slice(0, 19);
 }
 
+export function resolveUnifiedCausalLedgerDir(dataDir: string, fileName = "causal-ledger.jsonl"): string {
+  const base = path.resolve(dataDir);
+  const targetDir = path.join(base, "sugent-stewardship");
+  const legacyDir = path.join(base, "sugent-ledger");
+  fs.mkdirSync(targetDir, { recursive: true, mode: 0o700 });
+  try {
+    fs.chmodSync(targetDir, 0o700);
+  } catch {
+    /* ignore */
+  }
+  const targetLog = path.join(targetDir, fileName);
+  const legacyLog = path.join(legacyDir, fileName);
+  if (!fs.existsSync(targetLog) && fs.existsSync(legacyLog)) {
+    const tmpLog = `${targetLog}.${process.pid}.migrate.tmp`;
+    fs.copyFileSync(legacyLog, tmpLog);
+    try {
+      fs.chmodSync(tmpLog, 0o600);
+    } catch {
+      /* ignore */
+    }
+    fs.renameSync(tmpLog, targetLog);
+  }
+  return targetDir;
+}
+
 export class CausalLedger {
   readonly logFilePath: string;
   private facts: CausalFactRecord[] = [];
@@ -128,6 +153,17 @@ export class CausalLedger {
     const resolvedDir = path.resolve(storageDir);
     fs.mkdirSync(resolvedDir, { recursive: true, mode: 0o700 });
     this.logFilePath = path.join(resolvedDir, fileName);
+    if (path.basename(resolvedDir) === "sugent-stewardship" && !fs.existsSync(this.logFilePath)) {
+      const legacyLog = path.join(path.dirname(resolvedDir), "sugent-ledger", fileName);
+      if (fs.existsSync(legacyLog)) {
+        fs.copyFileSync(legacyLog, this.logFilePath);
+        try {
+          fs.chmodSync(this.logFilePath, 0o600);
+        } catch {
+          /* ignore */
+        }
+      }
+    }
     this.rebuildProjection();
   }
 

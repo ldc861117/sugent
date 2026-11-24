@@ -11,7 +11,15 @@ import { confirmSheet, failed, toast } from "../lib/store.js";
 import { fmtAgo } from "../lib/format.js";
 import { MF_TOPUP, usd } from "../lib/links.js";
 import { t } from "../lib/i18n.js";
+import {
+  LEGACY_MULTI_BOT_EVENT,
+  readLegacyMultiBotPref,
+  shouldShowLegacyModelflareBilling,
+  shouldShowLegacyMultiBotControls,
+} from "../lib/one-jarvis-mode.js";
 import { NeedsRow } from "./needs-you.js";
+
+export { shouldShowLegacyModelflareBilling, shouldShowLegacyMultiBotControls };
 
 /**
  * 左下角账户：头像字母 + 名称（登录后是 Modelflare 账户名），旁边是设置齿轮。
@@ -22,7 +30,8 @@ export function AccountButton({ username, account, settingsOn, onSettings, onMod
   const [open, setOpen] = useState(false);
   const ref = useRef(null);
   const me = ((account && account.state === "signed_in" && account.name) || username || t("sidebar.localUser")).trim();
-  const bal = account && account.balanceUsd !== null && account.balanceUsd !== undefined ? usd(account.balanceUsd) : "";
+  const hasBilling = shouldShowLegacyModelflareBilling(account);
+  const bal = hasBilling ? usd(account.balanceUsd) : "";
   return html`<button type="button" class=${`account${open ? " on" : ""}`} ref=${ref}
       aria-label=${bal ? t("sidebar.account") : t("sidebar.openSettings")} aria-haspopup=${bal ? "dialog" : undefined} aria-expanded=${bal ? open : undefined}
       onClick=${bal ? () => setOpen((v) => !v) : onSettings}>
@@ -44,7 +53,7 @@ export function AccountButton({ username, account, settingsOn, onSettings, onMod
 
 /** 余额低于提醒线时，侧栏底部常驻一条提示 */
 function LowBalance({ account }) {
-  if (!account || !account.lowBalance) return null;
+  if (!shouldShowLegacyModelflareBilling(account) || !account.lowBalance) return null;
   return html`<a class="low-balance" href=${MF_TOPUP} target="_blank" rel="noopener noreferrer" role="status">
     ${t("sidebar.lowBalance", { amount: usd(account.balanceUsd) })}
   </a>`;
@@ -57,6 +66,7 @@ export function Sidebar({ bots, botsError, reloadBots, selectedId, view, preview
   const [renaming, setRenaming] = useState("");
   const [renameText, setRenameText] = useState("");
   const [specialistsOpen, setSpecialistsOpen] = useState(false);
+  const [legacyMultiBot, setLegacyMultiBot] = useState(() => readLegacyMultiBotPref());
   const [companion, setCompanion] = useState({ supported: false, visible: false });
   const root = useRef(null);
   const searchRef = useRef(null);
@@ -64,6 +74,15 @@ export function Sidebar({ bots, botsError, reloadBots, selectedId, view, preview
   useEffect(() => {
     if (renaming) requestAnimationFrame(() => (renameRef.current?.focus(), renameRef.current?.select()));
   }, [renaming]);
+  useEffect(() => {
+    const sync = () => setLegacyMultiBot(readLegacyMultiBotPref());
+    window.addEventListener(LEGACY_MULTI_BOT_EVENT, sync);
+    window.addEventListener("storage", sync);
+    return () => {
+      window.removeEventListener(LEGACY_MULTI_BOT_EVENT, sync);
+      window.removeEventListener("storage", sync);
+    };
+  }, []);
   useEffect(() => {
     api("/steward/companion").then((d) => d && setCompanion(d)).catch(() => {});
   }, []);
@@ -97,12 +116,19 @@ export function Sidebar({ bots, botsError, reloadBots, selectedId, view, preview
   const primary = (bots || []).find((b) => b.id === "default") || (bots || [])[0];
   const primaryNeeds = primary ? (needs.bots[primary.id]?.n || pending[primary.id] || 0) : 0;
   const primaryWorking = !!(primary && working[primary.id]);
-  const showSpecialists = specialistsOpen || !!needle || (bots && bots.length > 1) || view === "new" || view === "bot-settings";
+  const showLegacyMultiBot = shouldShowLegacyMultiBotControls({
+    botCount: (bots || []).length,
+    legacyMultiBotEnabled: legacyMultiBot,
+    view,
+    searchQuery: q,
+  });
+  const showBotSection = showLegacyMultiBot || !!botsError || !bots || bots.length === 0;
+  const showSpecialists = showBotSection && (specialistsOpen || !!needle || (bots && bots.length > 1) || view === "new" || view === "bot-settings" || !bots || !bots.length || !!botsError);
 
   return html`<aside class="side" ref=${root} aria-label=${t("sidebar.bots")}>
     <div class="side-top">
       <span class="side-brand"><img src="/amb/static/assets/favicon-64.png" alt="" /><span>${t("steward.nav.brand")}</span></span>
-      <${IconButton} icon="plus" iconSize="md" label=${t("sidebar.newShortcut")} on=${view === "new"} onClick=${onNew} />
+      ${(showLegacyMultiBot || (bots && bots.length === 0)) && html`<${IconButton} icon="plus" iconSize="md" label=${t("sidebar.newShortcut")} on=${view === "new"} onClick=${onNew} />`}
     </div>
     ${primary && html`<div class="side-hero">
       <${BotAvatar} bot=${primary} useActivePack=${primary.id === "default"} size=${40} state=${primaryNeeds > 0 ? "waiting" : primaryWorking ? "working" : "idle"} />
@@ -126,7 +152,7 @@ export function Sidebar({ bots, botsError, reloadBots, selectedId, view, preview
         </button>
         <${NeedsRow} count=${needs.n} on=${view === "needs"} onClick=${onNeeds} />
       </div>
-      <label class="side-search">
+      ${showBotSection && html`<label class="side-search">
         <${Icon} name="search" size="sm" />
         <input ref=${searchRef} type="search" placeholder=${t("common.search")} aria-label=${t("sidebar.search")} value=${q} onInput=${(e) => setQ(e.target.value)}
           onKeyDown=${(e) => e.key === "Escape" && q && (e.stopPropagation(), setQ(""))} />
@@ -134,7 +160,7 @@ export function Sidebar({ bots, botsError, reloadBots, selectedId, view, preview
       <button type="button" class="side-specialists-toggle" aria-expanded=${showSpecialists} onClick=${() => setSpecialistsOpen((v) => !v)}>
         <span>${t("steward.nav.specialists", { count: list.length })}</span>
         <${Icon} name=${showSpecialists ? "chevDown" : "chevRight"} size="xs" />
-      </button>
+      </button>`}
       ${showSpecialists && html`<nav aria-label=${t("sidebar.list")}>
       ${view === "new" && html`<div class="thread sel" aria-current="page"><${BotAvatar} neutral size=${38} />
         <span class="body"><span class="line"><span class="title">${t("sidebar.newBot")}</span></span><span class="line"><span class="snip">${t("sidebar.creating")}</span></span></span></div>`}

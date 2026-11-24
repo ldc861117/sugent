@@ -144,4 +144,81 @@ describe("Sugent Autonomous Knowledge Graph & Skill Crystallization", () => {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
   });
+
+  it("gates workflow skill crystallization behind candidate approval in gated mode and enforces maxActiveSkills cap", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "sugent-kg-gate-"));
+    try {
+      const kg = new SugentKnowledgeGraph(path.join(tmp, "kg"));
+      const skillsDir = path.join(tmp, "skills");
+      const legacyDir = path.join(tmp, "legacy-skills");
+      for (let i = 1; i <= 14; i++) {
+        kg.applyDelta(
+          {
+            nodes: [
+              {
+                id: `wf:deploy-${i}`,
+                kind: "workflow",
+                name: `Deploy Flow ${i}`,
+                summary: `flow ${i}`,
+                tags: ["ops"],
+                reinforcements: 2 + i,
+                steps: ["npm run build", "npm test"],
+              },
+            ],
+            edges: [],
+          },
+          `2026-11-23T0${Math.min(9, Math.floor(i / 2))}:00:00.000Z`,
+        );
+      }
+
+      const gatedBefore = (kg as unknown as {
+        crystallizeSkillsToDir(dir: string, opts: { gated: boolean; maxActiveSkills: number }): string[];
+      }).crystallizeSkillsToDir(skillsDir, { gated: true, maxActiveSkills: 12 });
+      expect(gatedBefore).toHaveLength(0);
+      expect(fs.existsSync(skillsDir) ? fs.readdirSync(skillsDir) : []).toHaveLength(0);
+
+      const candidates = (kg as unknown as { listSkillCandidates(): Array<{ nodeId: string; status: string }> }).listSkillCandidates();
+      expect(candidates).toHaveLength(14);
+      expect(candidates.every((c) => c.status === "candidate")).toBe(true);
+
+      const rejected = (kg as unknown as { rejectSkillCandidate(id: string): boolean }).rejectSkillCandidate("wf:deploy-1");
+      expect(rejected).toBe(true);
+      expect((kg as unknown as { listSkillCandidates(): Array<{ nodeId: string }> }).listSkillCandidates()).toHaveLength(13);
+
+      for (let i = 2; i <= 14; i++) {
+        expect((kg as unknown as { approveSkillCandidate(id: string): boolean }).approveSkillCandidate(`wf:deploy-${i}`)).toBe(true);
+      }
+
+      const gatedAfter = (kg as unknown as {
+        crystallizeSkillsToDir(dir: string, opts: { gated: boolean; maxActiveSkills: number }): string[];
+      }).crystallizeSkillsToDir(skillsDir, { gated: true, maxActiveSkills: 12 });
+      expect(gatedAfter).toHaveLength(12);
+      const dirsAfter = fs.readdirSync(skillsDir);
+      expect(dirsAfter).toHaveLength(12);
+      expect(dirsAfter).not.toContain("wf-deploy-2");
+      expect(dirsAfter).toContain("wf-deploy-14");
+
+      kg.applyDelta({
+        nodes: [{ id: "wf:deploy-99", kind: "workflow", name: "Top Priority Flow", summary: "top", tags: [], reinforcements: 50, steps: ["npm run verify:sugent"] }],
+      });
+      (kg as unknown as { approveSkillCandidate(id: string): boolean }).approveSkillCandidate("wf:deploy-99");
+      (kg as unknown as { crystallizeSkillsToDir(dir: string, opts: { gated: boolean; maxActiveSkills: number }): string[] }).crystallizeSkillsToDir(skillsDir, {
+        gated: true,
+        maxActiveSkills: 12,
+      });
+      const dirsEvicted = fs.readdirSync(skillsDir);
+      expect(dirsEvicted).toHaveLength(12);
+      expect(dirsEvicted).toContain("wf-deploy-99");
+      expect(dirsEvicted).not.toContain("wf-deploy-3");
+
+      const defaultCapDir = path.join(tmp, "skills-default-cap");
+      const defaultCapOut = kg.crystallizeSkillsToDir(defaultCapDir, { gated: true });
+      expect(defaultCapOut).toHaveLength(12);
+
+      const legacyOut = kg.crystallizeSkillsToDir(legacyDir, 3);
+      expect(legacyOut.length).toBeGreaterThanOrEqual(14);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
 });

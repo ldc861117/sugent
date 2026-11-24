@@ -20,6 +20,11 @@ import { PwshHint } from "../components/pwsh-hint.js";
 import { ProviderSettingsPanel } from "../components/provider-settings.js";
 import { t, has, useLang, getLangPref, onLangChange, changeLang, LANG_NAMES } from "../lib/i18n.js";
 import { fmtTimeOfDay } from "../lib/format.js";
+import {
+  LEGACY_MULTI_BOT_EVENT,
+  readLegacyMultiBotPref,
+  writeLegacyMultiBotPref,
+} from "../lib/one-jarvis-mode.js";
 
 const HTTPS_PROTO = ["https", "://"].join("");
 const HTTP_PROTO = ["http", "://"].join("");
@@ -167,6 +172,7 @@ export function SettingsScreen({ tab, query: q, onQuery: setQ, onTab, focusRow, 
   const [cu, setCu] = useState(null);
   const [selfEvo, setSelfEvo] = useState(false);
   const [selfEvoStatus, setSelfEvoStatus] = useState(null);
+  const [legacyMultiBot, setLegacyMultiBot] = useState(() => readLegacyMultiBotPref());
   const [update, setUpdate] = useState(null);
   const [flash, setFlash] = useState("");
   const mode = useStore(themeMode);
@@ -174,6 +180,11 @@ export function SettingsScreen({ tab, query: q, onQuery: setQ, onTab, focusRow, 
   const lang = useLang();
   const [langPref, setLangPrefView] = useState(getLangPref);
   useEffect(() => onLangChange(() => setLangPrefView(getLangPref())), []);
+  useEffect(() => {
+    const sync = () => setLegacyMultiBot(readLegacyMultiBotPref());
+    window.addEventListener(LEGACY_MULTI_BOT_EVENT, sync);
+    return () => window.removeEventListener(LEGACY_MULTI_BOT_EVENT, sync);
+  }, []);
 
   const [media, setMedia] = useState(null);
   const loadMedia = () =>
@@ -330,6 +341,8 @@ export function SettingsScreen({ tab, query: q, onQuery: setQ, onTab, focusRow, 
         ctl: html`<${Seg} label=${t("common.lang.label")} value=${langPref} onChange=${(v) => changeLang(v).then(() => saved()).catch(failed)} options=${LANG_OPTIONS()} />` },
       bots && bots.length > 0 && { tab: "general", id: "self-evolution", name: t("settings.rows.selfEvo.name"), sub: t("settings.rows.selfEvo.sub"), keys: t("settings.rows.selfEvo.keys"),
         ctl: html`<${Switch} label=${t("settings.rows.selfEvo.name")} value=${selfEvo} onChange=${toggleSelfEvo} />` },
+      { tab: "general", id: "legacy-multibot", name: t("steward.nav.legacyMultiBotName"), sub: t("steward.nav.legacyMultiBotSub"), keys: t("steward.nav.legacyMultiBotKeys"),
+        ctl: html`<${Switch} label=${t("steward.nav.legacyMultiBotName")} value=${legacyMultiBot} onChange=${(v) => { setLegacyMultiBot(v); writeLegacyMultiBotPref(undefined, v); saved(); }} />` },
       { tab: "general", id: "send-key", name: t("settings.rows.sendKey.name"), sub: t("settings.rows.sendKey.sub", { key: p.sendKey === "mod" ? "Enter" : "Shift+Enter" }), keys: t("settings.rows.sendKey.keys"),
         ctl: html`<${Seg} label=${t("settings.rows.sendKey.name")} value=${p.sendKey} onChange=${(v) => { setPrefs({ sendKey: v }); saved(); }} options=${[["enter", "Enter"], ["mod", MOD_ENTER]]} />` },
       canNotify && { tab: "general", id: "notify", name: t("settings.rows.notify.name"), sub: t("settings.rows.notify.sub"), keys: t("settings.rows.notify.keys"),
@@ -455,7 +468,7 @@ export function SettingsScreen({ tab, query: q, onQuery: setQ, onTab, focusRow, 
       signedIn && { tab: "about", id: "links", name: "Docs", sub: t("settings.rows.links.sub"),
         ctl: html`<a class="text" href=${MF_DOCS_LINK} target="_blank" rel="noopener noreferrer">${t("settings.rows.links.docs")}</a>` },
     ].filter(Boolean);
-  }, [s, mf, mode, p, models, modelsError, cu, status, bots, acct, unread, g, media, lang, langPref, update, updateSub, macDesktop, desktop, selfEvoStatus, conn.accounts, conn.channelAccounts]);
+  }, [s, mf, mode, p, models, modelsError, cu, status, bots, acct, unread, g, media, lang, langPref, update, updateSub, macDesktop, desktop, selfEvo, selfEvoStatus, legacyMultiBot, conn.accounts, conn.channelAccounts]);
 
   const needle = q.trim().toLowerCase();
   const shown = needle ? rows.filter((r) => `${r.name} ${r.sub || ""} ${r.keys || ""}`.toLowerCase().includes(needle)) : rows.filter((r) => r.tab === tab);

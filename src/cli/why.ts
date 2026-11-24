@@ -8,7 +8,7 @@
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { defaultDataDir } from "../config.js";
-import { CausalLedger } from "../sugent/causal-ledger.js";
+import { CausalLedger, resolveUnifiedCausalLedgerDir } from "../sugent/causal-ledger.js";
 
 export interface WhyCliOptions {
   ledgerDir: string;
@@ -18,9 +18,10 @@ export interface WhyCliOptions {
 }
 
 export function parseWhyCliArgs(argv: string[], env: NodeJS.ProcessEnv = process.env): WhyCliOptions {
+  const baseDataDir = env.AMB_DATA_DIR ? path.resolve(env.AMB_DATA_DIR) : defaultDataDir();
   let ledgerDir = env.SUGENT_LEDGER_DIR
     ? path.resolve(env.SUGENT_LEDGER_DIR)
-    : path.join(defaultDataDir(), "sugent-ledger");
+    : resolveUnifiedCausalLedgerDir(baseDataDir);
   let roundId: string | undefined;
   let list = false;
   let json = false;
