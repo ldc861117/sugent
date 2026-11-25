@@ -134,6 +134,18 @@ import {
   inspectWorkspaceFsTopology,
   probeColdStartReadiness,
   stagePrReviewToHandoff,
+  PowerSaveBlockerController,
+  E2eeOfflineDigestVault,
+  buildOfflineLedgerDigest,
+  COMPLIANCE_MODE,
+  WeixinAdaptiveQuotaGuard,
+  buildThreeSecondForwardedBriefing,
+  BUILTIN_WEAPON_PACKAGES,
+  WeaponSoakTelemetryLedger,
+  listWeaponPackages,
+  runContractQuoteGuardPack,
+  runIndustrialFdeDiagnosticPack,
+  SugentStewardHostService,
 } from "../dist/src/sugent/index.js";
 import { normalizeSettings } from "../dist/src/agent/settings.js";
 
@@ -1175,6 +1187,134 @@ import { normalizeSettings } from "../dist/src/agent/settings.js";
   }
 }
 
+// 26. Wave P2 合盖离线韧性、微信 iLink 3 秒转发参谋与端-边联邦标杆武器包契约
+{
+  const p2Dir = fs.mkdtempSync(path.join(os.tmpdir(), "sugent-verify-p2-"));
+  try {
+    const pwr = new PowerSaveBlockerController({ maxDurationMs: 8 * 3600_000 });
+    const ps1 = pwr.enable("prevent-app-suspension", { durationMs: 24 * 3600_000, nowMs: 1_000 });
+    assert.equal(ps1.active, true);
+    assert.equal(ps1.expiresAtMs, 1_000 + 8 * 3600_000);
+    assert.equal(pwr.checkAutoExpire(1_000 + 8 * 3600_000), true);
+
+    const p2Kg = new SugentKnowledgeGraph(path.join(p2Dir, "kg"));
+    const p2Budgets = new LocalBudgetLedger(path.join(p2Dir, "budgets"));
+    const host = new SugentStewardHostService({
+      dataDir: p2Dir,
+      knowledgeGraph: p2Kg,
+      localBudgets: p2Budgets,
+      nowIso: () => "2026-11-25T10:00:00.000Z",
+    });
+    host.ledger.upsertGoal({ id: "g-p2", partition: "work_project", title: "收官 Wave P2", northStarCriterion: "14天零越权" });
+    host.ledger.upsertRelationship({
+      id: "rel-chen",
+      partition: "work_project",
+      name: "陈总",
+      trustTier: "L1_whisper_prompt",
+      taboos: ["不要承诺驻场包干"],
+    });
+    host.ledger.addGuardrail({ id: "gr-p2", partition: "work_project", kind: "hard_redline", statement: "标准账期不得超过 60 天，严禁零首付" });
+    host.ledger.upsertResource({
+      id: "res-p2",
+      partition: "work_project",
+      kind: "personal_archive",
+      title: "陈总项目底价单",
+      localUriOrPath: "/Users/private/secret-quote.pdf",
+      metadata: { counterparty: "陈总", floorPriceWan: 20, floorPrice: 200000, maxPaymentDays: 60 },
+    });
+
+    const digest = buildOfflineLedgerDigest(host.ledger, { nowIso: "2026-11-25T10:00:00.000Z" });
+    assert.equal(JSON.stringify(digest).includes("secret-quote.pdf"), false);
+
+    const vault = new E2eeOfflineDigestVault({ dataDir: p2Dir, kdfIterations: 100_000 });
+    const sealedSnap = vault.sealDigestSnapshot({
+      ledger: host.ledger,
+      passphrase: "gate-p2-passphrase-2026",
+      subjectSub: "usr_gate_p2",
+      deviceId: "mac-main",
+      lamportClock: 1,
+    });
+    assert.equal(vault.openDigestSnapshot({ envelope: sealedSnap, passphrase: "gate-p2-passphrase-2026", expectedSubjectSub: "usr_gate_p2" }).goals[0].title, "收官 Wave P2");
+    const taskEnv = vault.enqueueEncryptedOfflineTask({
+      task: { taskId: "wake-1", summary: "开盖后核对设备台账", counterpartyOrRef: "陈总", partition: "work_project" },
+      passphrase: "gate-p2-passphrase-2026",
+      subjectSub: "usr_gate_p2",
+      mobileDeviceId: "iphone-pwa",
+      lamportClock: 2,
+    });
+    const drained = vault.drainOfflineTaskQueueOnWake({
+      envelopes: [taskEnv, taskEnv],
+      passphrase: "gate-p2-passphrase-2026",
+      expectedSubjectSub: "usr_gate_p2",
+      ledger: host.ledger,
+    });
+    assert.equal(drained.ingestedCount, 1);
+    assert.equal(drained.skippedDuplicateCount, 1);
+
+    const wxGuard = new WeixinAdaptiveQuotaGuard({ lowWatermark: 3, criticalWatermark: 1 });
+    assert.equal(wxGuard.routeProactivePush({ peerId: "wx_1", title: "常规提醒", body: "ok", urgency: "normal", remainingQuota: 2, channelState: "connected" }).action, "buffered_low_quota");
+    assert.equal(wxGuard.flushCoalescedDigest("wx_1", 2).flushedCount, 1);
+    assert.equal(wxGuard.routeProactivePush({ peerId: "wx_1", title: "配额耗尽", body: "warn", urgency: "urgent", remainingQuota: 0, channelState: "expired" }).action, "fallback_channel");
+
+    const brief = host.briefForwardedWeixinChat({
+      rawForwardedText: "[合并转发的聊天记录]\n陈总: 能不能降到 15 万，走账期 90 天零首付先驻场包干？",
+    });
+    assert.equal(brief.complianceMode, COMPLIANCE_MODE);
+    assert.ok(brief.triggeredRedlines.some((r) => r.includes("报价破底价红线")));
+    assert.equal(fs.existsSync(brief.envelopePath), true);
+
+    assert.equal(listWeaponPackages().length, 2);
+    assert.equal(BUILTIN_WEAPON_PACKAGES["industrial-fde-diagnostics"].requiresHumanStagingGate, true);
+    const fdeOut = host.runIndustrialFdePack({
+      batchId: "gate-fde-01",
+      records: [
+        { ticketId: "T1", station: "总装A", category: "气路异常", downtimeMinutes: 75, slaHoursLimit: 2, elapsedHours: 3, description: "停机", rawExtra: { cwd: "/etc" } },
+        { ticketId: "T2", station: "总装A", category: "吊装等待", downtimeMinutes: 30, slaHoursLimit: 2, elapsedHours: 2.5, description: "重复热点" },
+      ],
+    });
+    assert.equal(fdeOut.severity, "P0");
+    assert.equal(fdeOut.coworkDraft.status, "PENDING_REVIEW");
+    assert.ok(fdeOut.envelope.strippedFields.includes("cwd"));
+
+    const contractBlocked = host.runContractGuardPack({
+      inquiryId: "INQ-GATE-1",
+      counterparty: "陈总",
+      quotedUnitPrice: 160000,
+      requestedPaymentDays: 90,
+      rawContractText: "乙方承担无限连带责任，零首付验收后 90 天结算。",
+    });
+    assert.equal(contractBlocked.verdict, "block");
+
+    const contractSafe = runContractQuoteGuardPack({
+      workspaceDir: p2Dir,
+      inquiryId: "INQ-GATE-2",
+      counterparty: "陈总",
+      quotedUnitPrice: 220000,
+      requestedPaymentDays: 45,
+      rawContractText: "乙方不承担无限连带责任，首付 50% 验收后 45 天结清。",
+      ledger: host.ledger,
+    });
+    assert.equal(contractSafe.verdict, "pass");
+
+    const soak = new WeaponSoakTelemetryLedger(p2Dir);
+    for (let d = 1; d <= 14; d += 1) {
+      soak.recordPackRun({
+        packId: "industrial-fde-diagnostics",
+        dateKey: `2026-11-${String(d).padStart(2, "0")}`,
+        minutesSaved: 40,
+        baselineFlagshipUsd: 2.0,
+        actualRoutedUsd: 0.5,
+        redlinesCaught: 1,
+      });
+    }
+    const proof = soak.exportCommercialProofSummary(14);
+    assert.equal(proof.soakTargetMet, true);
+    assert.equal(proof.unauthorizedIncidents, 0);
+  } finally {
+    fs.rmSync(p2Dir, { recursive: true, force: true });
+  }
+}
+
 console.log(
-  "verify:sugent — 全部核心契约断言通过 (M1.1–M1.6 / M2.1 / Cowork 联邦 / P0 Broker + P1 幕僚耳麦 + P2 BYOK 诊断与零知识加密同步 / Sprint 1–3 / M1–M4 Vibe Coding 闭环 / 能力自感知与全文读取 / 形象工坊与桌宠契约 / M-Auto 1–4 双环自治与 SIM 演进 / M1–M3 全量模型同步与经验驱动自适应路由 / L0–L3 分层热启动与热更新 / Wave P0 双脑归一与宿主主循环合龙 / GCE 常驻中枢与微信单持有者舰队桥接 / Wave P1 零填表冷启动、ACP 编码军团与隐藏快照防呆)",
+  "verify:sugent — 全部核心契约断言通过 (M1.1–M1.6 / M2.1 / Cowork 联邦 / P0 Broker + P1 幕僚耳麦 + P2 BYOK 诊断与零知识加密同步 / Sprint 1–3 / M1–M4 Vibe Coding 闭环 / 能力自感知与全文读取 / 形象工坊与桌宠契约 / M-Auto 1–4 双环自治与 SIM 演进 / M1–M3 全量模型同步与经验驱动自适应路由 / L0–L3 分层热启动与热更新 / Wave P0 双脑归一与宿主主循环合龙 / GCE 常驻中枢与微信单持有者舰队桥接 / Wave P1 零填表冷启动、ACP 编码军团与隐藏快照防呆 / Wave P2 合盖离线韧性、微信 3 秒转发参谋与端-边联邦标杆武器包)",
 );

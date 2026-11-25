@@ -29,3 +29,15 @@
    - `App.upsertDecoupledProvider` 先将服务商落盘至 `sugent-providers.json`，随后调用 `MagpieSupervisor.upsertGenericProvider` 写入 `{ chat, responses, anthropic: "", ... }`。Magpie Go 侧 `Provider` 结构体对空字符串使用了 `json:"...,omitempty"`，回读 `providers.json` 时 `saved.anthropic` 为 `undefined`。旧逻辑 `JSON.stringify(saved?.[k] ?? {}) !== JSON.stringify(v ?? {})` 将 `undefined ?? {}` 算成 `"{}"` 与 `'""'` 对比必败，导致已成功落盘却向前端抛错。通过 `matchesMagpieSavedField` 统一归一化空串/空对象/空数组与尾部斜杠彻底根除。
 2. **`.sheet` 模态框 `backdrop-filter` 劫持 `position: fixed` 导致下拉框漂移与被裁切**：
    - CSS 规范中祖先节点含 `backdrop-filter` 会创建新的 `position: fixed` 包含块，导致内联渲染在 `.sheet` 内部的 `.pop` 把 `getBoundingClientRect()` 视口坐标叠加在模态框左上角偏移上，同时被 `.sheet { overflow: auto }` 截断右边缘。改为将 `Popover` 直接挂载至 `document.body`（层级设为 `calc(var(--z-modal) + 4)`）并监听捕获阶段滚动与 `Escape` 分级关闭。
+
+## 2026-11-25 · Wave P2：合盖离线零知识摘要舱、微信 3 秒合规参谋与标杆武器包收官
+
+1. **防休眠电池上限与零知识双 Schema 防混淆（`P2.1`）**：
+   - `PowerSaveBlockerController` 强制默认 8 小时电池保护封顶，且切换模式时先 `stop` 旧句柄防止 Electron `powerSaveBlocker` 句柄泄漏。
+   - `E2eeOfflineDigestVault` 复用 `e2ee-sync.ts` 的 `config-snapshot` HKDF 通道，但通过内层 `sugent.offline_ledger_digest.v1` 与 `sugent.offline_queued_task.v1` 严格防跨类型重放，并在生成云端只读摘要时物理剥离 `localUriOrPath` 与敏感 `metadata`；唤醒排空采用「全量预解密校验 → Lamport 时钟升序 → `0o600` 原子去重落账」，避免半途解密失败污染账本。
+2. **微信 iLink 合规边界、低配额折叠与中文金额词边界避坑（`P2.2`）**：
+   - 严守 `COMPLIANCE_MODE = "forwarded_or_screenshot_only"`，不触碰个人微信原生聊天窗内存/数据库；转发文本先经 `sealExternalEvent` (`privilegedFieldMode: "strip"`) 剥离越权字段并隔离存储，再对照五维账本召回底价、账期与沟通禁忌，且生成的两版外发话术严禁回显内部禁忌原文。
+   - 正则提取中文金额（如 `"14 万？"`）时，JavaScript 非 `/u` 正则将中文字符与全角标点均视为 `\W`，若写成 `(?:万|万元|w)\b` 会因两个 `\W` 之间不存在 `\b` 导致漏匹配；必须写成 `(?:万元|万|w\b)` 仅对 ASCII `w` 施加词边界。
+3. **端-边联邦武器包确定性门禁与否定保护条款消歧（`P2.3`）**：
+   - 工业现场 FDE 诊断包（`industrial-fde-diagnostics`）与一人公司合同防漏包（`opc-contract-quote-guard`）均以安全信封包裹外部不可信批次/合同文本，所有产出强制进入 `PENDING_REVIEW` 或主理人拍板卡（`requiresHumanStagingGate: true`）。
+   - 合同红线扫描通过前向窗口否定词检测（`不承担/不涉及/免除/排除`）区分保护性免责条款（如“乙方不承担无限连带责任”放行）与真实毒丸条款（拦截），并由 `WeaponSoakTelemetryLedger` 执行 14 天常驻与越权事故一票否决计量。

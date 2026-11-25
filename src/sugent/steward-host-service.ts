@@ -100,6 +100,31 @@ import {
   type OpsRemoteCommand,
   type OpsStewardPendingSnapshot,
 } from "./ops-bridge-client.js";
+import {
+  E2eeOfflineDigestVault,
+  PowerSaveBlockerController,
+  buildOfflineLedgerDigest,
+  type OfflineLedgerDigest,
+  type PowerGuardMode,
+  type PowerGuardStatus,
+  type PowerSaveBlockerDriver,
+} from "./offline-digest-and-power-guard.js";
+import {
+  WeixinAdaptiveQuotaGuard,
+  buildThreeSecondForwardedBriefing,
+  type ThreeSecondForwardedBriefingResult,
+} from "./weixin-quota-and-briefing.js";
+import {
+  WeaponSoakTelemetryLedger,
+  listWeaponPackages,
+  runContractQuoteGuardPack,
+  runIndustrialFdeDiagnosticPack,
+  type CommercialProofSummary,
+  type IndustrialExceptionRecord,
+  type IndustrialFdeDiagnosticResult,
+  type RedlineDiffCard,
+  type WeaponPackageManifest,
+} from "./weapon-packages.js";
 
 export interface SugentStewardHostServiceOptions {
   dataDir: string;
@@ -132,6 +157,7 @@ export interface SugentStewardHostServiceOptions {
   opsBridge?: OpsBridgeClient;
   manifestPath?: string;
   workspaceRoot?: string;
+  powerSaveBlockerDriver?: PowerSaveBlockerDriver;
 }
 
 export interface RecentDropRecord {
@@ -387,6 +413,10 @@ export class SugentStewardHostService {
   readonly modelPoolSync: ModelPoolSyncer;
   readonly routingExperience: RoutingExperienceStore;
   readonly adaptiveRouter: AdaptiveModelRouter;
+  readonly powerGuard: PowerSaveBlockerController;
+  readonly offlineVault: E2eeOfflineDigestVault;
+  readonly weixinQuotaGuard: WeixinAdaptiveQuotaGuard;
+  readonly weaponSoakLedger: WeaponSoakTelemetryLedger;
   private readonly homeDir: string;
   private lastBootNotice?: PostBootNotice;
   private lastRouteTurn?: {
@@ -483,6 +513,12 @@ export class SugentStewardHostService {
     this.gitCheckpoints = new GitRefCheckpointManager();
     this.desktopPermissions = new LazyDesktopPermissionGate();
     this.desktopPermissions.onAppBoot();
+    this.powerGuard = new PowerSaveBlockerController({
+      ...(opts.powerSaveBlockerDriver ? { driver: opts.powerSaveBlockerDriver } : {}),
+    });
+    this.offlineVault = new E2eeOfflineDigestVault({ dataDir: opts.dataDir });
+    this.weixinQuotaGuard = new WeixinAdaptiveQuotaGuard();
+    this.weaponSoakLedger = new WeaponSoakTelemetryLedger(opts.dataDir);
     this.codingHarnesses = new CodingHarnessRegistry([
       new AntigravityCodingHarness(this.dispatcher),
       new AcpCodingHarness({ backend: "claude_code" }),
@@ -1834,5 +1870,72 @@ export class SugentStewardHostService {
       approved,
       nowIso: this.nowIsoFn(),
     });
+  }
+
+  setPowerGuardMode(mode: PowerGuardMode, durationMs?: number): PowerGuardStatus {
+    return this.powerGuard.enable(mode, durationMs !== undefined ? { durationMs } : undefined);
+  }
+
+  getPowerGuardStatus(): PowerGuardStatus {
+    return this.powerGuard.getStatus();
+  }
+
+  buildOfflineDigest(dueSoonHours = 48): OfflineLedgerDigest {
+    return buildOfflineLedgerDigest(this.ledger, { nowIso: this.nowIsoFn(), dueSoonHours });
+  }
+
+  briefForwardedWeixinChat(input: {
+    rawForwardedText: string;
+    ownerName?: string;
+  }): ThreeSecondForwardedBriefingResult {
+    return buildThreeSecondForwardedBriefing({
+      workspaceDir: path.join(this.opts.dataDir, "sugent-stewardship", "weixin-briefings"),
+      ledger: this.ledger,
+      rawForwardedText: input.rawForwardedText,
+      ...(input.ownerName ? { ownerName: input.ownerName } : {}),
+    });
+  }
+
+  listBuiltinWeaponPackages(): WeaponPackageManifest[] {
+    return listWeaponPackages();
+  }
+
+  runIndustrialFdePack(input: {
+    batchId: string;
+    records: IndustrialExceptionRecord[];
+    coworkWorkspaceId?: string;
+    proposerId?: string;
+  }): IndustrialFdeDiagnosticResult {
+    return runIndustrialFdeDiagnosticPack({
+      workspaceDir: path.join(this.opts.dataDir, "sugent-weapons", "fde-batches"),
+      batchId: input.batchId,
+      records: input.records,
+      ...(input.coworkWorkspaceId ? { coworkWorkspaceId: input.coworkWorkspaceId } : {}),
+      ...(input.proposerId ? { proposerId: input.proposerId } : {}),
+      nowIso: this.nowIsoFn(),
+    });
+  }
+
+  runContractGuardPack(input: {
+    inquiryId: string;
+    counterparty: string;
+    rawContractText: string;
+    quotedUnitPrice?: number;
+    requestedPaymentDays?: number;
+  }): RedlineDiffCard {
+    return runContractQuoteGuardPack({
+      workspaceDir: path.join(this.opts.dataDir, "sugent-weapons", "contract-reviews"),
+      inquiryId: input.inquiryId,
+      counterparty: input.counterparty,
+      rawContractText: input.rawContractText,
+      ...(input.quotedUnitPrice !== undefined ? { quotedUnitPrice: input.quotedUnitPrice } : {}),
+      ...(input.requestedPaymentDays !== undefined ? { requestedPaymentDays: input.requestedPaymentDays } : {}),
+      ledger: this.ledger,
+      nowIso: this.nowIsoFn(),
+    });
+  }
+
+  getWeaponSoakProof(targetSoakDays = 14): CommercialProofSummary {
+    return this.weaponSoakLedger.exportCommercialProofSummary(targetSoakDays);
   }
 }

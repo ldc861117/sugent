@@ -63,3 +63,6 @@ export * from "./cold-start-onboarding.js";
 export * from "./acp-coding-harness.js";
 export * from "./git-checkpoint-and-pr-feed.js";
 export * from "./worktree-and-platform-guard.js";
+export * from "./offline-digest-and-power-guard.js";
+export * from "./weixin-quota-and-briefing.js";
+export * from "./weapon-packages.js";

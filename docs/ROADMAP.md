@@ -79,17 +79,17 @@ Sugent 按「外环私人幕僚（[`docs/PHILOSOPHY.md`](./PHILOSOPHY.md)）× �
 
 **战役目标**：正面攻克“笔记本合盖断连”与“微信 iLink 协议边界”两大物理堵点，并以 1–2 个高确定性垂直武器包跑通真实商业回款。
 
-- [ ] **P2.1 破解「笔记本合盖休眠 vs. 随身微信幕僚」物理悖论**
-  - **端侧常驻分级**：在 Electron 托盘提供一键「幕僚值守防休眠（`powerSaveBlocker`）」开关，并配套 Mac mini / NAS / 轻量工位机一键常驻部署指南。
-  - **云端 E2EE 离线只读摘要舱与待办暂存队列**：依托无状态 `Sugent Auth Broker` 与 [`e2ee-sync.ts`](../src/sugent/e2ee-sync.ts)，宿主机在线时向云端同步端侧公钥加密的轻量五维账本只读快照（密钥不出端）；当笔记本合盖离线时，主理人在外出手机端依然能**秒查加密档案摘要、接收临期提醒并将新交办事项压入加密队列**，宿主机开盖瞬间自动拉取队列续跑。
-- [ ] **P2.2 微信 iLink 配额自适应保护与「3 秒转发参谋」合规工作流**
-  - **严守合规边界**：明确不读取个人微信原生聊天窗口；针对客户沟通场景，专项优化**「微信合并转发聊天记录 / 聊天截图发给 Sugent → 3 秒召回客户历史底价与禁忌雷区 → 返回可一键复制的拟回复话术」**高频动作。
-  - **主动配额水位管理**：实时监测 `WeixinChannel` 主动消息剩余配额（`quota.remaining`），低水位时自动将多条非紧急通知折叠为单张汇总卡，配额耗尽或 Token 过期时平滑降级至飞书/邮件备用通道告警。
-- [ ] **P2.3 打造首个高客单价「端-边联邦标杆武器包（Weapon Package）」**
-  - 聚焦高付费意愿、强结果导向的真实场景，基于 [`cowork-bridge.ts`](../src/sugent/cowork-bridge.ts)（`1 × Cowork Hub :28080 + N × Sugent Edge`）率先打穿两个样板武器包之一：
-    1. **工业现场 FDE 异常诊断与精益数智交付包**：结合端侧 CUA 从老旧 MES/ERP 导表 + 本地元模型/确定性规则校验 + 现场异常归因报告生成 + 专家手机微信/飞书 Staging 审批闭环。
-    2. **一人公司 / 外贸工作室合同与报价防漏审校包**：监听本地目录或微信转发的询盘/合同 PDF，对照本地私密历史报价子图与证伪墓碑核验条款风险，生成红线差异卡推送主理人拍板。
-  - 完成连续 14 天全天候常驻实盘压测，沉淀真实节省的看护工时、模型路由省钱比例与零越权事故记录，作为正式签名发行版（Open-Core）的核心商业证明。
+- [x] **P2.1 破解「笔记本合盖休眠 vs. 随身微信幕僚」物理悖论**
+  - **端侧常驻分级**：在 Electron 托盘提供一键「幕僚值守防休眠（`powerSaveBlocker`）」开关（[`offline-digest-and-power-guard.ts`](../src/sugent/offline-digest-and-power-guard.ts)，含 8 小时电池防榨干硬上限与零句柄泄漏切换），并配套 Mac mini / NAS / GCE 轻量常驻中枢部署套件（[`deploy/gce-hub/`](../deploy/gce-hub)）。
+  - **云端 E2EE 离线只读摘要舱与待办暂存队列**：依托无状态 `Sugent Auth Broker` 与 [`e2ee-sync.ts`](../src/sugent/e2ee-sync.ts)，宿主机在线时同步端侧零知识加密的轻量五维账本只读快照（自动剥离本地绝对路径与敏感元数据）；当笔记本合盖离线时，主理人在外出手机端依然能**秒查加密档案摘要、接收临期提醒并将新交办事项压入加密队列**，宿主机开盖瞬间按 Lamport 时钟事务性排空续跑（`0o600` 幂等防重放）。
+- [x] **P2.2 微信 iLink 配额自适应保护与「3 秒转发参谋」合规工作流**
+  - **严守合规边界**：明确不读取个人微信原生聊天窗口（[`weixin-quota-and-briefing.ts`](../src/sugent/weixin-quota-and-briefing.ts) `COMPLIANCE_MODE = "forwarded_or_screenshot_only"`）；针对客户沟通场景，跑通**「微信合并转发聊天记录 / 聊天截图发给 Sugent → 安全信封物理隔离 → 毫秒级召回客户历史底价与禁忌雷区 → 返回刚性守线 + 范围置换双版本可复制话术」**高频动作。
+  - **主动配额水位管理**：实时监测 `WeixinChannel` 主动消息剩余配额（`WeixinAdaptiveQuotaGuard`），低水位（`<= 3`）时自动将多条非紧急通知折叠为单张汇总卡，紧急告警直通附临界提示，配额耗尽或会话过期时平滑降级至飞书备用通道告警。
+- [x] **P2.3 打造首个高客单价「端-边联邦标杆武器包（Weapon Package）」**
+  - 聚焦高付费意愿、强结果导向的真实场景，基于 [`cowork-bridge.ts`](../src/sugent/cowork-bridge.ts)（`1 × Cowork Hub :28080 + N × Sugent Edge`）在 [`weapon-packages.ts`](../src/sugent/weapon-packages.ts) 完整交付两大标杆武器包与实盘商业证明账本（详细实施方案见 [`2026-11-25 Wave P2 方案`](./plans/2026-11-25-p2-offline-resilience-weixin-briefing-and-weapon-pack.md)）：
+    1. **工业现场 FDE 异常诊断与精益数智交付包（`industrial-fde-diagnostics`）**：端侧安全信封密封 MES/ERP 导表批次 + 确定性停机帕累托、SLA 超期与重复热点工位校验 + `CoworkPendingDraftPayload` 待审本体三元组与手机 Staging 审批卡。
+    2. **一人公司 / 外贸工作室合同与报价防漏审校包（`opc-contract-quote-guard`）**：对照本地私密历史报价子图与证伪墓碑核验底价、账期及否定式保护条款消歧，生成红线差异卡推送主理人拍板。
+  - 配套 `WeaponSoakTelemetryLedger` 持久化追踪连续 14 天常驻实盘压测指标（活跃天数、节省看护工时、模型路由省钱比例、拦截红线数与零越权一票否决门禁）。
 
 ---
 
