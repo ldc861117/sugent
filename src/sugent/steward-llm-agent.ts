@@ -135,6 +135,15 @@ export interface StewardLlmToolsPort<TWorkbench extends StewardWorkbenchLike = S
     reason?: string;
   }): Promise<Record<string, unknown>>;
   delegateLocalTask?(input: LocalTaskDelegationInput): Promise<LocalTaskDelegationResult> | LocalTaskDelegationResult;
+  proposeOpsInbox?(input: {
+    title: string;
+    summary?: string;
+    targetNodeId?: string;
+    commandAction?: string;
+    projectKey?: string;
+    requiresDashboardConfirm?: boolean;
+    weeklyFocus?: string[];
+  }): Promise<Record<string, unknown>>;
 }
 
 export interface LocalTaskDelegationInput {
@@ -371,6 +380,27 @@ const LLM_TOOLS = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "manage_ops_fleet",
+      description: "查询跨节点舰队全局快照 (/ops) 或生成下周重点排期/派单草案写入待签批收件箱 (ops_inbox)，返回确认编号供主人在微信回复 同意 或 /ok <编号> 放行。",
+      parameters: {
+        type: "object",
+        properties: {
+          action: { type: "string", enum: ["overview", "propose_inbox"] },
+          title: { type: "string", description: "排期或派单草案标题" },
+          summary: { type: "string", description: "草案具体内容与验收要点" },
+          targetNodeId: { type: "string", description: "目标执行节点，默认 local-mac" },
+          commandAction: { type: "string", description: "签批后下发的指令动作名，如 sync_weekly_plan" },
+          projectKey: { type: "string", description: "关联项目标识" },
+          requiresDashboardConfirm: { type: "boolean", description: "涉及资金、合同、对外发言时设为 true" },
+          weeklyFocus: { type: "array", items: { type: "string" }, description: "可选本周重点列表" },
+        },
+        required: ["action"],
+      },
+    },
+  },
 ];
 const shortProj = (k: string): string => k.replace(/^repo:[^/]+\//, "").replace(/^local:[^:]+:/, "");
 const tierLabel = (t: 0 | 1 | 2): string => (t === 0 ? "私密（仅本机）" : t === 1 ? "脱敏摘要" : "深度协同");
@@ -427,6 +457,22 @@ function buildSystemPrompt(wb: StewardWorkbenchLike): string {
     `重点目标(${goals.length}/3)：${goals.length ? goals.join(" | ") : "暂无"}`,
     `未结待办：${commits.length ? commits.join("；") : "暂无"}`,
     `正在运行中的开发任务：${running.length ? running.join(" | ") : "暂无"}`,
+    ...(wb.opsFleet?.projects?.length
+      ? [
+          `跨端舰队全局态势 (/ops)：${wb.opsFleet.projects
+            .slice(0, 8)
+            .map((p) => `${p.displayName || shortProj(p.projectKey)}${p.nodeId ? `[${p.nodeId}]` : ""}：${p.status || p.sanitizedSummary || "在线"}`)
+            .join(" | ")}`,
+        ]
+      : []),
+    ...(wb.opsFleet?.pendingInbox?.length
+      ? [
+          `待签批排期与派单 (/ops)：${wb.opsFleet.pendingInbox
+            .slice(0, 5)
+            .map((i) => `${i.id}「${i.title}」(${i.targetNodeId || "默认节点"})`)
+            .join(" | ")}`,
+        ]
+      : []),
     `价值红线与墓碑：${guards.length ? guards.join("；") : "暂无"}`,
     `重要联系人：${contacts.length ? contacts.join("；") : "暂无"}`,
   ].join("\n");
@@ -594,6 +640,7 @@ export class StewardLlmAgent<TWorkbench extends StewardWorkbenchLike = StewardWo
     if (name === "manage_model_routing") return this.executeModelRoutingTool(args);
     if (name === "manage_hot_update") return this.executeHotUpdateTool(args);
     if (name === "delegate_local_execution") return this.executeLocalDelegationTool(args, channel);
+    if (name === "manage_ops_fleet") return this.executeOpsFleetTool(args, wb);
     return this.executePrefsTool(args, wb, domain);
   }
 
@@ -789,6 +836,31 @@ export class StewardLlmAgent<TWorkbench extends StewardWorkbenchLike = StewardWo
       channel,
     });
     return { ...res };
+  }
+
+  private async executeOpsFleetTool(args: Record<string, unknown>, wb: TWorkbench): Promise<Record<string, unknown>> {
+    const act = String(args.action ?? "overview");
+    if (act === "overview") {
+      return {
+        ok: true,
+        projects: wb.opsFleet?.projects ?? [],
+        pendingInbox: wb.opsFleet?.pendingInbox ?? [],
+        weeklyFocus: wb.opsFleet?.weeklyFocus ?? [],
+      };
+    }
+    const fn = this.opts.toolsPort.proposeOpsInbox;
+    if (!fn) return { ok: false, errorCode: "OPS_FLEET_PROPOSE_UNAVAILABLE" };
+    const title = String(args.title ?? "").trim();
+    if (!title) return { ok: false, errorCode: "MISSING_PROPOSAL_TITLE" };
+    return fn({
+      title,
+      ...(typeof args.summary === "string" && args.summary.trim() ? { summary: args.summary.trim() } : {}),
+      ...(typeof args.targetNodeId === "string" && args.targetNodeId.trim() ? { targetNodeId: args.targetNodeId.trim() } : {}),
+      ...(typeof args.commandAction === "string" && args.commandAction.trim() ? { commandAction: args.commandAction.trim() } : {}),
+      ...(typeof args.projectKey === "string" && args.projectKey.trim() ? { projectKey: args.projectKey.trim() } : {}),
+      ...(typeof args.requiresDashboardConfirm === "boolean" ? { requiresDashboardConfirm: args.requiresDashboardConfirm } : {}),
+      ...(Array.isArray(args.weeklyFocus) ? { weeklyFocus: args.weeklyFocus.map(String) } : {}),
+    });
   }
 
   private async invokeChat(ep: ResolvedRouteEndpoint, messages: Array<Record<string, unknown>>) {

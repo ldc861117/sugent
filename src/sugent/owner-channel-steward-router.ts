@@ -44,6 +44,7 @@ export interface OwnerStewardPort {
         workbench?: StewardWorkbenchLike;
       }
   >;
+  approveOpsInbox?(approvalId?: string): Promise<{ ok: boolean; handled: boolean; reply?: string }>;
 }
 
 export interface OwnerStewardRouteResult {
@@ -54,6 +55,7 @@ export interface OwnerStewardRouteResult {
 }
 
 const RETRY_STRONGER_RE = /^(?:\/retry-stronger|换更强模型重试|重试更强模型|用更强模型重答|换个强模型重来)$/i;
+const OPS_OK_CMD_RE = /^(?:\/ok(?:\s+([a-zA-Z0-9._-]+))?|同意(?:\s+([a-zA-Z0-9._-]+))?)[\s。.！!~～]*$/i;
 const MAX_HISTORY_MESSAGES = 20; // 10 user+assistant turns
 
 function normalizeDropzoneChannel(raw: string): DropzoneChannel {
@@ -106,6 +108,15 @@ export class OwnerChannelStewardRouter {
 
     await priorTail;
     try {
+      const okMatch = OPS_OK_CMD_RE.exec(text);
+      if (okMatch && this.opts.steward.approveOpsInbox) {
+        const targetId = (okMatch[1] || okMatch[2] || "").trim().replace(/\.+$/, "") || undefined;
+        const approved = await this.opts.steward.approveOpsInbox(targetId);
+        if (approved.handled && approved.reply) {
+          return { handled: true, reply: approved.reply };
+        }
+      }
+
       if (RETRY_STRONGER_RE.test(text) && this.opts.steward.retryLastTurnStronger) {
         const retried = await this.opts.steward.retryLastTurnStronger("owner_private");
         if (!retried.ok || !retried.reply.trim()) return { handled: false };

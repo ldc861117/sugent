@@ -119,6 +119,10 @@ import {
   hasVerifiedActiveOrPendingSlot,
   OwnerChannelStewardRouter,
   resolveUnifiedCausalLedgerDir,
+  OpsBridgeClient,
+  evaluateWeixinSingleHolderGuard,
+  pruneProjectPulseForTier,
+  resolveOpsBridgeConfig,
 } from "../dist/src/sugent/index.js";
 import { normalizeSettings } from "../dist/src/agent/settings.js";
 
@@ -1012,6 +1016,86 @@ import { normalizeSettings } from "../dist/src/agent/settings.js";
   }
 }
 
+// 24. GCE 常驻中枢、微信单持有者守卫与 /ops 舰队桥接契约 (Step 1)
+{
+  const mockOpsOrigin = ["https:", "", "ops.sugent.internal"].join("/");
+  // 24.1 mode: none 零请求静默与单持有者守卫
+  const emptyCfg = resolveOpsBridgeConfig({});
+  assert.equal(emptyCfg.enabled, false);
+  let zeroFetchCalls = 0;
+  const offlineBridge = new OpsBridgeClient({
+    ...emptyCfg,
+    fetchImpl: async () => {
+      zeroFetchCalls += 1;
+      return new Response("{}", { status: 200 });
+    },
+  });
+  const skippedPulse = await offlineBridge.pushPulse([]);
+  assert.equal(skippedPulse.ok, false);
+  assert.equal(skippedPulse.skipped, true);
+  assert.equal(zeroFetchCalls, 0);
+
+  assert.equal(evaluateWeixinSingleHolderGuard({}).blocked, false);
+  assert.equal(
+    evaluateWeixinSingleHolderGuard({ OPS_BASE_URL: mockOpsOrigin, SUGENT_NODE_ID: "local-mac" }).blocked,
+    true,
+  );
+  assert.equal(
+    evaluateWeixinSingleHolderGuard({
+      OPS_BASE_URL: mockOpsOrigin,
+      SUGENT_NODE_ID: "gce-hub",
+      SUGENT_WEIXIN_OWNER_NODE: "gce-hub",
+    }).blocked,
+    false,
+  );
+
+  // 24.2 Tier 0/1/2 字段裁剪与 JWT 续期 + 幂等回执
+  const t0Pruned = pruneProjectPulseForTier({
+    projectKey: "repo:owner/private-ledger",
+    displayName: "Private Ledger",
+    tier: 0,
+    updatedAtIso: "2026-11-24T12:00:00.000Z",
+    sessionCount: 2,
+    runningSessionCount: 1,
+    subagentCount: 1,
+    workspaceRoot: "/Users/owner/secret",
+    summary: "secret numbers",
+  });
+  assert.equal(t0Pruned.displayName, undefined);
+  assert.equal(t0Pruned.sanitizedSummary, undefined);
+  assert.ok(/^proj-[a-f0-9]{8}$/.test(t0Pruned.codeName));
+
+  let nowSim = 1_700_000_000_000;
+  let authSeq = 0;
+  let ackCalls = 0;
+  const hubBridge = new OpsBridgeClient({
+    baseUrl: mockOpsOrigin,
+    nodeToken: "tok-hub",
+    nodeId: "gce-hub",
+    stewardHubNodeId: "gce-hub",
+    nowMs: () => nowSim,
+    fetchImpl: async (input) => {
+      const url = String(input);
+      if (url.endsWith("/api/ops/node/auth")) {
+        authSeq += 1;
+        return new Response(JSON.stringify({ token: `jwt-${authSeq}`, expiresInSec: 3600 }), { status: 200 });
+      }
+      if (url.endsWith("/ack")) ackCalls += 1;
+      return new Response(JSON.stringify({ ok: true, projects: [], pendingInbox: [] }), { status: 200 });
+    },
+  });
+  await hubBridge.stewardPending();
+  await hubBridge.stewardPending();
+  assert.equal(authSeq, 1);
+  nowSim += 56 * 60_000;
+  await hubBridge.stewardPending();
+  assert.equal(authSeq, 2);
+  await hubBridge.ackCommand("cmd-gate-1", { status: "completed" });
+  const dupAck = await hubBridge.ackCommand("cmd-gate-1", { status: "completed" });
+  assert.equal(dupAck.idempotent, true);
+  assert.equal(ackCalls, 1);
+}
+
 console.log(
-  "verify:sugent — 全部核心契约断言通过 (M1.1–M1.6 / M2.1 / Cowork 联邦 / P0 Broker + P1 幕僚耳麦 + P2 BYOK 诊断与零知识加密同步 / Sprint 1–3 / M1–M4 Vibe Coding 闭环 / 能力自感知与全文读取 / 形象工坊与桌宠契约 / M-Auto 1–4 双环自治与 SIM 演进 / M1–M3 全量模型同步与经验驱动自适应路由 / L0–L3 分层热启动与热更新 / Wave P0 双脑归一与宿主主循环合龙)",
+  "verify:sugent — 全部核心契约断言通过 (M1.1–M1.6 / M2.1 / Cowork 联邦 / P0 Broker + P1 幕僚耳麦 + P2 BYOK 诊断与零知识加密同步 / Sprint 1–3 / M1–M4 Vibe Coding 闭环 / 能力自感知与全文读取 / 形象工坊与桌宠契约 / M-Auto 1–4 双环自治与 SIM 演进 / M1–M3 全量模型同步与经验驱动自适应路由 / L0–L3 分层热启动与热更新 / Wave P0 双脑归一与宿主主循环合龙 / GCE 常驻中枢与微信单持有者舰队桥接)",
 );

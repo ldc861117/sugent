@@ -1,0 +1,42 @@
+# Sugent GCE 常驻中枢 (gce-hub) Docker Compose 编排
+# 目标机器：airtoken-micro (e2-medium 2 vCPU / 4 GB，与远程开发共享宿主机)
+# 安全边界：宿主机仅监听 127.0.0.1:3600，绝不暴露公网端口，管理面板一律走 SSH 本地端口转发访问。
+
+services:
+  sugent-hub:
+    image: ${SUGENT_IMAGE:-ghcr.io/ldc861117/sugent:latest}
+    container_name: sugent-gce-hub
+    restart: always
+    mem_limit: 1536m
+    memswap_limit: 2048m
+    ports:
+      - "127.0.0.1:3600:3600"
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      AMB_DATA_DIR: /data
+      # 容器内监听 0.0.0.0 以便 Docker 桥接转发宿主机 127.0.0.1:3600；宿主机侧已严格锁定环回地址
+      AMB_UI_HOST: 0.0.0.0
+      AMB_UI_PORT: "3600"
+      SUGENT_NODE_ID: ${SUGENT_NODE_ID:-gce-hub}
+      SUGENT_STEWARD_HUB_NODE: ${SUGENT_STEWARD_HUB_NODE:-gce-hub}
+      SUGENT_WEIXIN_OWNER_NODE: ${SUGENT_WEIXIN_OWNER_NODE:-gce-hub}
+    volumes:
+      - sugent-data:/data
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "const s=require('node:net').connect(3600,'127.0.0.1',()=>{s.end();process.exit(0)});s.on('error',()=>process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  sugent-data:
+    name: sugent-data

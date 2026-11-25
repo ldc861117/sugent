@@ -59,6 +59,7 @@ import {
   HotReloadBus,
   LLM_PROVIDER_PRESETS,
   LocalBudgetLedger,
+  OpsBridgeClient,
   OwnerChannelStewardRouter,
   ProviderRegistry,
   SugentAuthManager,
@@ -70,8 +71,10 @@ import {
   createEnvelopedRuleEventSink,
   decodeJwtPayloadUnsafe,
   deriveMagpieApiBases,
+  evaluateWeixinSingleHolderGuard,
   normalizeProviderPresetId,
   probeGeminiWeb2Api,
+  resolveOpsBridgeConfig,
   resolveSugentGatewayConfig,
   resolveUnifiedKnowledgeGraphDir,
   type GeminiWeb2ApiProbeResult,
@@ -82,6 +85,7 @@ import {
   type SugentBrokerClaims,
   type SugentRoleKey,
   type UpsertProviderInput,
+  type WeixinSingleHolderVerdict,
 } from "./sugent/index.js";
 
 const log = logger("app");
@@ -162,6 +166,7 @@ export interface AppOptions {
   enableOwnerStewardRouter?: boolean;
   enableStewardPulseTimer?: boolean;
   stewardPulseIntervalMs?: number;
+  opsEnv?: Record<string, string | undefined>;
 }
 
 interface BotChannels {
@@ -183,6 +188,7 @@ export class App {
   readonly conciergeBridge: ConciergeChannelBridge;
   readonly hotBundles: HotBundleSlotManager;
   readonly hotReloadBus: HotReloadBus;
+  readonly opsBridge: OpsBridgeClient;
   readonly p2Service: SugentP2HostService;
   readonly stewardService: SugentStewardHostService;
   readonly ownerStewardRouter: OwnerChannelStewardRouter;
@@ -205,6 +211,10 @@ export class App {
   account!: AccountManager;
   sugentAuth!: SugentAuthManager;
   lastDiagnostics: { model?: import("./diagnostics.js").ModelTestResult; agent?: import("./diagnostics.js").AgentTestResult } = {};
+  private readonly opsEnv: Record<string, string | undefined>;
+  private readonly executedOpsCommandIds = new Set<string>();
+  private readonly notifiedOpsInboxIds = new Set<string>();
+  private lastOpsInboxPush?: { sig: string; atMs: number };
   private notices: Array<{ at: number; level: "info" | "warn"; text: string }> = [];
   private offPwsh: (() => void) | undefined;
   private accountTimer: NodeJS.Timeout | undefined;
@@ -297,8 +307,20 @@ export class App {
       getDefaultModel: () => this.config.llm.defaultModel || this.providers.routing.executor,
       getFetch: () => this.desktop?.fetch ?? fetch,
     });
+    this.opsEnv = opts.opsEnv ?? process.env;
+    const opsCfg = resolveOpsBridgeConfig(this.opsEnv);
+    if (opsCfg.nodeToken) registerSecret(opsCfg.nodeToken);
+    this.opsBridge = new OpsBridgeClient({
+      baseUrl: opsCfg.baseUrl,
+      nodeToken: opsCfg.nodeToken,
+      nodeId: opsCfg.nodeId,
+      stewardHubNodeId: opsCfg.stewardHubNodeId,
+      getFetch: () => this.desktop?.fetch ?? globalThis.fetch,
+    });
     this.stewardService = new SugentStewardHostService({
       dataDir: config.dataDir,
+      nodeId: opsCfg.nodeId,
+      opsBridge: this.opsBridge,
       knowledgeGraph: this.knowledgeGraph,
       localBudgets: this.localBudgets,
       providerRegistry: this.providers,
@@ -584,6 +606,95 @@ export class App {
     return Boolean(this.stewardPulseTimer);
   }
 
+  weixinGuard(): WeixinSingleHolderVerdict {
+    return evaluateWeixinSingleHolderGuard(this.opsEnv, this.opsBridge.nodeId);
+  }
+
+  private async pullAndExecuteOpsCommands(): Promise<void> {
+    const pulled = await this.opsBridge.pullCommands();
+    if (!pulled.ok || !pulled.commands?.length) return;
+    for (const cmd of pulled.commands) {
+      if (cmd.targetNodeId && cmd.targetNodeId !== this.opsBridge.nodeId) continue;
+      if (this.executedOpsCommandIds.has(cmd.id)) {
+        await this.opsBridge.ackCommand(cmd.id, { status: "accepted", summary: "Already queued locally" });
+        continue;
+      }
+      try {
+        const botId = this.store.listBots()[0]?.id || "default";
+        const conv = this.store.ensureConversation(botId, "web", `ops-cmd-${this.opsBridge.nodeId}`, "Ops Bridge", "dm");
+        const title = cmd.title || `[Ops] ${cmd.action}`;
+        const brief = cmd.summary ? `${cmd.action}: ${cmd.summary}` : cmd.action;
+        const created = this.tasks.create({
+          botId,
+          conversationId: conv.id,
+          title,
+          brief,
+          anytime: true,
+        });
+        if (created.task) {
+          if (this.executedOpsCommandIds.size >= 500) {
+            const oldest = this.executedOpsCommandIds.values().next().value;
+            if (oldest) this.executedOpsCommandIds.delete(oldest);
+          }
+          this.executedOpsCommandIds.add(cmd.id);
+          await this.opsBridge.ackCommand(cmd.id, {
+            status: "accepted",
+            summary: `Queued local task ${created.task.id}`,
+          });
+        } else {
+          await this.opsBridge.ackCommand(cmd.id, {
+            status: "failed",
+            summary: created.error ?? "TASK_CREATE_REJECTED",
+          });
+        }
+      } catch (e) {
+        await this.opsBridge.ackCommand(cmd.id, {
+          status: "failed",
+          summary: (e as Error).message.slice(0, 200),
+        });
+      }
+    }
+  }
+
+  async syncOpsBridgeTick(nowMs = Date.now()): Promise<void> {
+    if (!this.opsBridge.isConfigured()) return;
+    const localPulses = this.stewardService.collectLocalOpsProjectPulses();
+    if (this.opsBridge.isStewardHub()) {
+      const pending = await this.opsBridge.stewardPending();
+      if (pending.ok && pending.snapshot) {
+        this.stewardService.setRemoteOpsSnapshot(pending.snapshot);
+        const freshInbox = (pending.snapshot.pendingInbox ?? []).filter(
+          (it) => it?.id && !this.notifiedOpsInboxIds.has(it.id),
+        );
+        if (freshInbox.length > 0 && !this.stewardService.getWorkbench("owner_private").quietHoursActive) {
+          const lines = [
+            `【待签批派单提醒 · ${freshInbox.length} 项】`,
+            ...freshInbox.slice(0, 4).map(
+              (it) =>
+                `- ${it.id}「${it.title}」(${it.targetNodeId || "local-mac"})：${it.requiresDashboardConfirm ? "需 /ops 看板二次确认" : `回复 /ok ${it.id} 放行`}`,
+            ),
+          ];
+          const text = lines.join("\n");
+          const duplicateWithin1m =
+            this.lastOpsInboxPush &&
+            this.lastOpsInboxPush.sig === text &&
+            nowMs - this.lastOpsInboxPush.atMs < 60_000;
+          if (!duplicateWithin1m) {
+            this.lastOpsInboxPush = { sig: text, atMs: nowMs };
+            for (const it of freshInbox) this.notifiedOpsInboxIds.add(it.id);
+            await this.pushToOwner(text).catch(() => false);
+          }
+        }
+      }
+      if (localPulses.length > 0) {
+        await this.opsBridge.pushPulse(localPulses);
+      }
+    } else {
+      await this.opsBridge.pushPulse(localPulses);
+    }
+    await this.pullAndExecuteOpsCommands();
+  }
+
   async runStewardPulseTick(input: {
     nowMs?: number;
     forceMorningDrain?: boolean;
@@ -591,6 +702,7 @@ export class App {
     forceGardener?: boolean;
     gardenerIntervalMs?: number;
   } = {}) {
+    await this.syncOpsBridgeTick().catch((e) => log.warn("ops bridge tick failed", { message: (e as Error).message }));
     const res = this.stewardService.runScheduledPulse(input);
     if (res.morningDrain && res.morningDrain.emitNow.length > 0) {
       const lines = [
@@ -1422,7 +1534,13 @@ export class App {
     }
 
     registerSecret(this.store.getWeixinAccount(key)?.botToken);
-    if (this.store.getChannelAccount(key, "weixin")?.enabled && !ch.weixin) {
+    const wxGuard = this.weixinGuard();
+    if (wxGuard.blocked) {
+      log.info(`account ${key}: weixin skipped by single-holder guard`, {
+        nodeId: wxGuard.nodeId,
+        ownerNodeId: wxGuard.ownerNodeId,
+      });
+    } else if (this.store.getChannelAccount(key, "weixin")?.enabled && !ch.weixin) {
       ch.weixin = new WeixinChannel(key, this.store, this.runtime, this.queue, {
         fetchImpl: this.opts.weixinFetch,
         cdnBaseUrl: this.config.weixin.cdnBaseUrl,
@@ -1603,6 +1721,10 @@ export class App {
   }
 
   startWeixinLogin(key: string): WeixinLogin {
+    const wxGuard = this.weixinGuard();
+    if (wxGuard.blocked) {
+      throw new Error(wxGuard.reason ?? `Weixin channel is exclusively owned by ${wxGuard.ownerNodeId}`);
+    }
     const ch = this.channels.get(key) ?? {};
     this.channels.set(key, ch);
     ch.weixinLogin?.cancel();
@@ -1649,7 +1771,10 @@ export class App {
         : ch?.feishu?.status ?? { state: "disabled", since: 0 };
     if (fsAccount?.credentials.appId) feishu.account = { appId: fsAccount.credentials.appId, saved: { appSecret: mask(fsAccount.credentials.appSecret) } };
     const acct = this.store.getWeixinAccount(key);
-    const wx = ch?.weixin?.status ?? (acct ? { state: "disabled" as const, since: 0 } : { state: "login_required" as const, detail: t("channel.wx_login_required"), since: 0 });
+    const wxGuard = this.weixinGuard();
+    const wx = wxGuard.blocked
+      ? { state: "disabled" as const, detail: wxGuard.reason, since: 0 }
+      : (ch?.weixin?.status ?? (acct ? { state: "disabled" as const, since: 0 } : { state: "login_required" as const, detail: t("channel.wx_login_required"), since: 0 }));
     const quota = ch?.weixin
       ? this.store.listWeixinPeers(key).map((p) => ({ userId: p.userId, remaining: ch.weixin!.quota.remaining(p.userId), windowStartedAt: p.windowStartedAt }))
       : [];

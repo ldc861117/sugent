@@ -1,0 +1,90 @@
+# Sugent Image: 构建并发布包含 Sugent 完整改动的无界面常驻镜像至 ghcr.io/ldc861117/sugent
+# 注意：保持与上游 .github/workflows/docker.yml 完全独立，互不干扰。
+
+name: Sugent Image
+
+on:
+  push:
+    branches: ["main", "master"]
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      push:
+        description: "Push image to GHCR (true/false)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: sugent-image-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+env:
+  IMAGE: ghcr.io/ldc861117/sugent
+
+jobs:
+  build-amd64:
+    name: Build and Publish (linux/amd64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Fetch magpie submodule
+        run: git submodule update --init --depth 1 vendor/magpie
+
+      - name: Compute image tags
+        id: meta
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+          INPUT_PUSH: ${{ inputs.push }}
+        run: |
+          version=$(node -p 'require("./package.json").version')
+          short_sha="${SHA:0:12}"
+          should_push="true"
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$INPUT_PUSH" = "false" ]; then
+            should_push="false"
+          fi
+          tags="$IMAGE:sha-$short_sha,$IMAGE:$version"
+          if [ "$REF_TYPE" = "branch" ] || [[ "$REF_NAME" != *-* ]]; then
+            tags="$tags,$IMAGE:latest"
+          fi
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "push=$should_push" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        if: steps.meta.outputs.push == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build and push Sugent image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          push: ${{ steps.meta.outputs.push == 'true' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          provenance: false
+          sbom: false
+          labels: |
+            org.opencontainers.image.title=SugentHub
+            org.opencontainers.image.description=Sugent headless resident steward hub and WeChat bridge
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.meta.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=MIT
+          cache-from: type=gha,scope=sugent-image-amd64
+          cache-to: type=gha,mode=max,scope=sugent-image-amd64

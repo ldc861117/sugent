@@ -17,6 +17,7 @@ import type { RepoBindingRecord, UpsertRepoBindingInput } from "./repo-binding.j
 import { SocialImVibeAdapter, type VibePipelineRecord } from "./vibe-coding-pipeline.js";
 import type { CapabilityAwarenessSnapshot } from "./capability-awareness.js";
 import type { AuthorizedFileMatch, ReadAuthorizedFileResult } from "./authorized-file-reader.js";
+import type { OpsStewardPendingSnapshot } from "./ops-bridge-client.js";
 
 export interface StewardConversationTurnInput {
   text: string;
@@ -118,6 +119,7 @@ export interface StewardWorkbenchLike {
   concierge?: StewardConciergeView;
   vibeCoding?: { bindings: RepoBindingRecord[]; pipelines: VibePipelineRecord[] };
   capabilities?: CapabilityAwarenessSnapshot;
+  opsFleet?: OpsStewardPendingSnapshot;
 }
 export interface StewardConversationHostPort<TWorkbench extends StewardWorkbenchLike = StewardWorkbenchLike> {
   getWorkbench(callerDomain?: CallerAccessDomain): TWorkbench;

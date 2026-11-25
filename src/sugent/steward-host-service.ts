@@ -89,6 +89,13 @@ import { SugentModelCatalog, type ModelTier } from "./model-catalog.js";
 import { ModelPoolSyncer, type ProviderSyncResult } from "./model-pool-sync.js";
 import { RoutingExperienceStore, type RoutingOperatingMode, type RoutingPolicyState, type RoutingStrategyPreset, type TaskArchetype } from "./routing-experience-store.js";
 import { AdaptiveModelRouter, type AdaptiveRoutingDashboardSnapshot } from "./adaptive-router.js";
+import {
+  OpsBridgeClient,
+  type OpsInboxItem,
+  type OpsProjectPulseInput,
+  type OpsRemoteCommand,
+  type OpsStewardPendingSnapshot,
+} from "./ops-bridge-client.js";
 
 export interface SugentStewardHostServiceOptions {
   dataDir: string;
@@ -118,6 +125,7 @@ export interface SugentStewardHostServiceOptions {
   };
   vibeCommandRunner?: CommandExecPort;
   delegateLocalTask?: (input: LocalTaskDelegationInput) => Promise<LocalTaskDelegationResult>;
+  opsBridge?: OpsBridgeClient;
   manifestPath?: string;
   workspaceRoot?: string;
 }
@@ -190,6 +198,7 @@ export interface StewardWorkbenchSnapshot {
   skillCandidates?: SkillCandidateSummary[];
   routing?: AdaptiveRoutingDashboardSnapshot;
   hotUpdate?: Record<string, unknown>;
+  opsFleet?: OpsStewardPendingSnapshot;
 }
 
 function writeJsonAtomic600(filePath: string, data: unknown): void {
@@ -395,6 +404,8 @@ export class SugentStewardHostService {
   private lastScanResult?: AntigravityScanResult;
   private lastCadenceScan?: StewardWorkbenchSnapshot["cadence"]["lastScan"];
   private lastMorningDrain?: StewardWorkbenchSnapshot["cadence"]["lastMorningDrain"];
+  private remoteOpsSnapshot?: OpsStewardPendingSnapshot;
+  private readonly stagedOpsInbox = new Map<string, OpsInboxItem>();
 
   constructor(private readonly opts: SugentStewardHostServiceOptions) {
     this.nowIsoFn = opts.nowIso ?? (() => new Date().toISOString());
@@ -574,6 +585,7 @@ export class SugentStewardHostService {
         syncModelPool: (o) => this.syncModelPool(o),
         updateRoutingPolicy: (patch) => this.updateRoutingPolicy(patch),
         manageHotUpdate: (input) => this.executeHotUpdateAction(input),
+        proposeOpsInbox: (input) => this.proposeOpsInbox(input),
         ...(opts.delegateLocalTask ? { delegateLocalTask: opts.delegateLocalTask } : {}),
         ...(opts.conciergeBridge ? { executeConciergeCommand: (cmd, ch) => opts.conciergeBridge!.executeOwnerCommand(cmd, ch) } : {}),
       },
@@ -919,6 +931,9 @@ export class SugentStewardHostService {
       capabilities: this.capabilityAwareness.snapshot(this.getAuthorizedProjectRoots(scan).length),
       ...(callerDomain === "owner_private"
         ? { skillCandidates: this.opts.knowledgeGraph.listSkillCandidates({ threshold: 3 }) }
+        : {}),
+      ...(callerDomain === "owner_private" && this.remoteOpsSnapshot
+        ? { opsFleet: this.remoteOpsSnapshot }
         : {}),
       routing,
       ...(this.opts.hotUpdatePort ? { hotUpdate: this.getHotUpdateStatus() } : {}),
@@ -1577,6 +1592,183 @@ export class SugentStewardHostService {
       ...(morningDrain ? { morningDrain } : {}),
       ...(boundaryDrain ? { boundaryDrain } : {}),
       ...(gardener ? { gardener } : {}),
+    };
+  }
+
+  setRemoteOpsSnapshot(snapshot: OpsStewardPendingSnapshot | undefined): void {
+    this.remoteOpsSnapshot = snapshot;
+    this.stagedOpsInbox.clear();
+    if (snapshot?.pendingInbox) {
+      for (const item of snapshot.pendingInbox) {
+        if (item?.id) this.stagedOpsInbox.set(item.id, item);
+      }
+    }
+  }
+
+  getRemoteOpsSnapshot(): OpsStewardPendingSnapshot | undefined {
+    return this.remoteOpsSnapshot;
+  }
+
+  stageOpsInboxProposal(item: OpsInboxItem): void {
+    if (!item?.id) return;
+    this.stagedOpsInbox.set(item.id, item);
+  }
+
+  async proposeOpsInbox(input: {
+    title: string;
+    summary?: string;
+    targetNodeId?: string;
+    commandAction?: string;
+    projectKey?: string;
+    requiresDashboardConfirm?: boolean;
+    weeklyFocus?: string[];
+  }): Promise<Record<string, unknown>> {
+    const id = `inb-${Date.now().toString(36)}-${crypto.randomBytes(2).toString("hex")}`;
+    const highRiskText = `${input.title} ${input.summary ?? ""}`;
+    const highRisk = Boolean(
+      input.requiresDashboardConfirm ||
+        /(资金|转账|付款|打款|合同|签约|协议|对外发言|公开发布|群发)/.test(highRiskText),
+    );
+    const item: OpsInboxItem = {
+      id,
+      title: input.title,
+      ...(input.summary ? { summary: input.summary } : {}),
+      targetNodeId: input.targetNodeId || "local-mac",
+      commandAction: input.commandAction || "sync_weekly_plan",
+      ...(input.projectKey ? { projectKey: input.projectKey } : {}),
+      requiresDashboardConfirm: highRisk,
+      createdAtIso: this.nowIsoFn(),
+    };
+    this.stageOpsInboxProposal(item);
+    if (this.remoteOpsSnapshot) {
+      this.remoteOpsSnapshot = {
+        ...this.remoteOpsSnapshot,
+        pendingInbox: [item, ...this.remoteOpsSnapshot.pendingInbox],
+        ...(input.weeklyFocus?.length ? { weeklyFocus: input.weeklyFocus } : {}),
+      };
+    }
+    if (this.opts.opsBridge?.isConfigured() && this.opts.opsBridge.isStewardHub()) {
+      const syncRes = await this.opts.opsBridge.stewardSync({
+        inboxItems: [item],
+        ...(input.weeklyFocus?.length ? { weeklyFocus: input.weeklyFocus } : {}),
+      });
+      if (!syncRes.ok) {
+        return {
+          ok: false,
+          inboxId: id,
+          errorCode: syncRes.reason ?? "OPS_SYNC_FAILED",
+          message: `草案已暂存本机，但同步 /ops 失败（${syncRes.reason ?? "network_error"}）。`,
+        };
+      }
+    }
+    return {
+      ok: true,
+      inboxId: id,
+      item,
+      confirmInstruction: highRisk
+        ? `该事项涉及资金/合同/对外发言高风险边界，请前往 /ops 看板二次确认（编号 ${id}）。`
+        : `回复「同意」或「/ok ${id}」即可签批并下发至 ${item.targetNodeId}。`,
+    };
+  }
+
+  collectLocalOpsProjectPulses(): OpsProjectPulseInput[] {
+    const nowIso = this.nowIsoFn();
+    const { scan } = this.scanAntigravity();
+    const sortedSessions = [...scan.sessions].sort(
+      (a, b) =>
+        ((b.isRunning ? 1 : 0) - (a.isRunning ? 1 : 0)) ||
+        ((b.effectiveLastModifiedMs ?? b.lastModifiedMs ?? 0) - (a.effectiveLastModifiedMs ?? a.lastModifiedMs ?? 0)),
+    );
+    return this.buildProjectViews(sortedSessions).map((p) => ({
+      projectKey: p.projectKey,
+      displayName: p.displayName,
+      aliases: p.aliases,
+      tier: p.policy.tier,
+      status: p.runningSessionCount > 0 ? "running" : "idle",
+      summary: p.title,
+      updatedAtIso: nowIso,
+      sessionCount: p.sessionCount,
+      runningSessionCount: p.runningSessionCount,
+      subagentCount: p.subagentCount,
+      ...(p.workspaceRoot ? { workspaceRoot: p.workspaceRoot } : {}),
+      runningSessions: p.runningSessions,
+    }));
+  }
+
+  async approveOpsInbox(approvalId?: string): Promise<{ ok: boolean; handled: boolean; reply?: string }> {
+    const candidates = Array.from(this.stagedOpsInbox.values());
+    const trimmedId = String(approvalId ?? "").trim();
+    let target: OpsInboxItem | undefined;
+
+    if (trimmedId) {
+      target = this.stagedOpsInbox.get(trimmedId) ?? candidates.find((c) => c.id === trimmedId);
+      if (!target) {
+        return {
+          ok: false,
+          handled: true,
+          reply: `未找到待签批事项「${trimmedId}」，可能已完成或已过期。`,
+        };
+      }
+    } else {
+      if (candidates.length === 0) {
+        return { ok: false, handled: false };
+      }
+      if (candidates.length > 1) {
+        const list = candidates.slice(0, 5).map((c) => `${c.id}（${c.title}）`).join("、");
+        return {
+          ok: false,
+          handled: true,
+          reply: `当前有 ${candidates.length} 条待签批派单，请附带编号确认（例如 /ok ${candidates[0]!.id}）：${list}`,
+        };
+      }
+      target = candidates[0];
+    }
+
+    if (!target) return { ok: false, handled: false };
+    if (target.requiresDashboardConfirm) {
+      return {
+        ok: false,
+        handled: true,
+        reply: `事项「${target.title}」（${target.id}）涉及高危变更，需前往 /ops 面板完成二次确认。`,
+      };
+    }
+
+    const cmd: OpsRemoteCommand = {
+      id: `cmd-${target.id}-${Date.now().toString(36)}`,
+      targetNodeId: target.targetNodeId || "local-mac",
+      action: target.commandAction || "execute_approved_inbox",
+      title: target.title,
+      ...(target.summary ? { summary: target.summary } : {}),
+      ...(target.projectKey ? { projectKey: target.projectKey } : {}),
+      createdAtIso: this.nowIsoFn(),
+    };
+
+    if (this.opts.opsBridge?.isConfigured() && this.opts.opsBridge.isStewardHub()) {
+      const syncRes = await this.opts.opsBridge.stewardSync({
+        approvedInboxIds: [target.id],
+        commands: [cmd],
+      });
+      if (!syncRes.ok) {
+        return {
+          ok: false,
+          handled: true,
+          reply: `签批「${target.title}」（${target.id}）同步 /ops 失败（${syncRes.reason ?? "network_error"}），请稍后重试。`,
+        };
+      }
+    }
+
+    this.stagedOpsInbox.delete(target.id);
+    if (this.remoteOpsSnapshot) {
+      this.remoteOpsSnapshot = {
+        ...this.remoteOpsSnapshot,
+        pendingInbox: this.remoteOpsSnapshot.pendingInbox.filter((i) => i.id !== target.id),
+      };
+    }
+
+    return {
+      ok: true,
+      handled: true,
+      reply: `已签批「${target.title}」（${target.id}），指令已写入队列并下发至节点 ${cmd.targetNodeId}。`,
     };
   }
 }

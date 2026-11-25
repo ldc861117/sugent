@@ -58,3 +58,4 @@ export * from "./hot-bundle-slots.js";
 export * from "./hot-reload-bus.js";
 export * from "./hot-core-supervisor.js";
 export * from "./owner-channel-steward-router.js";
+export * from "./ops-bridge-client.js";
