@@ -59,17 +59,17 @@ Sugent 按「外环私人幕僚（[`docs/PHILOSOPHY.md`](./PHILOSOPHY.md)）× �
 
 **战役目标**：把新用户首次惊艳时间（Time-to-First-Aha）压缩至 3 分钟以内，同时精准吸收 T3 Code、Paseo、Paradev 与 Pane 已验证的高 ROI 工程机制。
 
-- [ ] **P1.1 首日「零填表 3 分钟惊艳」冷启动重塑（破解空心账本劝退）**
+- [x] **P1.1 首日「零填表 3 分钟惊艳」冷启动重塑（破解空心账本劝退）**
   - 首次打开绝不弹出五维账本、信任阶梯或四角色模型配置表单：自动探测本机可用网关/CLI，仅引导用户完成 1 个极简动作——**“拖入 1 个常用项目/合同文件夹，或转发 1 段待办消息”**。
   - 60 秒内自动生成首张本地档案索引卡、提炼首条 `CommitmentItem` 待办承诺，并联动升级版 `sugent try` 演示一次“后台执行 → 挂起零消耗推拍板卡 → 点选完成”的完整闭环，让五维账本在日常使用中无感自生长。
-- [ ] **P1.2 基于 ACP 标准协议的统一外部智能体适配器（补齐 `CodingHarnessRegistry`）**
+- [x] **P1.2 基于 ACP 标准协议的统一外部智能体适配器（补齐 `CodingHarnessRegistry`）**
   - 放弃为各家 CLI 单独维护脆弱终端解析器的旧方案，新增 `src/sugent/acp-coding-harness.ts` 实现标准 ACP 客户端与参数数组安全调用，注册进 [`repo-binding.ts`](../src/sugent/repo-binding.ts) 的 `CodingHarnessRegistry`。
   - 一次性免改造接入本机 Claude Code、Codex、OpenCode 与 Pi，在 [`vibe-coding-pipeline.ts`](../src/sugent/vibe-coding-pipeline.ts) 中跑通“A 智能体编码 + `IndependentGateRunner` 客观门禁 + B 智能体交叉 Review”，并将预算拆分为**「API 精确美元账本 + 订阅制频次/冷却配额账本」**双轨计量。
-- [ ] **P1.3 Worktree 隐藏 Git Refs 快照、零膨胀克隆与 PR 行级评论回灌**
+- [x] **P1.3 Worktree 隐藏 Git Refs 快照、零膨胀克隆与 PR 行级评论回灌**
   - **隐藏状态快照（借鉴 T3 Code）**：在 Vibe Coding 每轮阶段切换与验证前后，通过 `git write-tree` 与 `git update-ref refs/sugent/checkpoints/<pipelineId>/<round>` 静默打快照——零污染业务分支 `git log`，支持在微信拍板卡与桌面端一键秒退任意轮次，并与 [`self-improvement-memory.ts`](../src/sugent/self-improvement-memory.ts) 的 `attemptId` 绑定。
   - **多 Worktree 磁盘与端口隔离**：初始化隔离 Worktree 时优先采用 macOS APFS `cp -c`（写时复制）或 `pnpm` 硬链接秒级复用 `node_modules`，并自动注入随机空闲端口与独立临时目录环境变量，根治并发脏写与磁盘暴涨。
   - **PR / CI 审查回灌与轻量元素点选（借鉴 Paradev）**：结合 [`delivery.ts`](../src/sugent/delivery.ts) 与 [`handoff-file-bridge.ts`](../src/sugent/handoff-file-bridge.ts)，将 GitHub PR 的 CI 失败日志与 Diff 行级评论经安全信封隔离后自动生成增量补丁投递进 `.sugent-handoff/inbox/`；在桌面本地 Web 预览窗提供轻量 DOM 点选拾取器，一键附带选择器与截图派单改 UI。
-- [ ] **P1.4 系统权限按需懒加载与 Windows / WSL2 跨文件系统加固（借鉴 Pane）**
+- [x] **P1.4 系统权限按需懒加载与 Windows / WSL2 跨文件系统加固（借鉴 Pane）**
   - **系统权限懒授权**：安装包首次启动绝不触发 macOS「屏幕录制 / 辅助功能」系统弹窗，仅在用户首次下达 CUA 桌面操控指令时按需引导授权，降低非技术主理人安装流失率。
   - **Windows + WSL2 专项稳健性**：针对国内政企与工业现场常见的 Windows 宿主机 + WSL2 混合环境，专项验证并修复 `GitWorktreeManager`、`anymodel.lock` 与 [`scripts/safe-relaunch.mjs`](../scripts/safe-relaunch.mjs) 的跨文件系统路径与进程回收逻辑。
 

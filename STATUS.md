@@ -3,30 +3,32 @@ status_version: 1
 project: sugent
 review_state: pending_review
 updated_by: gemini-task@local-mac
-updated_at: "2026-11-24T19:32:00-08:00"
+updated_at: "2026-11-25T04:55:00-08:00"
 confirmed_by: ""
 confirmed_at: ""
 ---
 
 ## 阶段目标
 
-打通 GCE 常驻中枢、微信单持有者与 `/ops` 舰队闭环
+完成 GCE 微信上线收尾与 Wave P1 + UI/网关修复合入
 
 ## 最近完成
 
-- 完成 `src/sugent/ops-bridge-client.ts`：实现 1h JWT 缓存与提前 5 分钟续期、`401` 自动重签、Tier `0/1/2` 脉冲裁剪、仅 Tier `2` 文档同步、按状态幂等指令回执、`gce-hub` 专属快照同步及 `mode: "none"` 零请求静默。
-- 完成管家双模与微信审批闭环：在 `SugentStewardHostService`、`StewardLlmAgent`、`OwnerChannelStewardRouter` 与 `App` 接入远端 `/ops` 快照、`manage_ops_fleet` 草案提报（含资金/合同/对外发言高风险看板二次确认拦截）、`/ok <id>` 放行下发 `ops_commands`、1 分钟去重推送及微信单持有者守卫。
-- 完成无界面部署与门禁：新增 `deploy/gce-hub/{compose.yml,.env.example,README.md}`（`1536m` 内存上限、`127.0.0.1:3600` 环回绑定）、独立 `.github/workflows/sugent-image.yml`，并在 `package.json` 与 `scripts/verify-sugent.mjs` 第 24 节注册全套单测与契约自检。
+- **路线一（GCE 常驻微信中枢已上线连通）**：`airtoken-micro` 上的 `sugent-gce-hub` 容器已健康运行（`Up (healthy)`，仅绑定 `127.0.0.1:3600`），已接入同机 `CLIProxyAPI` 统一网关并完成主人微信扫码绑定（`Confirmed · 微信已连接`），本机 `local-mac` 单持有者防抢锁环境变量已生效。
+- **路线二（Wave P1 全量实现 + 两项线上体验缺陷修复）**：
+  - Wave P1（`P1.1–P1.4`）四模块及第 25 节门禁全绿。
+  - 修复第三方 OpenAI 兼容网关（如 `CLIProxyAPI`）保存后误报「保存后校验失败」（`src/magpie/supervisor.ts` 回读兼容 Go `omitempty` 空字符串与 `byok-diagnostics.ts` 探测路径适配）。
+  - 修复模态对话框（`Sheet` 含 `backdrop-filter`）内 `MenuButton` / `Popover` 下拉菜单向右下漂移与被右侧裁剪的问题（挂载至 `document.body` 并提升层级至 `calc(var(--z-modal) + 4)`）。
 
 ## 在途
 
-- 对齐并收口 `Andy-web` 仓库未提交的 `/ops` 服务端改动与 Cloud Run Firestore 环境变量（阶段 A）。
+- 待本机提交并推送代码以触发 GHCR 构建新版镜像，在 GCE 执行 `docker compose pull && docker compose up -d` 热更修复。
 
 ## 下一步
 
-1. 在 `Andy-web` 仓库收口 `/ops` 改动，开启 Cloud Run `OPS_STORAGE_MODE=firestore` 并配置 `OPS_NODE_TOKEN_LOCAL_MAC` 与 `OPS_NODE_TOKEN_GCE_HUB`。
-2. 在 GCE `airtoken-micro` 实例按 `deploy/gce-hub/README.md` 启动 `sugent-gce-hub` 容器，经 SSH 隧道完成微信迁移扫码与端到端联调。
+1. 提交本轮 Wave P1 与网关/下拉框修复并推送 `origin/main`，更新 GCE `sugent-gce-hub` 容器镜像。
+2. 如需开启跨节点 `/ops` 派单协同，在 GCE `~/sugent-hub/.env` 填入 `OPS_BASE_URL` 与 `OPS_NODE_TOKEN`；随后进入 Wave P2。
 
 ## 卡点
 
-- 阶段 A（Cloud Run 密钥与 `firestore.rules` 发布）及阶段 B/C（GCE 线上拉起与手机微信本人扫码）需主人授权与实机扫码配合。
+- 暂无阻塞卡点；待主人确认后提交并推送镜像即可同步至云端容器。
