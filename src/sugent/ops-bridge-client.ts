@@ -85,17 +85,52 @@ export interface OpsInboxItem {
   createdAtIso?: string;
 }
 
+export interface OpsStewardProjectItem {
+  projectKey: string;
+  displayName?: string;
+  nodeId?: string;
+  nodes?: string[];
+  tier?: 0 | 1 | 2;
+  privacyTier?: 0 | 1 | 2;
+  domain?: string;
+  stage?: string;
+  boardStatus?: string;
+  boardStatusReason?: string;
+  status?: string;
+  sanitizedSummary?: string;
+  updatedAtIso?: string;
+  lastActiveAt?: string;
+  executiveSummary?: {
+    goalText?: string;
+    progressText?: string;
+    nextActionText?: string;
+    updatedAt?: string;
+  };
+  statusCard?: {
+    stageGoal?: string;
+    landed?: string[];
+    inflight?: Array<{ text: string; nodeId?: string; surface?: string; updatedAt?: string }>;
+    nextActions?: string[];
+    blockers?: string[];
+    reviewState?: string;
+    source?: string;
+    updatedBy?: string;
+    updatedAt?: string;
+  };
+  roadmapSummary?: {
+    activeNode?: {
+      code?: string;
+      title?: string;
+      status?: string;
+      progress?: { done?: number; total?: number; pct?: number };
+    };
+    totals?: { done?: number; total?: number; pct?: number };
+  };
+}
+
 export interface OpsStewardPendingSnapshot {
   fetchedAtIso?: string;
-  projects: Array<{
-    projectKey: string;
-    displayName?: string;
-    nodeId?: string;
-    tier?: 0 | 1 | 2;
-    status?: string;
-    sanitizedSummary?: string;
-    updatedAtIso?: string;
-  }>;
+  projects: OpsStewardProjectItem[];
   pendingInbox: OpsInboxItem[];
   weeklyFocus?: string[];
   stageGoals?: string[];
@@ -433,6 +468,37 @@ export class OpsBridgeClient {
     return { ok: false, ...(res.skipped ? { skipped: true } : {}), ...(res.reason ? { reason: res.reason } : {}) };
   }
 
+  async fetchFleetSnapshot(): Promise<{
+    ok: boolean;
+    skipped?: boolean;
+    snapshot?: OpsStewardPendingSnapshot;
+    reason?: string;
+  }> {
+    if (!this.isConfigured()) {
+      return { ok: false, skipped: true, reason: "OPS_BRIDGE_UNCONFIGURED" };
+    }
+    const res = await this.authedJson<Record<string, unknown>>("/api/ops/bridge/steward-pending", {
+      method: "GET",
+    });
+    if (!res.ok) {
+      return { ok: false, ...(res.reason ? { reason: res.reason } : {}) };
+    }
+    const raw = res.data ?? {};
+    const rawInbox = Array.isArray(raw.pendingInbox)
+      ? raw.pendingInbox
+      : Array.isArray(raw.pendingItems)
+        ? raw.pendingItems
+        : [];
+    const snapshot: OpsStewardPendingSnapshot = {
+      fetchedAtIso: new Date(this.nowMsFn()).toISOString(),
+      projects: Array.isArray(raw.projects) ? (raw.projects as OpsStewardProjectItem[]) : [],
+      pendingInbox: rawInbox as OpsInboxItem[],
+      ...(Array.isArray(raw.weeklyFocus) ? { weeklyFocus: raw.weeklyFocus.map(String) } : {}),
+      ...(Array.isArray(raw.stageGoals) ? { stageGoals: raw.stageGoals.map(String) } : {}),
+    };
+    return { ok: true, snapshot };
+  }
+
   async stewardPending(): Promise<{
     ok: boolean;
     skipped?: boolean;
@@ -445,21 +511,7 @@ export class OpsBridgeClient {
     if (!this.isStewardHub()) {
       return { ok: false, reason: "NOT_STEWARD_HUB_NODE" };
     }
-    const res = await this.authedJson<Record<string, unknown>>("/api/ops/bridge/steward-pending", {
-      method: "GET",
-    });
-    if (!res.ok) {
-      return { ok: false, ...(res.reason ? { reason: res.reason } : {}) };
-    }
-    const raw = res.data ?? {};
-    const snapshot: OpsStewardPendingSnapshot = {
-      fetchedAtIso: new Date(this.nowMsFn()).toISOString(),
-      projects: Array.isArray(raw.projects) ? (raw.projects as OpsStewardPendingSnapshot["projects"]) : [],
-      pendingInbox: Array.isArray(raw.pendingInbox) ? (raw.pendingInbox as OpsInboxItem[]) : [],
-      ...(Array.isArray(raw.weeklyFocus) ? { weeklyFocus: raw.weeklyFocus.map(String) } : {}),
-      ...(Array.isArray(raw.stageGoals) ? { stageGoals: raw.stageGoals.map(String) } : {}),
-    };
-    return { ok: true, snapshot };
+    return this.fetchFleetSnapshot();
   }
 
   async stewardSync(

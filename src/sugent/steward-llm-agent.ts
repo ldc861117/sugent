@@ -135,6 +135,12 @@ export interface StewardLlmToolsPort<TWorkbench extends StewardWorkbenchLike = S
     reason?: string;
   }): Promise<Record<string, unknown>>;
   delegateLocalTask?(input: LocalTaskDelegationInput): Promise<LocalTaskDelegationResult> | LocalTaskDelegationResult;
+  refreshOpsFleet?(): Promise<{
+    ok: boolean;
+    configured: boolean;
+    snapshot?: StewardWorkbenchLike["opsFleet"];
+    reason?: string;
+  }>;
   proposeOpsInbox?(input: {
     title: string;
     summary?: string;
@@ -384,11 +390,12 @@ const LLM_TOOLS = [
     type: "function",
     function: {
       name: "manage_ops_fleet",
-      description: "查询跨节点舰队全局快照 (/ops) 或生成下周重点排期/派单草案写入待签批收件箱 (ops_inbox)，返回确认编号供主人在微信回复 同意 或 /ok <编号> 放行。",
+      description: "实时查询运营总控台 (/ops) 的跨节点项目最新进展（含 STATUS.md 状态卡、阶段目标、最近完成、路线图进度、在途任务、下一步与卡点）或生成排期/派单草案写入待签批收件箱。当主人询问任意项目的最新进展、状态或路线图（如 airtoken、sugent、Andy-web）时，务必优先调用此工具 action='overview' 并传入 projectQuery。",
       parameters: {
         type: "object",
         properties: {
           action: { type: "string", enum: ["overview", "propose_inbox"] },
+          projectQuery: { type: "string", description: "可选，按项目名称或关键词筛选单个项目最新进展（如 airtoken）" },
           title: { type: "string", description: "排期或派单草案标题" },
           summary: { type: "string", description: "草案具体内容与验收要点" },
           targetNodeId: { type: "string", description: "目标执行节点，默认 local-mac" },
@@ -449,7 +456,7 @@ function buildSystemPrompt(wb: StewardWorkbenchLike): string {
   return [
     "你是主人的贴身私人管家与生命幕僚（Sugent），围着主人本人生长，而不是技术控制台。",
     "表达准则：全程用自然、简练、像真人助理聊天的中文直接回应（说人话）。绝对禁止暴露任何内部实现术语或代号（如 Epoch、T0/T1/T2、L0/L1/L3、superseded、CASCADE_RUN_STATUS、tool_calls、JSON 字段名）。隐私档位统一说“私密（仅本机）/ 脱敏摘要 / 深度协同”。",
-    "项目命名与状态铁律：称呼 Antigravity 项目时一律优先用工具返回的显示名（如 Andy-web），不要拿底层仓库后缀代替；当运行状态为“进行中/running”时说明任务正在后台跑，绝不可误说成“已处理完”或“正等你点头放行”，想看具体跑到哪一步请调用 manage_antigravity(action='comprehend_session')。",
+    "项目命名与状态铁律：称呼 Antigravity 项目时一律优先用工具返回的显示名（如 Andy-web），不要拿底层仓库后缀代替；当主人询问某个项目的最新进展、状态或路线图（如“查一下 airtoken 最新进展”）时，务必优先调用 manage_ops_fleet(action='overview', projectQuery='项目名') 实时拉取 /ops 上的状态卡（阶段目标/最近完成/下一步/卡点）和路线图进度，绝不可只看本机有没有活跃会话就回答“看不到活跃会话”；当本机存在运行中会话时可再配合 manage_antigravity(action='comprehend_session') 补充现场细节。",
     "行动准则：遇到查询目标/待办/档案/来信/开发项目、读取完整本地 .md 或报告全文、记录事项、更改目标、处理来信、绑定仓或发起定制开发时，务必先调用对应工具获取真实现场数据或执行状态变更再回答，绝不靠猜或编造结果；工具返回 ok=false 时必须如实告知限制原因，绝不越权伪造成功。",
     ...(capBlock ? ["", capBlock] : []),
     "",
@@ -460,8 +467,15 @@ function buildSystemPrompt(wb: StewardWorkbenchLike): string {
     ...(wb.opsFleet?.projects?.length
       ? [
           `跨端舰队全局态势 (/ops)：${wb.opsFleet.projects
-            .slice(0, 8)
-            .map((p) => `${p.displayName || shortProj(p.projectKey)}${p.nodeId ? `[${p.nodeId}]` : ""}：${p.status || p.sanitizedSummary || "在线"}`)
+            .slice(0, 10)
+            .map((p) => {
+              const goal = p.statusCard?.stageGoal || p.executiveSummary?.goalText || "";
+              const landed = p.statusCard?.landed?.[0] || p.executiveSummary?.progressText || p.sanitizedSummary || "";
+              const rm = p.roadmapSummary?.activeNode;
+              const rmTag = rm?.code ? `[${rm.code}${rm.progress?.total ? ` ${rm.progress.done ?? 0}/${rm.progress.total}` : ""}]` : "";
+              const summary = [p.boardStatus || p.status, rmTag, goal, landed].filter(Boolean).join(" · ");
+              return `${p.displayName || shortProj(p.projectKey)}${p.nodeId ? `[${p.nodeId}]` : ""}：${summary || "在线"}`;
+            })
             .join(" | ")}`,
         ]
       : []),
@@ -841,11 +855,37 @@ export class StewardLlmAgent<TWorkbench extends StewardWorkbenchLike = StewardWo
   private async executeOpsFleetTool(args: Record<string, unknown>, wb: TWorkbench): Promise<Record<string, unknown>> {
     const act = String(args.action ?? "overview");
     if (act === "overview") {
+      const refreshed = await this.opts.toolsPort.refreshOpsFleet?.();
+      const fleet = refreshed?.snapshot ?? wb.opsFleet;
+      const allProjects = fleet?.projects ?? [];
+      const q = String(args.projectQuery ?? "").trim().toLowerCase();
+      const matched = q
+        ? allProjects.filter((pr) => {
+            const hay = `${pr.displayName ?? ""} ${shortProj(pr.projectKey)} ${pr.projectKey}`.toLowerCase();
+            return hay.includes(q) || q.includes(shortProj(pr.projectKey).toLowerCase());
+          })
+        : allProjects;
+      const list = (matched.length > 0 ? matched : allProjects).slice(0, q ? 5 : 15).map((pr) => ({
+        projectKey: pr.projectKey,
+        displayName: pr.displayName || shortProj(pr.projectKey),
+        nodes: pr.nodes ?? (pr.nodeId ? [pr.nodeId] : []),
+        boardStatus: pr.boardStatus || pr.status,
+        boardStatusReason: pr.boardStatusReason,
+        stage: pr.stage,
+        lastActiveAt: pr.lastActiveAt || pr.updatedAtIso,
+        statusCard: pr.statusCard,
+        roadmapSummary: pr.roadmapSummary,
+        executiveSummary: pr.executiveSummary,
+      }));
       return {
         ok: true,
-        projects: wb.opsFleet?.projects ?? [],
-        pendingInbox: wb.opsFleet?.pendingInbox ?? [],
-        weeklyFocus: wb.opsFleet?.weeklyFocus ?? [],
+        opsBridgeConfigured: refreshed ? refreshed.configured : Boolean(fleet),
+        ...(refreshed && !refreshed.ok && refreshed.reason ? { refreshWarning: refreshed.reason } : {}),
+        matchedCount: matched.length,
+        totalProjects: allProjects.length,
+        projects: list,
+        pendingInbox: fleet?.pendingInbox ?? [],
+        weeklyFocus: fleet?.weeklyFocus ?? [],
       };
     }
     const fn = this.opts.toolsPort.proposeOpsInbox;

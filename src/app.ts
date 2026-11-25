@@ -690,6 +690,10 @@ export class App {
         await this.opsBridge.pushPulse(localPulses);
       }
     } else {
+      const fleet = await this.opsBridge.fetchFleetSnapshot();
+      if (fleet.ok && fleet.snapshot) {
+        this.stewardService.setRemoteOpsSnapshot(fleet.snapshot);
+      }
       await this.opsBridge.pushPulse(localPulses);
     }
     await this.pullAndExecuteOpsCommands();
@@ -1270,6 +1274,11 @@ export class App {
     this.modelPoolSyncTimer.unref();
     const enablePulse = this.opts.enableStewardPulseTimer ?? (!process.env.VITEST && !this.opts.noWeb);
     if (enablePulse) {
+      if (this.opsBridge.isConfigured()) {
+        setTimeout(() => {
+          void this.syncOpsBridgeTick().catch((e) => log.warn("initial ops bridge sync failed", { message: (e as Error).message }));
+        }, 2000).unref();
+      }
       const pulseMs = Math.max(5_000, this.opts.stewardPulseIntervalMs ?? 15 * 60_000);
       this.stewardPulseTimer = setInterval(() => {
         void this.runStewardPulseTick().catch((e) => log.warn("steward pulse tick failed", { message: (e as Error).message }));

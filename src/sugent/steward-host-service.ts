@@ -602,6 +602,7 @@ export class SugentStewardHostService {
         syncModelPool: (o) => this.syncModelPool(o),
         updateRoutingPolicy: (patch) => this.updateRoutingPolicy(patch),
         manageHotUpdate: (input) => this.executeHotUpdateAction(input),
+        refreshOpsFleet: () => this.refreshRemoteOpsSnapshot(),
         proposeOpsInbox: (input) => this.proposeOpsInbox(input),
         ...(opts.delegateLocalTask ? { delegateLocalTask: opts.delegateLocalTask } : {}),
         ...(opts.conciergeBridge ? { executeConciergeCommand: (cmd, ch) => opts.conciergeBridge!.executeOwnerCommand(cmd, ch) } : {}),
@@ -1624,6 +1625,24 @@ export class SugentStewardHostService {
 
   getRemoteOpsSnapshot(): OpsStewardPendingSnapshot | undefined {
     return this.remoteOpsSnapshot;
+  }
+
+  async refreshRemoteOpsSnapshot(): Promise<{
+    ok: boolean;
+    configured: boolean;
+    snapshot?: OpsStewardPendingSnapshot;
+    reason?: string;
+  }> {
+    const bridge = this.opts.opsBridge;
+    if (!bridge || !bridge.isConfigured()) {
+      return { ok: false, configured: false, snapshot: this.remoteOpsSnapshot, reason: "OPS_BRIDGE_UNCONFIGURED" };
+    }
+    const res = await bridge.fetchFleetSnapshot();
+    if (res.ok && res.snapshot) {
+      this.setRemoteOpsSnapshot(res.snapshot);
+      return { ok: true, configured: true, snapshot: res.snapshot };
+    }
+    return { ok: false, configured: true, snapshot: this.remoteOpsSnapshot, ...(res.reason ? { reason: res.reason } : {}) };
   }
 
   stageOpsInboxProposal(item: OpsInboxItem): void {
