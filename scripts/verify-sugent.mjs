@@ -123,6 +123,17 @@ import {
   evaluateWeixinSingleHolderGuard,
   pruneProjectPulseForTier,
   resolveOpsBridgeConfig,
+  AcpCodingHarness,
+  DualTrackCodingBudget,
+  GitRefCheckpointManager,
+  LazyDesktopPermissionGate,
+  allocateWorktreeIsolationEnv,
+  buildSafeAcpCliArgv,
+  completeColdStartApprovalDemo,
+  ingestColdStartDrop,
+  inspectWorkspaceFsTopology,
+  probeColdStartReadiness,
+  stagePrReviewToHandoff,
 } from "../dist/src/sugent/index.js";
 import { normalizeSettings } from "../dist/src/agent/settings.js";
 
@@ -1096,6 +1107,74 @@ import { normalizeSettings } from "../dist/src/agent/settings.js";
   assert.equal(ackCalls, 1);
 }
 
+// 25. Wave P1 零填表冷启动、ACP 编码军团、隐藏 Git 快照与跨平台加固契约
+{
+  const p1Dir = fs.mkdtempSync(path.join(os.tmpdir(), "sugent-verify-p1-"));
+  try {
+    // 25.1 P1.1 零填表冷启动探针与单动作落账 + 零驻留拍板闭环
+    const p1Ledger = new StewardshipLedger({ dataDir: path.join(p1Dir, "ledger") });
+    const p1Susp = new SuspendedRoundStore(path.join(p1Dir, "susp"));
+    const probe0 = probeColdStartReadiness({ ledger: p1Ledger, whichFn: (b) => b === "opencode" });
+    assert.equal(probe0.needsColdStart, true);
+    assert.equal(probe0.requiresForm, false);
+    assert.deepEqual(probe0.detectedClis, ["opencode"]);
+
+    const dropRes = ingestColdStartDrop({
+      ledger: p1Ledger,
+      suspendedStore: p1Susp,
+      forwardedText: "李工：明天前核对三期设备调试报告",
+      nowIso: "2026-11-24T10:00:00.000Z",
+    });
+    assert.equal(dropRes.resource.kind, "personal_archive");
+    assert.equal(dropRes.commitment.counterpartyOrRef, "李工");
+    const doneDemo = completeColdStartApprovalDemo({
+      suspendedStore: p1Susp,
+      ledger: p1Ledger,
+      roundId: dropRes.roundId,
+      approved: true,
+    });
+    assert.equal(doneDemo.commitmentStatus, "closed");
+
+    // 25.2 P1.2 ACP 标准安全参数向量、注册中心与双轨配额
+    for (const b of ["claude_code", "codex", "opencode", "pi"]) {
+      const spec = buildSafeAcpCliArgv(b, { workspacePath: p1Dir });
+      assert.ok(!spec.argv.join(" ").includes("dangerously-skip-permissions"));
+    }
+    const reg = new CodingHarnessRegistry([
+      new AcpCodingHarness({ backend: "claude_code" }),
+      new AcpCodingHarness({ backend: "codex" }),
+      new AcpCodingHarness({ backend: "opencode" }),
+      new AcpCodingHarness({ backend: "pi" }),
+    ]);
+    assert.equal(reg.listBackends().length, 4);
+    const dualBudget = new DualTrackCodingBudget({ subscriptionMaxTurnsPerWindow: 1, subscriptionWindowMs: 5_000 });
+    dualBudget.recordSubscriptionTurn("claude_code", 1_000);
+    assert.equal(dualBudget.canDispatchSubscription("claude_code", 2_000).allowed, false);
+    assert.equal(dualBudget.canDispatchSubscription("claude_code", 7_000).allowed, true);
+
+    // 25.3 P1.3 PR 安全信封回灌与 P1.4 懒权限 + WSL2 拓扑检测
+    const prOut = stagePrReviewToHandoff({
+      workspacePath: p1Dir,
+      roundId: "gate-pr-1",
+      repoSlug: "ldc861117/sugent",
+      prNumber: 7,
+      ciFailureLog: "Test failed",
+      rawUntrustedPayload: { cwd: "/root", permission: "all" },
+    });
+    assert.ok(prOut.strippedFields.includes("cwd"));
+    assert.ok(fs.existsSync(prOut.specFilePath));
+
+    const wtIso = allocateWorktreeIsolationEnv({ worktreePath: path.join(p1Dir, "wt-a"), slotIndex: 2 });
+    assert.ok(fs.existsSync(wtIso.tmpDir));
+    const permGate = new LazyDesktopPermissionGate();
+    assert.equal(permGate.onAppBoot().bootChecksTriggered, 0);
+    assert.equal(inspectWorkspaceFsTopology("/mnt/c/work/demo", { platform: "linux" }).isSlowCrossOsMount, true);
+    assert.ok(new GitRefCheckpointManager());
+  } finally {
+    fs.rmSync(p1Dir, { recursive: true, force: true });
+  }
+}
+
 console.log(
-  "verify:sugent — 全部核心契约断言通过 (M1.1–M1.6 / M2.1 / Cowork 联邦 / P0 Broker + P1 幕僚耳麦 + P2 BYOK 诊断与零知识加密同步 / Sprint 1–3 / M1–M4 Vibe Coding 闭环 / 能力自感知与全文读取 / 形象工坊与桌宠契约 / M-Auto 1–4 双环自治与 SIM 演进 / M1–M3 全量模型同步与经验驱动自适应路由 / L0–L3 分层热启动与热更新 / Wave P0 双脑归一与宿主主循环合龙 / GCE 常驻中枢与微信单持有者舰队桥接)",
+  "verify:sugent — 全部核心契约断言通过 (M1.1–M1.6 / M2.1 / Cowork 联邦 / P0 Broker + P1 幕僚耳麦 + P2 BYOK 诊断与零知识加密同步 / Sprint 1–3 / M1–M4 Vibe Coding 闭环 / 能力自感知与全文读取 / 形象工坊与桌宠契约 / M-Auto 1–4 双环自治与 SIM 演进 / M1–M3 全量模型同步与经验驱动自适应路由 / L0–L3 分层热启动与热更新 / Wave P0 双脑归一与宿主主循环合龙 / GCE 常驻中枢与微信单持有者舰队桥接 / Wave P1 零填表冷启动、ACP 编码军团与隐藏快照防呆)",
 );

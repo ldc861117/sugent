@@ -59,3 +59,7 @@ export * from "./hot-reload-bus.js";
 export * from "./hot-core-supervisor.js";
 export * from "./owner-channel-steward-router.js";
 export * from "./ops-bridge-client.js";
+export * from "./cold-start-onboarding.js";
+export * from "./acp-coding-harness.js";
+export * from "./git-checkpoint-and-pr-feed.js";
+export * from "./worktree-and-platform-guard.js";

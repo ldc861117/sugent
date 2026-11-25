@@ -6,8 +6,14 @@ import { canonicalizeProjectKey } from "./antigravity-bridge.js";
 import type { AntigravityDispatcher, DispatchOutcome } from "./antigravity-dispatcher.js";
 import { assertSafeDeliveryCommandVector } from "./delivery.js";
 import { discoverLocalSourceRepo } from "./self-evolution.js";
+import {
+  allocateWorktreeIsolationEnv,
+  linkZeroBloatDependencies,
+  type WorktreeIsolationEnv,
+  type ZeroBloatLinkStrategy,
+} from "./worktree-and-platform-guard.js";
 
-export type CodingBackendKind = "antigravity" | "claude_code" | "codex";
+export type CodingBackendKind = "antigravity" | "claude_code" | "codex" | "opencode" | "pi";
 export type RepoRestartMode = "none" | "extension_hotplug" | "process_reload" | "blue_green_app";
 
 export interface RepoBindingRecord {
@@ -228,6 +234,8 @@ export interface PreparedWorkspaceResult {
   branchName?: string;
   baseHeadSha?: string;
   isolatedWorktree: boolean;
+  isolationEnv?: WorktreeIsolationEnv;
+  dependencyLinkStrategy?: ZeroBloatLinkStrategy;
 }
 export class GitWorktreeManager {
   async prepareWorktree(input: {
@@ -273,7 +281,17 @@ export class GitWorktreeManager {
       throw new Error(`创建隔离 Git Worktree 失败: ${addRes.stderr || addRes.stdout}`);
     }
     ensureGitExcludeEntry(worktreePath);
-    return { worktreePath, branchName, baseHeadSha, isolatedWorktree: true };
+    ensureGitExcludeEntry(worktreePath, ".sugent-tmp/");
+    const iso = allocateWorktreeIsolationEnv({ worktreePath });
+    const depLink = await linkZeroBloatDependencies({ sourceRepoRoot: repoRoot, worktreePath });
+    return {
+      worktreePath,
+      branchName,
+      baseHeadSha,
+      isolatedWorktree: true,
+      isolationEnv: iso.env,
+      dependencyLinkStrategy: depLink.strategy,
+    };
   }
 
   async cleanupWorktree(input: { repoRoot: string; worktreePath: string }): Promise<boolean> {

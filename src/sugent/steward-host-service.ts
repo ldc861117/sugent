@@ -79,8 +79,12 @@ import {
   type DropzoneOutcome,
 } from "./universal-dropzone.js";
 import { HandoffFileBridge, type InboundAttachmentInput, type VibeIngressChannel } from "./handoff-file-bridge.js";
+import { AcpCodingHarness, DualTrackCodingBudget } from "./acp-coding-harness.js";
+import { completeColdStartApprovalDemo, ingestColdStartDrop, probeColdStartReadiness, type ColdStartReadinessReport } from "./cold-start-onboarding.js";
+import { GitRefCheckpointManager } from "./git-checkpoint-and-pr-feed.js";
 import { AntigravityCodingHarness, CodingHarnessRegistry, RepoBindingRegistry, type RepoBindingRecord, type UpsertRepoBindingInput } from "./repo-binding.js";
 import { SafeRelaunchCoordinator, writeBootHealthyStamp, type PostBootNotice } from "./safe-relauncher.js";
+import { LazyDesktopPermissionGate } from "./worktree-and-platform-guard.js";
 import { SugentSIMStore } from "./self-improvement-memory.js";
 import { VibeCodingPipelineOrchestrator, type CommandExecPort, type VibeNotificationEvent, type VibePipelineRecord } from "./vibe-coding-pipeline.js";
 import { SugentAvatarStudio } from "./avatar-studio.js";
@@ -372,6 +376,9 @@ export class SugentStewardHostService {
   readonly fileBridge: HandoffFileBridge;
   readonly relauncher: SafeRelaunchCoordinator;
   readonly codingHarnesses: CodingHarnessRegistry;
+  readonly dualTrackCodingBudget: DualTrackCodingBudget;
+  readonly gitCheckpoints: GitRefCheckpointManager;
+  readonly desktopPermissions: LazyDesktopPermissionGate;
   readonly vibePipeline: VibeCodingPipelineOrchestrator;
   readonly capabilityAwareness: CapabilityAwarenessEngine;
   readonly authorizedFiles: AuthorizedFileReader;
@@ -472,7 +479,17 @@ export class SugentStewardHostService {
     this.repoBindings = new RepoBindingRegistry({ dataDir: opts.dataDir, nowIso: this.nowIsoFn });
     this.fileBridge = new HandoffFileBridge({ dataDir: opts.dataDir, ledger: this.ledger });
     this.relauncher = new SafeRelaunchCoordinator({ dataDir: opts.dataDir, requestGracefulQuit: opts.requestRelaunchQuit });
-    this.codingHarnesses = new CodingHarnessRegistry([new AntigravityCodingHarness(this.dispatcher)]);
+    this.dualTrackCodingBudget = new DualTrackCodingBudget();
+    this.gitCheckpoints = new GitRefCheckpointManager();
+    this.desktopPermissions = new LazyDesktopPermissionGate();
+    this.desktopPermissions.onAppBoot();
+    this.codingHarnesses = new CodingHarnessRegistry([
+      new AntigravityCodingHarness(this.dispatcher),
+      new AcpCodingHarness({ backend: "claude_code" }),
+      new AcpCodingHarness({ backend: "codex" }),
+      new AcpCodingHarness({ backend: "opencode" }),
+      new AcpCodingHarness({ backend: "pi" }),
+    ]);
     this.vibePipeline = new VibeCodingPipelineOrchestrator({
       dataDir: opts.dataDir,
       bindings: this.repoBindings,
@@ -1770,5 +1787,33 @@ export class SugentStewardHostService {
       handled: true,
       reply: `已签批「${target.title}」（${target.id}），指令已写入队列并下发至节点 ${cmd.targetNodeId}。`,
     };
+  }
+
+  getColdStartStatus(): ColdStartReadinessReport {
+    return probeColdStartReadiness({
+      ledger: this.ledger,
+      hasLiveLlm: this.hasLiveLlmEndpoint(),
+    });
+  }
+
+  ingestColdStart(input: { folderPath?: string; forwardedText?: string; partition?: ContextPartition }) {
+    return ingestColdStartDrop({
+      ledger: this.ledger,
+      suspendedStore: this.suspendedStore,
+      ...(input.folderPath ? { folderPath: input.folderPath } : {}),
+      ...(input.forwardedText ? { forwardedText: input.forwardedText } : {}),
+      ...(input.partition ? { partition: input.partition } : {}),
+      nowIso: this.nowIsoFn(),
+    });
+  }
+
+  completeColdStartDemo(roundId: string, approved: boolean) {
+    return completeColdStartApprovalDemo({
+      suspendedStore: this.suspendedStore,
+      ledger: this.ledger,
+      roundId,
+      approved,
+      nowIso: this.nowIsoFn(),
+    });
   }
 }
