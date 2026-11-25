@@ -34,3 +34,11 @@
      2. **合规与分发（Distribution & ToS Risk）**：它能否顺利通过 macOS 公证 / Windows 签名 / 企业安全审计？是否包含硬编码客户端密钥或第三方平台封禁隐患？
      3. **离线退路（Sovereignty Fallback）**：剥离云端账号后，单机 BYOK 核心闭环是否依然完整自洽？
      4. **一人公司运维杠杆（OPC Ops Leverage）**：是否符合“无状态边缘服务 + 端侧重逻辑”原则，确保单人架构师与 Agent 团队的日常运维负担趋近于零？
+
+
+## 5. 状态卡与规划文档落盘规范（Antigravity & Gemini App Task 模式通用）
+
+当通过本地文件夹挂载（如 Gemini App `Task` 模式 Connected Folders 或 Antigravity）推进本仓时，必须遵守以下文件闭环规则：
+1. **开工必读**：动手前先读根目录 `STATUS.md`（若存在）与 `docs/ROADMAP.md`，对齐当前阶段目标与红线，不脱离现有路线另起炉灶。
+2. **过程落盘**：调研与实施方案统一写入 `docs/plans/YYYY-MM-DD-<topic>.md`；关键架构取舍或避坑结论追加至 `docs/decisions/steward-notes.md`；完成既定里程碑子项时同步勾选 `docs/ROADMAP.md`。
+3. **收工必更 `STATUS.md`**：每完成一轮关键规划/实施交付或用户说“收工”时，直接新建或更新仓库根目录 `STATUS.md`（YAML frontmatter 置 `status_version: 1`、`project: sugent`、`review_state: pending_review`、`updated_by: gemini-task@local-mac` 或 `agent@<node_id>`、`updated_at: <ISO时间>`，`confirmed_by`/`confirmed_at` 留空；正文包含 `## 阶段目标` ≤30字不写项目介绍、`## 最近完成`、`## 在途`、`## 下一步`、`## 卡点` 五节）。严禁自行置 `confirmed`，严禁触碰 `.env` 密钥或未经确认擅自 `git push`。
