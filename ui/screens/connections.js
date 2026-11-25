@@ -501,7 +501,7 @@ function ChannelSheet({ conn, bots, channel, accountKey, onClose }) {
         <input class="field" maxlength="80" value=${label} onInput=${(e) => setLabel(e.target.value)} onBlur=${() => label.trim() !== account.label && put({ label: label.trim() })} />
       </label>
       <div class="set-field"><span class="k">${t("settings.connections.defaultBot")}</span>
-        <${MenuButton} label=${t("settings.connections.defaultBot")} value=${account.defaultBot} width=${260} options=${(bots || []).map((b) => [b.id, b.name])} onChange=${(v) => put({ defaultBot: v })} />
+        <${MenuButton} label=${t("settings.connections.defaultBot")} value=${account.defaultBot} width=${260} align="left" options=${(bots || []).map((b) => [b.id, b.name])} onChange=${(v) => put({ defaultBot: v })} />
         <p class="hint">${t("settings.connections.defaultBotHint")}</p>
       </div>`}
     ${key && st && (channel === "weixin"

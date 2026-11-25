@@ -310,7 +310,7 @@ async function probeSingleTarget(
     primaryEndpoint = `${base}/models/${encodeURIComponent(target.modelId)}`;
   } else if (
     target.probeCapabilities &&
-    (target.providerId === "openai" ||
+    ((target.providerId === "openai" && /(^|\/\/|\.)api\.openai\.com(\/|$)/i.test(base)) ||
       target.providerId === "cowork" ||
       target.providerId === "gemini-web2api")
   ) {

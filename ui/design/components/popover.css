@@ -19,7 +19,7 @@
 .pop {
   --pop-r: var(--r-xl);
   --pop-pad: var(--space-1);
-  position: fixed; z-index: var(--z-popover); width: 280px; max-height: 360px;
+  position: fixed; z-index: calc(var(--z-modal) + 4); width: 280px; max-height: 360px;
   display: flex; flex-direction: column;
   background: var(--grain), var(--glass-pop); backdrop-filter: var(--glass-filter-lg);
   border-radius: var(--pop-r); box-shadow: var(--shadow-pop); overflow: hidden;

@@ -10,6 +10,7 @@ import {
   type ByokProbeTarget,
   type FetchLike,
 } from "../src/sugent/byok-diagnostics.js";
+import { matchesMagpieSavedField } from "../src/magpie/supervisor.js";
 
 const HTTP_PROTO = ["http", "://"].join("");
 const HTTPS_PROTO = ["https", "://"].join("");
@@ -120,6 +121,54 @@ describe("P2 BYOK Connectivity Diagnostics & Four-Role Monthly Cost Sandbox", ()
     expect(sim.budgetHealth.monthlyCapUsd).toBe(120);
     expect(sim.budgetHealth.currentMonthSpentUsd).toBe(18.5);
     expect(sim.budgetHealth.projectedExceedsCap).toBe(false);
+  });
+
+  it("verifies Magpie Go omitempty read-back fields, non-OpenAI gateway diagnostics, and modal Popover portal", async () => {
+    expect(matchesMagpieSavedField(undefined, "")).toBe(true);
+    expect(matchesMagpieSavedField(undefined, {})).toBe(true);
+    expect(matchesMagpieSavedField(undefined, [])).toBe(true);
+    expect(matchesMagpieSavedField(`${HTTPS_PROTO}ai.metamirror.club/v1`, `${HTTPS_PROTO}ai.metamirror.club/v1/`)).toBe(true);
+    expect(matchesMagpieSavedField(["m1", "m2"], ["m1", " m2 ", "m1"])).toBe(true);
+    expect(matchesMagpieSavedField("wrong-key", "clikey-expected")).toBe(false);
+
+    const calledUrls: string[] = [];
+    const proxyReport = await runByokDiagnostics(
+      [
+        {
+          providerId: "openai",
+          role: "executor",
+          baseUrl: `${HTTPS_PROTO}ai.metamirror.club/v1`,
+          apiKey: "clikey-demo",
+          modelId: "gemini-4-hydrogen-xhigh",
+          probeCapabilities: true,
+        },
+      ],
+      {
+        fetchImpl: async (url) => {
+          const u = String(url);
+          calledUrls.push(u);
+          if (u.endsWith("/v1/models")) {
+            return Response.json({ data: [{ id: "gemini-4-hydrogen-xhigh" }] });
+          }
+          if (u.endsWith("/v1/chat/completions")) {
+            return Response.json({
+              choices: [{ message: { tool_calls: [{ id: "tc1", function: { name: "ping_probe" } }] } }],
+            });
+          }
+          return new Response("Not Found", { status: 404 });
+        },
+      },
+    );
+    expect(calledUrls.some((u) => u.endsWith("/responses"))).toBe(false);
+    expect(proxyReport.results[0]?.status).toBe("healthy");
+    expect(proxyReport.results[0]?.capabilities.toolCalling).toBe(true);
+
+    const repoRoot = path.resolve(import.meta.dirname, "..");
+    const uiJs = fs.readFileSync(path.join(repoRoot, "ui/components/ui.js"), "utf8");
+    const popCss = fs.readFileSync(path.join(repoRoot, "ui/design/components/popover.css"), "utf8");
+    expect(uiJs).toContain("host.dataset.popPortal");
+    expect(uiJs).toContain("document.body.appendChild(host)");
+    expect(popCss).toContain("calc(var(--z-modal) + 4)");
   });
 });
 

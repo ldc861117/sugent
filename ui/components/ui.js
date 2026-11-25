@@ -1,6 +1,6 @@
 // 共用组件：图标、按钮、分段控件、弹出菜单、确认框、提示胶囊、复制按钮、骨架。
 // 样式在 ui/design/components/*.css；这里的组件只是给常用组合一个带逻辑的写法，直接写 class 也可以。
-import { h } from "preact";
+import { h, render } from "preact";
 import { useEffect, useLayoutEffect, useRef, useState, useCallback } from "preact/hooks";
 import htm from "htm";
 import { useStore, toasts, dismissToast, dialog } from "../lib/store.js";
@@ -321,29 +321,53 @@ export function usePopPosition(anchor, open, { width = 280, prefer = "down", ali
     };
     compute();
     window.addEventListener("resize", compute);
-    return () => window.removeEventListener("resize", compute);
+    window.addEventListener("scroll", compute, true);
+    return () => {
+      window.removeEventListener("resize", compute);
+      window.removeEventListener("scroll", compute, true);
+    };
   }, [open, anchor]);
   return pos;
 }
 
 export function Popover({ anchor, onClose, class: cls = "", width = 280, prefer, align, maxHeight, children, label, keepFocus }) {
   const ref = useRef(null);
+  const hostRef = useRef(null);
   const anchorRef = useRef(anchor && anchor.nodeType ? anchor : null);
   anchorRef.current = anchor && anchor.nodeType ? anchor : null;
   const pos = usePopPosition(anchor, true, { width, prefer, align, maxHeight });
   useDismiss(ref, onClose, true, anchorRef);
+  useLayoutEffect(() => {
+    const host = document.createElement("div");
+    host.dataset.popPortal = "";
+    document.body.appendChild(host);
+    hostRef.current = host;
+    return () => {
+      render(null, host);
+      host.remove();
+      hostRef.current = null;
+    };
+  }, []);
+  useLayoutEffect(() => {
+    const host = hostRef.current;
+    if (!host) return;
+    if (!pos) {
+      render(null, host);
+      return;
+    }
+    const style = { left: pos.left + "px", width: width + "px", "--ox": pos.ox + "px", maxHeight: pos.max + "px", ...(pos.up ? { bottom: pos.bottom + "px" } : { top: pos.top + "px" }) };
+    render(html`<div class=${`pop ${cls}${pos.up ? " up" : ""}`} ref=${ref} style=${style} role="dialog" aria-label=${label}>${children}</div>`, host);
+  });
   useEffect(() => {
-    if (keepFocus) return;
+    if (keepFocus || !pos) return;
     const prev = document.activeElement;
     requestAnimationFrame(() => {
       const target = ref.current?.querySelector("input, [role=option], [role=menuitem], button");
       target?.focus?.();
     });
     return () => prev?.focus?.({ preventScroll: true });
-  }, []);
-  if (!pos) return null;
-  const style = { left: pos.left + "px", width: width + "px", "--ox": pos.ox + "px", maxHeight: pos.max + "px", ...(pos.up ? { bottom: pos.bottom + "px" } : { top: pos.top + "px" }) };
-  return html`<div class=${`pop ${cls}${pos.up ? " up" : ""}`} ref=${ref} style=${style} role="dialog" aria-label=${label}>${children}</div>`;
+  }, [!!pos]);
+  return null;
 }
 
 /**
@@ -392,7 +416,7 @@ export function Menu({ anchor, items, onClose, width = 240, prefer, align, label
 }
 
 /** 行右侧的菜单按钮（magpie .proto.pick） */
-export function MenuButton({ value, options, onChange, disabled, label, width = 260 }) {
+export function MenuButton({ value, options, onChange, disabled, label, width = 260, align = "right" }) {
   const [open, setOpen] = useState(false);
   const ref = useRef(null);
   const cur = options.find((o) => o[0] === value);
@@ -400,7 +424,7 @@ export function MenuButton({ value, options, onChange, disabled, label, width = 
       onClick=${() => setOpen((v) => !v)}>
       <span class="v">${cur ? cur[1] : value || "—"}</span><${Icon} name="chevDown" />
     </button>
-    ${open && html`<${Menu} anchor=${ref.current} width=${width} align="right" label=${label} onClose=${() => setOpen(false)}
+    ${open && html`<${Menu} anchor=${ref.current} width=${width} align=${align} label=${label} onClose=${() => setOpen(false)}
       items=${options.map(([v, text, note]) => ({ label: text, note, cur: v === value, onSelect: () => v !== value && onChange(v) }))} />`}`;
 }
 
@@ -449,6 +473,7 @@ export function Sheet({ title, onClose, children, wide, label, leaving }) {
     requestAnimationFrame(() => (ref.current?.querySelector("[data-autofocus]") || ref.current?.querySelector("button, input, textarea"))?.focus());
     const key = (e) => {
       if (e.key === "Escape") {
+        if (document.querySelector(".pop")) return;
         e.stopPropagation();
         onClose();
       }

@@ -90,6 +90,27 @@ function genKey(): string {
   return crypto.randomBytes(24).toString("base64url");
 }
 
+/**
+ * Compares a field read back from Magpie's `providers.json` against the patch sent
+ * to `/api/provider/save`, accounting for Go `omitempty` omissions (`""`, `{}`, `[]`),
+ * trailing-slash URL normalization, and trimmed/deduplicated model lists.
+ */
+export function matchesMagpieSavedField(actual: unknown, expected: unknown): boolean {
+  if (expected === undefined) return true;
+  if (typeof expected === "string") {
+    const norm = (s: string) => s.trim().replace(/\/+$/, "");
+    return norm(String(actual ?? "")) === norm(expected);
+  }
+  if (Array.isArray(expected)) {
+    const clean = (arr: unknown[]) => [...new Set(arr.map((x) => String(x).trim()).filter(Boolean))];
+    return JSON.stringify(clean(Array.isArray(actual) ? actual : [])) === JSON.stringify(clean(expected));
+  }
+  if (expected !== null && typeof expected === "object") {
+    return JSON.stringify(actual ?? {}) === JSON.stringify(expected);
+  }
+  return (actual ?? false) === expected;
+}
+
 export class MagpieSupervisor {
   state: MagpieState = "stopped";
   lastError = "";
@@ -586,7 +607,9 @@ export class MagpieSupervisor {
     });
     if (!res.ok) throw new Error(t("magpie.save_failed", { status: res.status, body: (await res.text()).slice(0, 200) }));
     const saved = this.readProviderRaw(id);
-    for (const [k, v] of Object.entries(patch)) if (JSON.stringify(saved?.[k] ?? {}) !== JSON.stringify(v ?? {})) throw new Error(t("magpie.verify_failed"));
+    for (const [k, v] of Object.entries(patch)) {
+      if (!matchesMagpieSavedField(saved?.[k], v)) throw new Error(t("magpie.verify_failed"));
+    }
   }
 
   private readProviderRaw(id: string): Record<string, unknown> | undefined {
