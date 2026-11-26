@@ -12,13 +12,15 @@
   <array>
     <string>/bin/sh</string>
     <string>-c</string>
-    <string>set -eu; if [ -f "$HOME/.config/sugent/edge.env" ]; then set -a; . "$HOME/.config/sugent/edge.env"; set +a; fi; if [ -f "__SUGENT_REPO_DIR__/dist/src/cli/edge-tentacle.js" ]; then exec "__NODE_BIN__" "__SUGENT_REPO_DIR__/dist/src/cli/edge-tentacle.js" --env-file "$HOME/.config/sugent/edge.env"; elif [ -x "__SUGENT_REPO_DIR__/node_modules/.bin/tsx" ]; then exec "__SUGENT_REPO_DIR__/node_modules/.bin/tsx" "__SUGENT_REPO_DIR__/src/cli/edge-tentacle.ts" --env-file "$HOME/.config/sugent/edge.env"; else exec "__NODE_BIN__" "__SUGENT_REPO_DIR__/src/cli/edge-tentacle.ts" --env-file "$HOME/.config/sugent/edge.env"; fi</string>
+    <string>set -eu; if [ -f "$HOME/.config/sugent/edge.env" ]; then set -a; . "$HOME/.config/sugent/edge.env"; set +a; fi; if [ -f "__SUGENT_REPO_DIR__/dist/src/cli/edge-tentacle.js" ]; then exec "__NODE_BIN__" --no-warnings "__SUGENT_REPO_DIR__/dist/src/cli/edge-tentacle.js" --env-file "$HOME/.config/sugent/edge.env"; elif [ -x "__SUGENT_REPO_DIR__/node_modules/.bin/tsx" ]; then exec "__SUGENT_REPO_DIR__/node_modules/.bin/tsx" "__SUGENT_REPO_DIR__/src/cli/edge-tentacle.ts" --env-file "$HOME/.config/sugent/edge.env"; else exec "__NODE_BIN__" --no-warnings "__SUGENT_REPO_DIR__/src/cli/edge-tentacle.ts" --env-file "$HOME/.config/sugent/edge.env"; fi</string>
   </array>
 
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
     <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>NODE_USE_ENV_PROXY</key>
+    <string>1</string>
     <key>SUGENT_HUB_URL</key>
     <string>__SUGENT_HUB_URL__</string>
     <key>SUGENT_NODE_ID</key>

@@ -1704,6 +1704,21 @@ export class SugentStewardHostService {
     }
     if (!hasEdge) return this.remoteOpsSnapshot;
 
+    const laneRank: Record<string, number> = {
+      blocked: 1,
+      active_executing: 2,
+      pending_review: 3,
+      monitoring: 4,
+      planned_ready: 5,
+      idle_untracked: 6,
+    };
+    const stageRank: Record<string, number> = {
+      focus: 1,
+      autopilot: 2,
+      incubating: 3,
+      archived: 4,
+    };
+
     const byKey = new Map<string, OpsStewardPendingSnapshot["projects"][number]>();
     for (const p of this.remoteOpsSnapshot.projects) {
       if (p?.projectKey) byKey.set(p.projectKey, p);
@@ -1715,22 +1730,52 @@ export class SugentStewardHostService {
         byKey.set(ep.projectKey, ep);
         continue;
       }
-      const combinedNodes = Array.from(new Set([...(prev.nodes ?? (prev.nodeId ? [prev.nodeId] : [])), ...(ep.nodes ?? (ep.nodeId ? [ep.nodeId] : []))]));
+      const combinedNodes = Array.from(
+        new Set([...(prev.nodes ?? (prev.nodeId ? [prev.nodeId] : [])), ...(ep.nodes ?? (ep.nodeId ? [ep.nodeId] : []))]),
+      );
+      const keepUserDomain = prev.domainSource === "user_override" && Boolean(prev.domain);
+      const keepUserStage = prev.stageSource === "user_override" && Boolean(prev.stage);
+      const keepUserBoard = prev.boardStatusSource === "user_override" && Boolean(prev.boardStatus);
+      const isRunning = ep.status === "running" || prev.status === "running";
       byKey.set(ep.projectKey, {
         ...prev,
         ...ep,
         nodes: combinedNodes,
+        status: isRunning ? "running" : (ep.status ?? prev.status),
+        ...(keepUserDomain ? { domain: prev.domain, domainSource: "user_override" } : {}),
+        ...(keepUserStage ? { stage: prev.stage, stageSource: "user_override" } : {}),
+        ...(keepUserBoard
+          ? { boardStatus: prev.boardStatus, boardStatusReason: prev.boardStatusReason, boardStatusSource: "user_override" }
+          : isRunning && ep.boardStatus !== "blocked" && prev.boardStatus !== "blocked"
+            ? { boardStatus: "active_executing", boardStatusReason: "当前存在活跃运行中的会话" }
+            : {}),
         statusCard: ep.statusCard ?? prev.statusCard,
         roadmapSummary: ep.roadmapSummary ?? prev.roadmapSummary,
         executiveSummary: ep.executiveSummary ?? prev.executiveSummary,
       });
     }
+    const mergedProjects = Array.from(byKey.values()).sort((a, b) => {
+      const runDiff = Number(b.status === "running") - Number(a.status === "running");
+      if (runDiff !== 0) return runDiff;
+      const lDiff = (laneRank[a.boardStatus ?? "idle_untracked"] ?? 6) - (laneRank[b.boardStatus ?? "idle_untracked"] ?? 6);
+      if (lDiff !== 0) return lDiff;
+      const sDiff = (stageRank[a.stage ?? "incubating"] ?? 3) - (stageRank[b.stage ?? "incubating"] ?? 3);
+      if (sDiff !== 0) return sDiff;
+      const msA = Date.parse(a.lastActiveAt ?? a.updatedAtIso ?? "") || 0;
+      const msB = Date.parse(b.lastActiveAt ?? b.updatedAtIso ?? "") || 0;
+      return msB - msA;
+    });
     return {
       fetchedAtIso: edgeSnap.fetchedAtIso ?? this.remoteOpsSnapshot.fetchedAtIso,
-      projects: Array.from(byKey.values()),
-      pendingInbox: this.remoteOpsSnapshot.pendingInbox.length > 0 ? this.remoteOpsSnapshot.pendingInbox : Array.from(this.stagedOpsInbox.values()),
+      projects: mergedProjects,
+      pendingInbox:
+        this.remoteOpsSnapshot.pendingInbox.length > 0
+          ? this.remoteOpsSnapshot.pendingInbox
+          : Array.from(this.stagedOpsInbox.values()),
       ...(this.remoteOpsSnapshot.weeklyFocus ? { weeklyFocus: this.remoteOpsSnapshot.weeklyFocus } : {}),
-      ...(edgeSnap.stageGoals ?? this.remoteOpsSnapshot.stageGoals ? { stageGoals: edgeSnap.stageGoals ?? this.remoteOpsSnapshot.stageGoals } : {}),
+      ...(edgeSnap.stageGoals ?? this.remoteOpsSnapshot.stageGoals
+        ? { stageGoals: edgeSnap.stageGoals ?? this.remoteOpsSnapshot.stageGoals }
+        : {}),
     };
   }
 

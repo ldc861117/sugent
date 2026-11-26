@@ -21,6 +21,9 @@ export type EdgeCommandStatus = "pending" | "accepted" | "completed" | "failed";
 
 export interface EdgeSessionPulseInput {
   projectKey: string;
+  workspaceRoot?: string;
+  workspaceUris?: readonly string[];
+  surface?: string;
   conversationId: string;
   title: string;
   isRunning: boolean;
@@ -61,12 +64,17 @@ export interface ParsedRepoRoadmap {
     title: string;
     status: string;
     progress: { done: number; total: number; pct: number };
+    inProgressCount?: number;
+    todoCount?: number;
+    blockedCount?: number;
+    hasExitGate?: boolean;
   };
   totals: { done: number; total: number; pct: number };
 }
 
 export interface ScanLocalProjectsForEdgeOptions {
   projectsRootDirs: readonly string[];
+  homeDir?: string;
   nodeId: string;
   defaultTier?: EdgePrivacyTier;
   resolveTier?: (projectKey: string, repoPath: string) => EdgePrivacyTier;
@@ -147,16 +155,25 @@ export interface EdgeAckCommandResult {
   ownerNotifyText?: string;
 }
 
+export interface EdgeTentacleRunnerCycleResult {
+  pulseOk: boolean;
+  projectCount: number;
+  commandsExecuted: number;
+  errors: string[];
+}
+
 export interface EdgeTentacleRunnerOptions {
   hubUrl: string;
   edgeToken: string;
   nodeId: string;
   projectsRootDirs: readonly string[];
+  homeDir?: string;
   fetchImpl?: typeof fetch;
   scanSessions?: () => ReadonlyArray<EdgeSessionPulseInput>;
   dispatchAntigravity?: (
     cmd: EdgeQueuedCommand,
   ) => Promise<{ ok: boolean; summary?: string; conversationId?: string }>;
+  onCycle?: (result: EdgeTentacleRunnerCycleResult) => void;
   intervalMs?: number;
   nowIso?: () => string;
   defaultTier?: EdgePrivacyTier;
@@ -305,30 +322,187 @@ export function parseRepoStatusMarkdown(markdown: string): ParsedRepoStatus {
   };
 }
 
-interface RoadmapSectionTrack {
+interface RawRoadmapSection {
+  level: number;
   rawHeading: string;
-  done: number;
-  open: number;
+  lines: string[];
 }
 
-function splitRoadmapHeadingCodeAndTitle(rawHeading: string): { code?: string; title: string } {
-  const trimmed = rawHeading.trim();
-  const match =
-    /^\[?((?:Phase|Stage|Wave|Milestone)\s+[A-Za-z0-9._-]+|[A-Za-z]+\d+(?:\.\d+)*)\]?\s*(?:[:\-—·]\s*|\s+)(.+)$/i.exec(
-      trimmed,
-    );
-  if (match?.[1] && match[2]) {
-    return { code: match[1].trim(), title: match[2].trim() };
+interface EvaluatedRoadmapStage {
+  code?: string;
+  title: string;
+  isStageHeading: boolean;
+  explicitActive: boolean;
+  hasExitGate: boolean;
+  done: number;
+  inProgress: number;
+  todo: number;
+  blocked: number;
+  status: string;
+}
+
+const STAGE_HEADING_PATTERNS: readonly RegExp[] = [
+  /\b(Horizon\s*[A-Z]?\d+)\b/i,
+  /\b(Milestone\s*[A-Z]?\d+)\b/i,
+  /\b(Phase\s*[A-Z]?\d+)\b/i,
+  /\b(Wave\s*[A-Z]?\d+)\b/i,
+  /\b(Sprint\s*[A-Z]?\d+)\b/i,
+  /\b(Stage\s*[A-Z]?\d+)\b/i,
+  /(?:^|\s)(里程碑\s*(?:[A-Z]?\d+|[一二三四五六七八九十]+))(?=\s*[:：\-—（(]|$)/,
+  /(?:^|\s)(第\s*(?:\d+|[一二三四五六七八九十]+)\s*阶段)(?=\s*[:：\-—（(]|$)/,
+  /(?:^|\s)(阶段\s*(?:[A-Z]?\d+|[一二三四五六七八九十]+))(?=\s*[:：\-—（(]|$)/,
+];
+
+const DELIVERABLE_HEADER_RE = /^\*\*[^*]*(?:core deliverables|deliverables|核心交付|交付清单|关键任务)[^*]*\*\*/i;
+const ENTRY_GATE_RE = /^\*\*[^*]*(?:entry gate|准入门禁|前置门禁)[^*]*\*\*\s*[:：]?\s*(.*)$/i;
+const EXIT_GATE_RE = /^\*\*[^*]*(?:exit\s*\/?\s*profit gate|exit gate|profit gate|验收门禁|晋级门禁|DoD)[^*]*\*\*\s*[:：]?\s*(.*)$/i;
+const META_BULLET_RE = /^\*\*[^*]*(?:entry gate|exit|profit gate|frozen|out-of-scope|战役目标|核心目标|验收门禁|DoD)[^*]*\*\*/i;
+const DELIV_CODE_RE = /^(?:\*\*)?`?([A-Z]{1,3}\d+(?:\.\d+)+)`?(?:\*\*)?(?:\s|$|[：:])/;
+
+function isExplicitActiveRoadmapHeading(rawHeading: string): boolean {
+  if (/[（(\[【][^）)\]】]*(?:当前|活跃|进行中|current|active|in progress|wip)[^）)\]】]*[）)\]】]/i.test(rawHeading)) {
+    return true;
   }
-  return { title: trimmed };
+  if (/[🚧🔥👉]/u.test(rawHeading)) return true;
+  return /^\s*(?:\d+[.、]\s*)?(?:当前(?:活跃)?阶段|current stage|active stage)\s*[:：]/i.test(rawHeading);
+}
+
+function splitRoadmapHeadingCodeAndTitle(rawHeading: string): { code?: string; title: string; isStageHeading: boolean } {
+  const cleanedMarkers = rawHeading
+    .replace(/[（(\[【][^）)\]】]*(?:当前|活跃|进行中|current|active|in progress|wip)[^）)\]】]*[）)\]】]/gi, "")
+    .replace(/[🚧🔥👉]/gu, "")
+    .trim();
+
+  for (const pat of STAGE_HEADING_PATTERNS) {
+    const m = pat.exec(cleanedMarkers);
+    if (m?.[1]) {
+      const code = m[1].trim();
+      const rest = cleanedMarkers
+        .slice(m.index + m[0].length)
+        .replace(/^\s*\([A-Z]{1,3}\d+\)\s*/i, "")
+        .replace(/^\s*[:：\-—·]\s*/, "")
+        .replace(/\*\*|__|[`*]/g, "")
+        .trim();
+      return { code, title: rest || cleanedMarkers, isStageHeading: true };
+    }
+  }
+
+  const fallbackMatch =
+    /^\[?((?:Phase|Stage|Wave|Milestone|Horizon|Sprint)\s+[A-Za-z0-9._-]+|[A-Za-z]+\d+(?:\.\d+)*)\]?\s*(?:[:\-—·]\s*|\s+)(.+)$/i.exec(
+      cleanedMarkers,
+    );
+  if (fallbackMatch?.[1] && fallbackMatch[2]) {
+    return {
+      code: fallbackMatch[1].trim(),
+      title: fallbackMatch[2].replace(/\*\*|__|[`*]/g, "").trim(),
+      isStageHeading: true,
+    };
+  }
+  return { title: cleanedMarkers, isStageHeading: false };
+}
+
+function classifyRoadmapBulletItem(rawBody: string): "done" | "in_progress" | "blocked" | "todo" | null {
+  let body = rawBody.trim();
+  const cb = /^\[([ xX/~!-])\]\s*(.*)$/.exec(body);
+  if (cb) {
+    const mark = cb[1] ?? " ";
+    body = (cb[2] ?? "").trim();
+    if (mark === "x" || mark === "X") return "done";
+    if (mark === "/" || mark === "~" || mark === "-") return "in_progress";
+    if (mark === "!") return "blocked";
+    if (/\bBLOCKED\b|阻塞|🔴/iu.test(body)) return "blocked";
+    return "todo";
+  }
+  const hasDelivCode = DELIV_CODE_RE.test(body);
+  if (body.includes("✅")) return "done";
+  if (body.includes("🚧") || body.includes("🔄")) return "in_progress";
+  if (body.includes("🔴") || /\bBLOCKED\b|阻塞/i.test(body)) return "blocked";
+  if (hasDelivCode) return "todo";
+  return null;
+}
+
+function evaluateSectionLines(lines: readonly string[]): {
+  done: number;
+  inProgress: number;
+  todo: number;
+  blocked: number;
+  hasExitGate: boolean;
+} {
+  let done = 0;
+  let inProgress = 0;
+  let todo = 0;
+  let blocked = 0;
+  let hasExitGate = false;
+
+  const listItemRe = /^(\s*)(?:[-*+]|\d+[.)])\s+(.*)$/;
+  const indents: number[] = [];
+  let hasDelivHeader = false;
+  for (const ln of lines) {
+    const m = listItemRe.exec(ln);
+    if (!m) continue;
+    indents.push((m[1] ?? "").length);
+    if (DELIVERABLE_HEADER_RE.test((m[2] ?? "").trim())) hasDelivHeader = true;
+  }
+  const topIndent = indents.length > 0 ? Math.min(...indents) : 0;
+
+  let mode: "scan" | "deliverables" | "entry_gate" | "exit_gate" = "scan";
+  let modeIndent = -1;
+
+  for (const ln of lines) {
+    const stripped = ln.trim();
+    if (!stripped) continue;
+    if (/<!--\s*ops:gate\s+[^>]*exit=/i.test(stripped)) {
+      hasExitGate = true;
+      continue;
+    }
+    const m = listItemRe.exec(ln);
+    if (!m) {
+      if (EXIT_GATE_RE.test(stripped)) hasExitGate = true;
+      continue;
+    }
+    const indent = (m[1] ?? "").length;
+    const body = (m[2] ?? "").trim();
+    if (mode !== "scan" && indent <= modeIndent) {
+      mode = "scan";
+      modeIndent = -1;
+    }
+    if (DELIVERABLE_HEADER_RE.test(body)) {
+      mode = "deliverables";
+      modeIndent = indent;
+      continue;
+    }
+    if (ENTRY_GATE_RE.test(body)) {
+      mode = "entry_gate";
+      modeIndent = indent;
+      continue;
+    }
+    if (EXIT_GATE_RE.test(body)) {
+      mode = "exit_gate";
+      modeIndent = indent;
+      hasExitGate = true;
+      continue;
+    }
+    if (mode === "entry_gate") continue;
+    if (mode === "exit_gate") {
+      hasExitGate = true;
+      continue;
+    }
+    if (hasDelivHeader && mode !== "deliverables") continue;
+    if (!hasDelivHeader && (indent > topIndent + 1 || META_BULLET_RE.test(body))) continue;
+
+    const st = classifyRoadmapBulletItem(body);
+    if (st === "done") done += 1;
+    else if (st === "in_progress") inProgress += 1;
+    else if (st === "blocked") blocked += 1;
+    else if (st === "todo") todo += 1;
+  }
+
+  return { done, inProgress, todo, blocked, hasExitGate };
 }
 
 export function parseRepoRoadmapMarkdown(markdown: string): ParsedRepoRoadmap {
   const normalized = markdown.replace(/^\uFEFF/, "").replace(/\r\n/g, "\n");
-  const sections: RoadmapSectionTrack[] = [];
-  let currentSection: RoadmapSectionTrack | null = null;
-  let totalDone = 0;
-  let totalOpen = 0;
+  const rawSections: RawRoadmapSection[] = [];
   let inFence = false;
 
   for (const line of normalized.split("\n")) {
@@ -337,54 +511,123 @@ export function parseRepoRoadmapMarkdown(markdown: string): ParsedRepoRoadmap {
       continue;
     }
     if (inFence) continue;
-    const headingMatch = /^#{2,3}\s+(.+?)\s*$/.exec(line);
-    if (headingMatch?.[1]) {
-      currentSection = { rawHeading: headingMatch[1], done: 0, open: 0 };
-      sections.push(currentSection);
-      continue;
-    }
-    const cbMatch = /^\s*[-*+]\s+\[([xX ])\]\s+/.exec(line);
-    if (cbMatch) {
-      const isDone = cbMatch[1]?.toLowerCase() === "x";
-      if (isDone) {
-        totalDone += 1;
-        if (currentSection) currentSection.done += 1;
-      } else {
-        totalOpen += 1;
-        if (currentSection) currentSection.open += 1;
-      }
+    const hm = /^(#{1,4})\s+(.+?)\s*#*\s*$/.exec(line);
+    if (hm?.[1] && hm[2]) {
+      rawSections.push({ level: hm[1].length, rawHeading: hm[2].trim(), lines: [] });
+    } else if (rawSections.length > 0) {
+      rawSections[rawSections.length - 1]!.lines.push(line);
     }
   }
 
-  const grandTotal = totalDone + totalOpen;
+  const hasExplicitStageHeadings = rawSections.some(
+    (s) => s.level >= 2 && splitRoadmapHeadingCodeAndTitle(s.rawHeading).isStageHeading,
+  );
+
+  const stages: EvaluatedRoadmapStage[] = [];
+  for (let idx = 0; idx < rawSections.length; idx += 1) {
+    const sec = rawSections[idx]!;
+    if (sec.level < 2) continue;
+    const parsedHead = splitRoadmapHeadingCodeAndTitle(sec.rawHeading);
+    if (hasExplicitStageHeadings && !parsedHead.isStageHeading) continue;
+
+    const combinedLines = [...sec.lines];
+    if (hasExplicitStageHeadings) {
+      for (let j = idx + 1; j < rawSections.length; j += 1) {
+        const nxt = rawSections[j]!;
+        if (nxt.level <= sec.level) break;
+        if (splitRoadmapHeadingCodeAndTitle(nxt.rawHeading).isStageHeading) break;
+        combinedLines.push(...nxt.lines);
+      }
+    }
+
+    const counts = evaluateSectionLines(combinedLines);
+    const secTotal = counts.done + counts.inProgress + counts.todo + counts.blocked;
+    if (!hasExplicitStageHeadings && secTotal === 0) continue;
+
+    const explicitActive = isExplicitActiveRoadmapHeading(sec.rawHeading);
+    let status = "planned";
+    if (counts.blocked > 0) {
+      status = "blocked";
+    } else if (explicitActive) {
+      status = secTotal > 0 && counts.done === secTotal && counts.hasExitGate ? "monitoring" : "in_progress";
+    } else if (secTotal > 0 && counts.done === secTotal) {
+      status = "completed";
+    } else if (counts.inProgress > 0) {
+      status = "in_progress";
+    }
+
+    stages.push({
+      ...(parsedHead.code ? { code: parsedHead.code } : {}),
+      title: parsedHead.title,
+      isStageHeading: parsedHead.isStageHeading,
+      explicitActive,
+      hasExitGate: counts.hasExitGate,
+      done: counts.done,
+      inProgress: counts.inProgress,
+      todo: counts.todo,
+      blocked: counts.blocked,
+      status,
+    });
+  }
+
+  const totalDone = stages.reduce((acc, s) => acc + s.done, 0);
+  const grandTotal = stages.reduce((acc, s) => acc + s.done + s.inProgress + s.todo + s.blocked, 0);
   const totals = {
     done: totalDone,
     total: grandTotal,
     pct: grandTotal > 0 ? Math.round((totalDone / grandTotal) * 100) : 0,
   };
 
-  const withBoxes = sections.filter((s) => s.done + s.open > 0);
-  const chosen = withBoxes.find((s) => s.open > 0) ?? withBoxes[withBoxes.length - 1];
+  const nonEmptyStages = stages.filter((s) => s.done + s.inProgress + s.todo + s.blocked > 0);
+  if (nonEmptyStages.length === 0) return { totals };
+
+  let chosen =
+    nonEmptyStages.find((s) => s.explicitActive && (s.status === "monitoring" || s.status === "in_progress" || s.status === "blocked")) ??
+    nonEmptyStages.find((s) => s.status === "blocked" || s.status === "in_progress" || s.status === "monitoring");
+
+  if (!chosen) {
+    const firstOpen = nonEmptyStages.find((s) => s.status === "planned" && s.todo > 0);
+    if (firstOpen) {
+      firstOpen.status = "in_progress";
+      chosen = firstOpen;
+    } else {
+      chosen = nonEmptyStages[nonEmptyStages.length - 1];
+    }
+  }
   if (!chosen) return { totals };
 
-  const secTotal = chosen.done + chosen.open;
-  const { code, title } = splitRoadmapHeadingCodeAndTitle(chosen.rawHeading);
+  const chosenTotal = chosen.done + chosen.inProgress + chosen.todo + chosen.blocked;
   return {
     activeNode: {
-      ...(code ? { code } : {}),
-      title,
-      status: chosen.open > 0 ? "in_progress" : "completed",
+      ...(chosen.code ? { code: chosen.code } : {}),
+      title: chosen.title,
+      status: chosen.status,
       progress: {
         done: chosen.done,
-        total: secTotal,
-        pct: secTotal > 0 ? Math.round((chosen.done / secTotal) * 100) : 0,
+        total: chosenTotal,
+        pct: chosenTotal > 0 ? Math.round((chosen.done / chosenTotal) * 100) : 0,
       },
+      ...(chosen.inProgress > 0 ? { inProgressCount: chosen.inProgress } : {}),
+      ...(chosen.todo > 0 ? { todoCount: chosen.todo } : {}),
+      ...(chosen.blocked > 0 ? { blockedCount: chosen.blocked } : {}),
+      ...(chosen.hasExitGate ? { hasExitGate: true } : {}),
     },
     totals,
   };
 }
 
 function deriveProjectKeyFromRepo(repoDir: string, nodeId: string): string {
+  try {
+    const opsProjPath = path.join(repoDir, ".ops-project.json");
+    if (fs.existsSync(opsProjPath)) {
+      const parsed = JSON.parse(fs.readFileSync(opsProjPath, "utf8")) as { projectKey?: unknown };
+      if (typeof parsed?.projectKey === "string" && parsed.projectKey.trim()) {
+        return parsed.projectKey.trim().toLowerCase();
+      }
+    }
+  } catch {
+    // ignore malformed .ops-project.json
+  }
   const folderName = path.basename(repoDir).toLowerCase().replace(/[^a-z0-9._-]+/g, "-");
   try {
     const gitConfigPath = path.join(repoDir, ".git", "config");
@@ -406,56 +649,350 @@ function deriveProjectKeyFromRepo(repoDir: string, nodeId: string): string {
   return `local:${nodeId.toLowerCase()}:${folderName}`;
 }
 
+function uriToNormalizedFsPath(rawUri: string): string {
+  const trimmed = String(rawUri ?? "").trim();
+  if (!trimmed) return "";
+  let fsPath = trimmed;
+  if (fsPath.startsWith("file://")) {
+    try {
+      fsPath = decodeURIComponent(new URL(fsPath).pathname);
+    } catch {
+      fsPath = decodeURIComponent(fsPath.slice("file://".length));
+    }
+  }
+  return fsPath ? path.resolve(fsPath) : "";
+}
+
+function loadKanbanHomeMetadata(homeDir: string): {
+  registeredNames: Map<string, string>;
+  sidecarsByFolder: Map<string, { hasSidecar: boolean; hasError: boolean }>;
+} {
+  const registeredNames = new Map<string, string>();
+  const sidecarsByFolder = new Map<string, { hasSidecar: boolean; hasError: boolean }>();
+  const dotGem = "." + "ge" + "mini";
+  const projCfgDir = path.join(homeDir, dotGem, "config", "projects");
+  try {
+    if (fs.existsSync(projCfgDir)) {
+      for (const fn of fs.readdirSync(projCfgDir).sort()) {
+        if (!fn.endsWith(".json")) continue;
+        try {
+          const obj = JSON.parse(fs.readFileSync(path.join(projCfgDir, fn), "utf8")) as {
+            name?: unknown;
+            sidecar?: unknown;
+            projectResources?: { resources?: Array<{ folderUri?: unknown; gitFolder?: { folderUri?: unknown } }> };
+          };
+          const name = typeof obj.name === "string" ? obj.name.trim() : "";
+          const isAux = Boolean(obj.sidecar) || /-(?:review|sidecar|cron|daily|timer)$/i.test(name);
+          for (const res of obj.projectResources?.resources ?? []) {
+            const rawUri =
+              typeof res.gitFolder?.folderUri === "string"
+                ? res.gitFolder.folderUri
+                : typeof res.folderUri === "string"
+                  ? res.folderUri
+                  : "";
+            const resolved = uriToNormalizedFsPath(rawUri);
+            if (!resolved) continue;
+            const candidateName = name || path.basename(resolved);
+            if (!registeredNames.has(resolved) || !isAux) {
+              registeredNames.set(resolved, candidateName);
+            }
+          }
+        } catch {
+          // ignore single malformed project file
+        }
+      }
+    }
+  } catch {
+    // ignore unreadable projects dir
+  }
+
+  const sidecarCfgDir = path.join(homeDir, dotGem, "config", "sidecars");
+  const sidecarDataDir = path.join(homeDir, dotGem, "antigravity", "sidecar_data");
+  try {
+    if (fs.existsSync(sidecarCfgDir)) {
+      for (const name of fs.readdirSync(sidecarCfgDir).sort()) {
+        const cfgPath = path.join(sidecarCfgDir, name, "sidecar.json");
+        if (!fs.existsSync(cfgPath)) continue;
+        try {
+          const cfg = JSON.parse(fs.readFileSync(cfgPath, "utf8")) as {
+            agent_permissions?: { workspace_uris?: unknown[] };
+          };
+          const uris = Array.isArray(cfg.agent_permissions?.workspace_uris) ? cfg.agent_permissions.workspace_uris : [];
+          let targetFolder = "";
+          for (const u of uris) {
+            const cand = uriToNormalizedFsPath(String(u ?? ""));
+            if (cand) {
+              targetFolder = cand;
+              break;
+            }
+          }
+          if (!targetFolder) continue;
+          let hasError = false;
+          const evDir = path.join(sidecarDataDir, name, "events");
+          if (fs.existsSync(evDir)) {
+            const evFiles = fs.readdirSync(evDir).filter((f) => f.endsWith(".json")).sort();
+            const latestEv = evFiles[evFiles.length - 1];
+            if (latestEv) {
+              const ev = JSON.parse(fs.readFileSync(path.join(evDir, latestEv), "utf8")) as { error?: unknown };
+              hasError = Boolean(ev?.error);
+            }
+          }
+          const prev = sidecarsByFolder.get(targetFolder);
+          sidecarsByFolder.set(targetFolder, { hasSidecar: true, hasError: Boolean(prev?.hasError || hasError) });
+        } catch {
+          // ignore malformed sidecar file
+        }
+      }
+    }
+  } catch {
+    // ignore unreadable sidecars dir
+  }
+
+  return { registeredNames, sidecarsByFolder };
+}
+
+function inferKanbanDomain(projectKey: string, displayName: string): string {
+  const identity = `${projectKey} ${displayName}`.toLowerCase();
+  if (/(?:token|wallet|quant|trading|alpha|backtest|factor|portfolio|crypto|量化|实盘|交易|策略|账本|钱包)/i.test(identity)) {
+    return "quant_trading";
+  }
+  if (/(?:gcp|script|transcri|audio|fleet|infra|devops|daemon|hook|lavoisier|tesla|工具|脚本|底座|转录|运维)/i.test(identity)) {
+    return "infra_tools";
+  }
+  if (/(?:lean|cowork|fde|consult|client|bom|\.com\.cn|advisory|商业|咨询|交付|客户|清单)/i.test(identity) || /(?:^|[-_/:.\s])eto(?:$|[-_/:.\s])/i.test(identity)) {
+    return "client_consulting";
+  }
+  if (/(?:ppt|slide|remotion|motion|video|shorts|printer|design|creation|content|brand|课题|大赛|内容|品牌|视频|视觉|海报|课件)/i.test(identity)) {
+    return "content_brand";
+  }
+  return "ai_products";
+}
+
+function inferKanbanStageAndBoardStatus(params: {
+  domain: string;
+  hasStatusMd: boolean;
+  parsedStatus?: ParsedRepoStatus;
+  parsedRoadmap?: ParsedRepoRoadmap;
+  hasGovernanceAnchor: boolean;
+  isRegistered: boolean;
+  hasSidecar: boolean;
+  sidecarHasError: boolean;
+  runningCount: number;
+  recentSteps72h: number;
+  lastActiveMs: number;
+  nowMs: number;
+}): { stage: string; boardStatus: string; boardStatusReason: string } {
+  const ageDays = params.lastActiveMs > 0 ? Math.max(0, (params.nowMs - params.lastActiveMs) / 86_400_000) : Number.POSITIVE_INFINITY;
+  const isRunning = params.runningCount > 0;
+  const pureAutopilot = params.hasSidecar && params.recentSteps72h < 200 && !isRunning;
+
+  let stage = "incubating";
+  if (pureAutopilot) {
+    stage = "autopilot";
+  } else if (ageDays > 21 && !isRunning && params.recentSteps72h === 0) {
+    stage = "archived";
+  } else if (params.domain === "infra_tools" && ageDays <= 14 && params.recentSteps72h < 30 && !isRunning) {
+    stage = "autopilot";
+  } else {
+    const openTodos = (params.parsedRoadmap?.totals.total ?? 0) - (params.parsedRoadmap?.totals.done ?? 0);
+    const hasTraction = params.hasGovernanceAnchor || params.hasStatusMd || params.recentSteps72h >= 15 || isRunning || openTodos > 0;
+    if (hasTraction && (ageDays <= 10 || isRunning || params.recentSteps72h >= 15 || params.parsedRoadmap?.activeNode?.status === "monitoring")) {
+      stage = "focus";
+    }
+  }
+  if (stage === "focus" && !isRunning && !params.hasStatusMd && !params.hasGovernanceAnchor && !params.isRegistered) {
+    stage = "incubating";
+  }
+
+  const blockers = params.parsedStatus?.blockers ?? [];
+  if (blockers.length > 0) {
+    return { stage, boardStatus: "blocked", boardStatusReason: `STATUS.md 存在卡点：${blockers[0]!.slice(0, 40)}` };
+  }
+  if (params.sidecarHasError) {
+    return { stage, boardStatus: "blocked", boardStatusReason: "后台定时巡检报错" };
+  }
+  if ((params.parsedRoadmap?.activeNode?.blockedCount ?? 0) > 0) {
+    return { stage, boardStatus: "blocked", boardStatusReason: "路线图活跃节点存在阻塞项" };
+  }
+
+  const reviewState = params.hasStatusMd ? (params.parsedStatus?.reviewState || "pending_review") : "untracked";
+  if (reviewState === "pending_review") {
+    return { stage, boardStatus: "pending_review", boardStatusReason: "STATUS.md 待主人确认验收" };
+  }
+
+  if (isRunning) {
+    return { stage, boardStatus: "active_executing", boardStatusReason: "当前存在活跃运行中的会话" };
+  }
+
+  const inflightWindowMs = 72 * 3_600_000;
+  const statusUpdatedMs = parseIsoMs(params.parsedStatus?.updatedAt);
+  const hasFreshInflight = (params.parsedStatus?.inflight ?? []).some((it) => {
+    if (!it.text?.trim()) return false;
+    const ts = parseIsoMs(it.updatedAt) || statusUpdatedMs;
+    return ts <= 0 || params.nowMs - ts <= inflightWindowMs;
+  });
+  if (hasFreshInflight) {
+    return { stage, boardStatus: "active_executing", boardStatusReason: "存在 72h 内在途任务" };
+  }
+  if ((params.parsedRoadmap?.activeNode?.inProgressCount ?? 0) > 0) {
+    return { stage, boardStatus: "active_executing", boardStatusReason: "路线图活跃节点存在进行中交付项" };
+  }
+
+  if (params.parsedRoadmap?.activeNode?.status === "monitoring") {
+    const label = params.parsedRoadmap.activeNode.code || "当前阶段";
+    return { stage, boardStatus: "monitoring", boardStatusReason: `${label} 交付已齐，处于门禁观测期` };
+  }
+  if (stage === "autopilot" && !params.sidecarHasError) {
+    return { stage, boardStatus: "monitoring", boardStatusReason: "后台常驻巡检健康运行中" };
+  }
+
+  const hasNext = (params.parsedStatus?.nextActions.length ?? 0) > 0;
+  const hasTodo = (params.parsedRoadmap?.totals.total ?? 0) - (params.parsedRoadmap?.totals.done ?? 0) > 0;
+  if (stage !== "archived" && reviewState === "confirmed" && (hasNext || hasTodo) && ageDays <= 21) {
+    return { stage, boardStatus: "planned_ready", boardStatusReason: "状态已确认且有明确下一步排期" };
+  }
+
+  const idleReason =
+    stage === "archived"
+      ? "项目已归档"
+      : reviewState === "untracked"
+        ? "尚未建立 STATUS.md 档案"
+        : "暂无近期在途或后续排期";
+  return { stage, boardStatus: "idle_untracked", boardStatusReason: idleReason };
+}
+
+const KANBAN_LANE_ORDER: Record<string, number> = {
+  blocked: 1,
+  active_executing: 2,
+  pending_review: 3,
+  monitoring: 4,
+  planned_ready: 5,
+  idle_untracked: 6,
+};
+
+const KANBAN_STAGE_ORDER: Record<string, number> = {
+  focus: 1,
+  autopilot: 2,
+  incubating: 3,
+  archived: 4,
+};
+
 export function scanLocalProjectsForEdge(opts: ScanLocalProjectsForEdgeOptions): EdgeProjectPulseItem[] {
   const nowIso = opts.nowIso ?? new Date().toISOString();
+  const nowMs = parseIsoMs(nowIso) || Date.now();
   const defaultTier: EdgePrivacyTier = opts.defaultTier ?? 2;
-  const maxProjects = Math.max(1, opts.maxProjects ?? 40);
+  const maxProjects = Math.max(1, opts.maxProjects ?? 200);
   const candidateDirs: string[] = [];
   const seenRealPaths = new Set<string>();
 
-  for (const rootDir of opts.projectsRootDirs) {
-    if (!rootDir || !fs.existsSync(rootDir)) continue;
-    const selfHasMarker =
-      fs.existsSync(path.join(rootDir, ".git")) ||
-      fs.existsSync(path.join(rootDir, "STATUS.md")) ||
-      fs.existsSync(path.join(rootDir, "package.json"));
-    if (selfHasMarker) {
-      const resolvedSelf = path.resolve(rootDir);
-      if (!seenRealPaths.has(resolvedSelf)) {
-        seenRealPaths.add(resolvedSelf);
-        candidateDirs.push(resolvedSelf);
-      }
-      continue;
-    }
-    let entries: fs.Dirent[] = [];
+  const addCandidate = (dirPath: string): void => {
+    if (!dirPath || !fs.existsSync(dirPath)) return;
     try {
-      entries = fs.readdirSync(rootDir, { withFileTypes: true });
+      if (!fs.statSync(dirPath).isDirectory()) return;
     } catch {
-      continue;
+      return;
     }
-    for (const ent of entries) {
-      if (!ent.isDirectory() || ent.name.startsWith(".")) continue;
-      const fullPath = path.join(rootDir, ent.name);
-      const hasMarker =
-        fs.existsSync(path.join(fullPath, ".git")) ||
-        fs.existsSync(path.join(fullPath, "STATUS.md")) ||
-        fs.existsSync(path.join(fullPath, "package.json"));
-      if (!hasMarker) continue;
-      const resolved = path.resolve(fullPath);
-      if (seenRealPaths.has(resolved)) continue;
-      seenRealPaths.add(resolved);
-      candidateDirs.push(resolved);
+    const resolved = path.resolve(dirPath);
+    if (seenRealPaths.has(resolved)) return;
+    seenRealPaths.add(resolved);
+    candidateDirs.push(resolved);
+  };
+
+  const kanbanMeta = opts.homeDir ? loadKanbanHomeMetadata(opts.homeDir) : undefined;
+  const sessionWorkspaceSet = new Set<string>();
+  for (const s of opts.sessions ?? []) {
+    const rawCandidates = [s.workspaceRoot, ...(s.workspaceUris ?? [])].filter((x): x is string => Boolean(x));
+    for (const rawWs of rawCandidates) {
+      if (/(?:^|\/)worktrees\/|\/subagents\//.test(rawWs.replace(/\\/g, "/"))) continue;
+      const norm = uriToNormalizedFsPath(rawWs);
+      if (norm && fs.existsSync(norm)) sessionWorkspaceSet.add(norm);
+    }
+  }
+
+  if (opts.homeDir && kanbanMeta) {
+    for (const regDir of kanbanMeta.registeredNames.keys()) addCandidate(regDir);
+    for (const scDir of kanbanMeta.sidecarsByFolder.keys()) addCandidate(scDir);
+    for (const sessDir of sessionWorkspaceSet) addCandidate(sessDir);
+    for (const wellKnown of [
+      path.join(opts.homeDir, "Documents", "Lean-Digital"),
+      path.join(opts.homeDir, "Wallet-management"),
+      path.join(opts.homeDir, "Projects", "agy-fleet-config"),
+      path.join("/", "opt", "airtoken"),
+    ]) {
+      addCandidate(wellKnown);
+    }
+    for (const rootDir of opts.projectsRootDirs) {
+      if (!rootDir || !fs.existsSync(rootDir)) continue;
+      const selfExplicit =
+        fs.existsSync(path.join(rootDir, "STATUS.md")) ||
+        fs.existsSync(path.join(rootDir, ".ops-project.json"));
+      if (selfExplicit) {
+        addCandidate(rootDir);
+        continue;
+      }
+      let entries: fs.Dirent[] = [];
+      try {
+        entries = fs.readdirSync(rootDir, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+      for (const ent of entries) {
+        if (!ent.isDirectory() || ent.name.startsWith(".")) continue;
+        const fullPath = path.resolve(path.join(rootDir, ent.name));
+        const isManaged =
+          kanbanMeta.registeredNames.has(fullPath) ||
+          kanbanMeta.sidecarsByFolder.has(fullPath) ||
+          sessionWorkspaceSet.has(fullPath) ||
+          fs.existsSync(path.join(fullPath, "STATUS.md")) ||
+          fs.existsSync(path.join(fullPath, ".ops-project.json"));
+        if (isManaged) addCandidate(fullPath);
+      }
+    }
+  } else {
+    for (const rootDir of opts.projectsRootDirs) {
+      if (!rootDir || !fs.existsSync(rootDir)) continue;
+      const selfHasMarker =
+        fs.existsSync(path.join(rootDir, ".git")) ||
+        fs.existsSync(path.join(rootDir, "STATUS.md")) ||
+        fs.existsSync(path.join(rootDir, ".ops-project.json")) ||
+        fs.existsSync(path.join(rootDir, "package.json"));
+      if (selfHasMarker) {
+        addCandidate(rootDir);
+        continue;
+      }
+      let entries: fs.Dirent[] = [];
+      try {
+        entries = fs.readdirSync(rootDir, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+      for (const ent of entries) {
+        if (!ent.isDirectory() || ent.name.startsWith(".")) continue;
+        const fullPath = path.join(rootDir, ent.name);
+        const hasMarker =
+          fs.existsSync(path.join(fullPath, ".git")) ||
+          fs.existsSync(path.join(fullPath, "STATUS.md")) ||
+          fs.existsSync(path.join(fullPath, ".ops-project.json")) ||
+          fs.existsSync(path.join(fullPath, "package.json"));
+        if (hasMarker) addCandidate(fullPath);
+      }
     }
   }
 
   const out: EdgeProjectPulseItem[] = [];
-  for (const repoDir of candidateDirs.slice(0, maxProjects)) {
+  for (const repoDir of candidateDirs) {
     const rawKey = deriveProjectKeyFromRepo(repoDir, opts.nodeId);
     const tier = opts.resolveTier ? opts.resolveTier(rawKey, repoDir) : defaultTier;
-    const displayName = path.basename(repoDir);
+    const displayName = kanbanMeta?.registeredNames.get(repoDir) || path.basename(repoDir);
 
-    const matchingSessions = (opts.sessions ?? []).filter((s) => s.projectKey === rawKey);
+    const matchingSessions = (opts.sessions ?? []).filter(
+      (s) => s.projectKey === rawKey || (s.workspaceRoot && path.resolve(s.workspaceRoot) === repoDir),
+    );
     const runningSessions = matchingSessions.filter((s) => s.isRunning);
+    const latestSessionMs = matchingSessions.reduce((mx, s) => Math.max(mx, s.lastModifiedMs ?? 0), 0);
+    const recentSteps72h = matchingSessions
+      .filter((s) => (s.lastModifiedMs ?? 0) >= nowMs - 72 * 3_600_000)
+      .reduce((sum, s) => sum + (s.stepCount || 0), 0);
 
     if (tier === 0) {
       const hash8 = crypto.createHash("sha256").update(rawKey).digest("hex").slice(0, 8);
@@ -472,17 +1009,24 @@ export function scanLocalProjectsForEdge(opts: ScanLocalProjectsForEdgeOptions):
     }
 
     let parsedStatus: ParsedRepoStatus | undefined;
+    let hasStatusMd = false;
     const statusMdPath = path.join(repoDir, "STATUS.md");
     if (fs.existsSync(statusMdPath)) {
       try {
         parsedStatus = parseRepoStatusMarkdown(fs.readFileSync(statusMdPath, "utf8"));
+        hasStatusMd = Boolean(parsedStatus.stageGoal || parsedStatus.landed.length || parsedStatus.nextActions.length || parsedStatus.reviewState);
       } catch {
         parsedStatus = undefined;
       }
     }
 
     let parsedRoadmap: ParsedRepoRoadmap | undefined;
-    const roadmapCandidates = [path.join(repoDir, "docs", "ROADMAP.md"), path.join(repoDir, "ROADMAP.md")];
+    const roadmapCandidates = [
+      path.join(repoDir, "ROADMAP.md"),
+      path.join(repoDir, "docs", "ROADMAP.md"),
+      path.join(repoDir, "roadmap.md"),
+      path.join(repoDir, "docs", "roadmap.md"),
+    ];
     for (const rp of roadmapCandidates) {
       if (fs.existsSync(rp)) {
         try {
@@ -494,13 +1038,36 @@ export function scanLocalProjectsForEdge(opts: ScanLocalProjectsForEdgeOptions):
       }
     }
 
-    const sanitizedGoal = parsedStatus?.stageGoal ? redactLocalPaths(parsedStatus.stageGoal) : undefined;
-    const boardStatus =
-      parsedStatus?.blockers && parsedStatus.blockers.length > 0
-        ? "blocked"
-        : runningSessions.length > 0 || (parsedStatus?.inflight.length ?? 0) > 0
-          ? "active"
-          : "idle";
+    const hasGovernanceAnchor =
+      Boolean(parsedRoadmap) ||
+      ["ROADMAP.md", "TASKS.md", "TOMBSTONES.md", "PROJECT.md", ".agents"].some((anc) =>
+        fs.existsSync(path.join(repoDir, anc)),
+      );
+    const sidecarInfo = kanbanMeta?.sidecarsByFolder.get(repoDir);
+    const domain = inferKanbanDomain(rawKey, displayName);
+    const lastActiveMs = Math.max(latestSessionMs, parseIsoMs(parsedStatus?.updatedAt));
+    const lastActiveIso = lastActiveMs > 0 ? new Date(lastActiveMs).toISOString() : (parsedStatus?.updatedAt || nowIso);
+
+    const { stage, boardStatus, boardStatusReason } = inferKanbanStageAndBoardStatus({
+      domain,
+      hasStatusMd,
+      ...(parsedStatus ? { parsedStatus } : {}),
+      ...(parsedRoadmap ? { parsedRoadmap } : {}),
+      hasGovernanceAnchor,
+      isRegistered: Boolean(kanbanMeta?.registeredNames.has(repoDir)),
+      hasSidecar: Boolean(sidecarInfo?.hasSidecar),
+      sidecarHasError: Boolean(sidecarInfo?.hasError),
+      runningCount: runningSessions.length,
+      recentSteps72h,
+      lastActiveMs,
+      nowMs,
+    });
+
+    const sanitizedGoal = parsedStatus?.stageGoal
+      ? redactLocalPaths(parsedStatus.stageGoal)
+      : parsedRoadmap?.activeNode
+        ? redactLocalPaths(`${parsedRoadmap.activeNode.code ? `${parsedRoadmap.activeNode.code} ` : ""}${parsedRoadmap.activeNode.title}`.trim())
+        : undefined;
 
     if (tier === 1) {
       out.push({
@@ -510,10 +1077,13 @@ export function scanLocalProjectsForEdge(opts: ScanLocalProjectsForEdgeOptions):
         nodes: [opts.nodeId],
         tier: 1,
         privacyTier: 1,
+        domain,
+        stage,
         boardStatus,
+        boardStatusReason,
         status: runningSessions.length > 0 ? "running" : "idle",
-        updatedAtIso: parsedStatus?.updatedAt || nowIso,
-        lastActiveAt: parsedStatus?.updatedAt || nowIso,
+        updatedAtIso: lastActiveIso,
+        lastActiveAt: lastActiveIso,
         ...(sanitizedGoal ? { sanitizedSummary: sanitizedGoal } : {}),
         ...(sanitizedGoal || parsedStatus?.reviewState
           ? {
@@ -553,12 +1123,15 @@ export function scanLocalProjectsForEdge(opts: ScanLocalProjectsForEdgeOptions):
       nodes: [opts.nodeId],
       tier: 2,
       privacyTier: 2,
+      domain,
+      stage,
       boardStatus,
+      boardStatusReason,
       status: runningSessions.length > 0 ? "running" : "idle",
       ...(summaryParts.length > 0 ? { sanitizedSummary: summaryParts.join(" · ").slice(0, 280) } : {}),
-      updatedAtIso: parsedStatus?.updatedAt || nowIso,
-      lastActiveAt: parsedStatus?.updatedAt || nowIso,
-      ...(parsedStatus || runningSessions.length > 0
+      updatedAtIso: lastActiveIso,
+      lastActiveAt: lastActiveIso,
+      ...(parsedStatus || runningSessions.length > 0 || sanitizedGoal
         ? {
             statusCard: {
               ...(sanitizedGoal ? { stageGoal: sanitizedGoal } : {}),
@@ -566,16 +1139,16 @@ export function scanLocalProjectsForEdge(opts: ScanLocalProjectsForEdgeOptions):
               inflight,
               nextActions,
               blockers,
-              ...(parsedStatus?.reviewState ? { reviewState: parsedStatus.reviewState } : {}),
+              reviewState: hasStatusMd ? (parsedStatus?.reviewState ?? "pending_review") : "untracked",
               ...(parsedStatus?.updatedBy ? { updatedBy: redactLocalPaths(parsedStatus.updatedBy) } : {}),
-              updatedAt: parsedStatus?.updatedAt || nowIso,
-              source: "STATUS.md",
+              updatedAt: parsedStatus?.updatedAt || lastActiveIso,
+              source: hasStatusMd ? "status_md" : (parsedRoadmap ? "roadmap" : "workspace"),
             },
             executiveSummary: {
               ...(sanitizedGoal ? { goalText: sanitizedGoal } : {}),
               ...(landed[0] ? { progressText: landed[0] } : {}),
               ...(nextActions[0] ? { nextActionText: nextActions[0] } : {}),
-              updatedAt: parsedStatus?.updatedAt || nowIso,
+              updatedAt: parsedStatus?.updatedAt || lastActiveIso,
             },
           }
         : {}),
@@ -596,7 +1169,15 @@ export function scanLocalProjectsForEdge(opts: ScanLocalProjectsForEdgeOptions):
     });
   }
 
-  return out;
+  out.sort(
+    (a, b) =>
+      Number(b.status === "running") - Number(a.status === "running") ||
+      (KANBAN_LANE_ORDER[a.boardStatus ?? "idle_untracked"] ?? 6) - (KANBAN_LANE_ORDER[b.boardStatus ?? "idle_untracked"] ?? 6) ||
+      (KANBAN_STAGE_ORDER[a.stage ?? "incubating"] ?? 3) - (KANBAN_STAGE_ORDER[b.stage ?? "incubating"] ?? 3) ||
+      (parseIsoMs(b.lastActiveAt ?? b.updatedAtIso) - parseIsoMs(a.lastActiveAt ?? a.updatedAtIso)),
+  );
+
+  return out.slice(0, maxProjects);
 }
 
 export function verifyEdgeToken(
@@ -793,7 +1374,7 @@ export class EdgeTentacleHub {
             existing.boardStatus === "blocked" || proj.boardStatus === "blocked"
               ? "blocked"
               : isRunning
-                ? "active"
+                ? "active_executing"
                 : (useIncomingBase ? proj.boardStatus : existing.boardStatus),
           ...(mergedSessions.length > 0 ? { runningSessions: mergedSessions } : {}),
           _cardMs: Math.max(existing._cardMs, cardMs),
@@ -806,6 +1387,8 @@ export class EdgeTentacleHub {
       .sort(
         (a, b) =>
           Number(b.status === "running") - Number(a.status === "running") ||
+          (KANBAN_LANE_ORDER[a.boardStatus ?? "idle_untracked"] ?? 6) - (KANBAN_LANE_ORDER[b.boardStatus ?? "idle_untracked"] ?? 6) ||
+          (KANBAN_STAGE_ORDER[a.stage ?? "incubating"] ?? 3) - (KANBAN_STAGE_ORDER[b.stage ?? "incubating"] ?? 3) ||
           b._pulseMs - a._pulseMs ||
           b._cardMs - a._cardMs,
       )
@@ -946,16 +1529,20 @@ export class EdgeTentacleRunner {
     };
   }
 
-  async runCycleOnce(): Promise<{
-    pulseOk: boolean;
-    projectCount: number;
-    commandsExecuted: number;
-    errors: string[];
-  }> {
+  private formatFetchError(err: unknown): string {
+    const e = err as Error & { cause?: { code?: string; message?: string } };
+    const base = e?.message || String(err);
+    const code = e?.cause?.code ? `[${e.cause.code}] ` : "";
+    const detail = e?.cause?.message && e.cause.message !== base ? ` (${e.cause.message})` : "";
+    return redactLocalPaths(`${code}${base}${detail}`).slice(0, 280);
+  }
+
+  async runCycleOnce(): Promise<EdgeTentacleRunnerCycleResult> {
     const errors: string[] = [];
     const sessions = this.opts.scanSessions ? this.opts.scanSessions() : [];
     const projects = scanLocalProjectsForEdge({
       projectsRootDirs: this.projectsRootDirs,
+      ...(this.opts.homeDir ? { homeDir: this.opts.homeDir } : {}),
       nodeId: this.nodeId,
       ...(this.opts.defaultTier !== undefined ? { defaultTier: this.opts.defaultTier } : {}),
       ...(this.opts.resolveTier ? { resolveTier: this.opts.resolveTier } : {}),
@@ -981,7 +1568,7 @@ export class EdgeTentacleRunner {
       pulseOk = pulseRes.ok;
       if (!pulseRes.ok) errors.push(`PULSE_HTTP_${pulseRes.status}`);
     } catch (e) {
-      errors.push(`PULSE_ERR:${(e as Error).message}`);
+      errors.push(`PULSE_ERR:${this.formatFetchError(e)}`);
     }
 
     let commandsExecuted = 0;
@@ -1041,33 +1628,37 @@ export class EdgeTentacleRunner {
               signal: AbortSignal.timeout(15_000),
             },
           ).catch((ackErr) => {
-            errors.push(`ACK_ERR:${(ackErr as Error).message}`);
+            errors.push(`ACK_ERR:${this.formatFetchError(ackErr)}`);
           });
         }
       }
     } catch (e) {
-      errors.push(`PULL_ERR:${(e as Error).message}`);
+      errors.push(`PULL_ERR:${this.formatFetchError(e)}`);
     }
 
-    return {
+    const result: EdgeTentacleRunnerCycleResult = {
       pulseOk,
       projectCount: projects.length,
       commandsExecuted,
       errors,
     };
+    this.opts.onCycle?.(result);
+    return result;
   }
 
   async runOnce() {
     return this.runCycleOnce();
   }
 
-  start(): void {
+  start(opts?: { keepAlive?: boolean }): void {
     if (this.timer) return;
     void this.runCycleOnce().catch(() => {});
     this.timer = setInterval(() => {
       void this.runCycleOnce().catch(() => {});
     }, this.intervalMs);
-    this.timer.unref();
+    if (!opts?.keepAlive) {
+      this.timer.unref();
+    }
   }
 
   stop(): void {

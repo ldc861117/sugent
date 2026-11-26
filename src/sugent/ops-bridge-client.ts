@@ -5,6 +5,7 @@ export interface OpsBridgeConfig {
   baseUrl: string;
   nodeToken: string;
   nodeId: string;
+  opsNodeId: string;
   stewardHubNodeId: string;
   weixinOwnerNodeId: string;
 }
@@ -93,9 +94,14 @@ export interface OpsStewardProjectItem {
   tier?: 0 | 1 | 2;
   privacyTier?: 0 | 1 | 2;
   domain?: string;
+  domainSource?: string;
   stage?: string;
+  stageSource?: string;
   boardStatus?: string;
   boardStatusReason?: string;
+  boardStatusSource?: string;
+  autopilotHealth?: string;
+  autopilotNote?: string;
   status?: string;
   sanitizedSummary?: string;
   updatedAtIso?: string;
@@ -155,6 +161,7 @@ export function resolveOpsBridgeConfig(
   const baseUrl = String(env.OPS_BASE_URL ?? "").trim().replace(/\/+$/, "");
   const nodeToken = String(env.OPS_NODE_TOKEN ?? "").trim();
   const nodeId = String(env.SUGENT_NODE_ID ?? "").trim() || "local-mac";
+  const opsNodeId = String(env.OPS_NODE_ID ?? "").trim() || nodeId;
   const explicitHub = String(env.SUGENT_STEWARD_HUB_NODE ?? "").trim();
   const explicitWxOwner = String(env.SUGENT_WEIXIN_OWNER_NODE ?? "").trim();
   const stewardHubNodeId = explicitHub || explicitWxOwner || "gce-hub";
@@ -164,6 +171,7 @@ export function resolveOpsBridgeConfig(
     baseUrl,
     nodeToken,
     nodeId,
+    opsNodeId,
     stewardHubNodeId,
     weixinOwnerNodeId,
   };
@@ -250,6 +258,7 @@ export interface OpsBridgeClientOptions {
   baseUrl?: string;
   nodeToken?: string;
   nodeId?: string;
+  opsNodeId?: string;
   stewardHubNodeId?: string;
   fetchImpl?: typeof fetch;
   getFetch?: () => typeof fetch;
@@ -259,6 +268,7 @@ export interface OpsBridgeClientOptions {
 export class OpsBridgeClient {
   readonly baseUrl: string;
   readonly nodeId: string;
+  readonly opsNodeId: string;
   readonly stewardHubNodeId: string;
   private readonly nodeToken: string;
   private readonly nowMsFn: () => number;
@@ -271,6 +281,7 @@ export class OpsBridgeClient {
     this.baseUrl = String(opts.baseUrl ?? "").trim().replace(/\/+$/, "");
     this.nodeToken = String(opts.nodeToken ?? "").trim();
     this.nodeId = String(opts.nodeId ?? "").trim() || "local-mac";
+    this.opsNodeId = String(opts.opsNodeId ?? "").trim() || this.nodeId;
     this.stewardHubNodeId = String(opts.stewardHubNodeId ?? "").trim() || "gce-hub";
     this.nowMsFn = opts.nowMs ?? (() => Date.now());
     this.getFetchFn = opts.getFetch ?? (() => opts.fetchImpl ?? globalThis.fetch);
@@ -305,26 +316,31 @@ export class OpsBridgeClient {
             "content-type": "application/json",
             authorization: `Bearer ${this.nodeToken}`,
           },
-          body: JSON.stringify({ nodeId: this.nodeId, token: this.nodeToken }),
+          body: JSON.stringify({ nodeId: this.opsNodeId, nodeToken: this.nodeToken, token: this.nodeToken }),
           signal: AbortSignal.timeout(15_000),
         });
         if (!res.ok) {
           return { ok: false, error: `AUTH_HTTP_${res.status}` };
         }
         const json = (await res.json()) as {
+          bridgeJwt?: string;
           token?: string;
           jwt?: string;
+          expiresAt?: string;
           expiresInSec?: number;
           expiresIn?: number;
           expiresAtMs?: number;
         };
-        const jwt = String(json.token ?? json.jwt ?? "").trim();
+        const jwt = String(json.bridgeJwt ?? json.token ?? json.jwt ?? "").trim();
         if (!jwt) return { ok: false, error: "EMPTY_AUTH_JWT" };
+        const parsedExpiresIso = typeof json.expiresAt === "string" ? Date.parse(json.expiresAt) : Number.NaN;
         const ttlSec = Number(json.expiresInSec ?? json.expiresIn ?? DEFAULT_JWT_TTL_SEC);
         const expiresAtMs =
           typeof json.expiresAtMs === "number" && Number.isFinite(json.expiresAtMs)
             ? json.expiresAtMs
-            : this.nowMsFn() + (Number.isFinite(ttlSec) && ttlSec > 60 ? ttlSec * 1_000 : DEFAULT_JWT_TTL_SEC * 1_000);
+            : Number.isFinite(parsedExpiresIso) && parsedExpiresIso > this.nowMsFn()
+              ? parsedExpiresIso
+              : this.nowMsFn() + (Number.isFinite(ttlSec) && ttlSec > 60 ? ttlSec * 1_000 : DEFAULT_JWT_TTL_SEC * 1_000);
         this.cachedJwt = { token: jwt, expiresAtMs };
         return { ok: true, token: jwt };
       } catch (e) {
@@ -395,7 +411,7 @@ export class OpsBridgeClient {
     const atIso = extra.atIso ?? new Date(this.nowMsFn()).toISOString();
     const res = await this.authedJson("/api/ops/bridge/pulse", {
       method: "POST",
-      body: { nodeId: this.nodeId, atIso, projects: pruned },
+      body: { nodeId: this.opsNodeId, atIso, projects: pruned },
     });
     return { ok: res.ok, prunedCount: pruned.length, ...(res.reason ? { reason: res.reason } : {}) };
   }
@@ -419,14 +435,14 @@ export class OpsBridgeClient {
     const atIso = extra.atIso ?? new Date(this.nowMsFn()).toISOString();
     const res = await this.authedJson("/api/ops/bridge/sync", {
       method: "POST",
-      body: { nodeId: this.nodeId, atIso, docs: tier2Only },
+      body: { nodeId: this.opsNodeId, atIso, docs: tier2Only },
     });
     return { ok: res.ok, sentCount: tier2Only.length, ...(res.reason ? { reason: res.reason } : {}) };
   }
 
   async pullCommands(): Promise<{ ok: boolean; skipped?: boolean; commands: OpsRemoteCommand[]; reason?: string }> {
     const res = await this.authedJson<{ commands?: OpsRemoteCommand[] }>(
-      `/api/ops/bridge/commands?nodeId=${encodeURIComponent(this.nodeId)}`,
+      `/api/ops/bridge/commands?nodeId=${encodeURIComponent(this.opsNodeId)}`,
       { method: "GET" },
     );
     if (!res.ok) {
@@ -449,7 +465,7 @@ export class OpsBridgeClient {
     const res = await this.authedJson(`/api/ops/bridge/commands/${encodeURIComponent(cleanId)}/ack`, {
       method: "POST",
       body: {
-        nodeId: this.nodeId,
+        nodeId: this.opsNodeId,
         status: payload.status,
         ...(payload.summary ? { summary: sanitizeSummaryText(payload.summary) } : {}),
         ackedAtIso: new Date(this.nowMsFn()).toISOString(),
@@ -477,9 +493,10 @@ export class OpsBridgeClient {
     if (!this.isConfigured()) {
       return { ok: false, skipped: true, reason: "OPS_BRIDGE_UNCONFIGURED" };
     }
-    const res = await this.authedJson<Record<string, unknown>>("/api/ops/bridge/steward-pending", {
-      method: "GET",
-    });
+    const res = await this.authedJson<Record<string, unknown>>(
+      `/api/ops/bridge/steward-pending?nodeId=${encodeURIComponent(this.opsNodeId)}`,
+      { method: "GET" },
+    );
     if (!res.ok) {
       return { ok: false, ...(res.reason ? { reason: res.reason } : {}) };
     }
@@ -488,7 +505,11 @@ export class OpsBridgeClient {
       ? raw.pendingInbox
       : Array.isArray(raw.pendingItems)
         ? raw.pendingItems
-        : [];
+        : Array.isArray(raw.workItems)
+          ? raw.workItems
+          : Array.isArray(raw.items)
+            ? raw.items
+            : [];
     const snapshot: OpsStewardPendingSnapshot = {
       fetchedAtIso: new Date(this.nowMsFn()).toISOString(),
       projects: Array.isArray(raw.projects) ? (raw.projects as OpsStewardProjectItem[]) : [],
@@ -526,7 +547,7 @@ export class OpsBridgeClient {
     const res = await this.authedJson("/api/ops/bridge/steward-sync", {
       method: "POST",
       body: {
-        nodeId: this.nodeId,
+        nodeId: this.opsNodeId,
         atIso: new Date(this.nowMsFn()).toISOString(),
         ...payload,
       },

@@ -507,7 +507,7 @@ function buildSystemPrompt(wb: StewardWorkbenchLike): string {
     "你是常驻云端的主权顶层管家与生命幕僚（Sugent），围着主人本人生长；微信与网页端都只是连接你这颗唯一大脑的零折损触手。",
     "表达准则：全程用自然、简练、像真人助理聊天的中文直接回应（说人话）。绝对禁止暴露任何内部实现术语或代号（如 Epoch、T0/T1/T2、L0/L1/L3、superseded、CASCADE_RUN_STATUS、tool_calls、JSON 字段名）。隐私档位统一说“私密（仅本机）/ 脱敏摘要 / 深度协同”。",
     "跨天全渠道记忆铁律：当主人询问“昨天我们聊了什么”、“上次提过的某件事”、“前几天讨论的方案”等历史对话时，必须第一时间调用 recall_chat_history 检索微信与网页端真实历史对话记录，绝不可声称“日常对话不会跨天存留”。",
-    "管家统筹与编码触手分工铁律：你的定位是顶层协调者与大管家，不亲自下场硬写业务代码；当主人询问任意项目的最新进展、状态或路线图（如 airtoken、sugent、近期推进的项目）时，务必先调用 manage_ops_fleet(action='overview') 实时拉取全节点触手汇聚的状态卡与路线图；当需要具体改代码、跑开发任务时，优先调用 dispatch_edge_antigravity 派单给本机 local-mac 或云端 gce-remote 的 Antigravity 触手落地执行。",
+    "管家统筹与编码触手分工铁律：你的定位是顶层协调者与大管家，不亲自下场硬写业务代码；当主人询问任意项目的最新进展、在运行项目、状态或路线图（如 airtoken、sugent、近期推进的项目）时，务必先调用 manage_ops_fleet(action='overview') 实时拉取看板态势。汇报时必须严格对齐看板语义：只有 runningNowProjects（此刻有会话正在跑）才叫“正在实时运行”，其余按看板分栏（施工中 / 待验收确认 / 门禁观测中 / 待开工 / 静默已折叠）如实区分，严禁把已纳管仓库总数或静默未建档仓库统称为“正在运行”！需要改代码时调用 dispatch_edge_antigravity 派单给对应节点触手执行。",
     "行动准则：遇到查询目标/待办/档案/历史聊天/来信/开发项目、读取完整本地 .md 或报告全文、记录事项、更改目标、处理来信或派发开发任务时，务必先调用对应工具获取真实现场数据或执行状态变更再回答，绝不靠猜或编造结果；工具返回 ok=false 时必须如实告知限制原因，绝不越权伪造成功。",
     ...(capBlock ? ["", capBlock] : []),
     "",
@@ -516,19 +516,35 @@ function buildSystemPrompt(wb: StewardWorkbenchLike): string {
     `未结待办：${commits.length ? commits.join("；") : "暂无"}`,
     `正在运行中的开发任务：${running.length ? running.join(" | ") : "暂无"}`,
     ...(wb.opsFleet?.projects?.length
-      ? [
-          `跨端舰队全局态势 (/ops)：${wb.opsFleet.projects
-            .slice(0, 10)
-            .map((p) => {
-              const goal = p.statusCard?.stageGoal || p.executiveSummary?.goalText || "";
-              const landed = p.statusCard?.landed?.[0] || p.executiveSummary?.progressText || p.sanitizedSummary || "";
-              const rm = p.roadmapSummary?.activeNode;
-              const rmTag = rm?.code ? `[${rm.code}${rm.progress?.total ? ` ${rm.progress.done ?? 0}/${rm.progress.total}` : ""}]` : "";
-              const summary = [p.boardStatus || p.status, rmTag, goal, landed].filter(Boolean).join(" · ");
-              return `${p.displayName || shortProj(p.projectKey)}${p.nodeId ? `[${p.nodeId}]` : ""}：${summary || "在线"}`;
-            })
-            .join(" | ")}`,
-        ]
+      ? (() => {
+          const allP = wb.opsFleet.projects;
+          const activeP = allP.filter((p) => (p.boardStatus ?? "idle_untracked") !== "idle_untracked" && p.stage !== "archived");
+          const runCnt = allP.filter((p) => p.status === "running").length;
+          const idleCnt = allP.length - activeP.length;
+          const laneLabel: Record<string, string> = {
+            blocked: "卡点",
+            active_executing: "施工中",
+            pending_review: "待验收",
+            monitoring: "观测中",
+            planned_ready: "待开工",
+            idle_untracked: "静默",
+          };
+          return [
+            `跨端舰队看板 (/ops，共纳管 ${allP.length} 项：此刻实时运行 ${runCnt} 项，活跃看板 ${activeP.length} 项，静默折叠 ${idleCnt} 项)：${(activeP.length ? activeP : allP)
+              .slice(0, 10)
+              .map((p) => {
+                const goal = p.statusCard?.stageGoal || p.executiveSummary?.goalText || "";
+                const landed = p.statusCard?.landed?.[0] || p.executiveSummary?.progressText || p.sanitizedSummary || "";
+                const rm = p.roadmapSummary?.activeNode;
+                const rmTag = rm?.code ? `[${rm.code}${rm.progress?.total ? ` ${rm.progress.done ?? 0}/${rm.progress.total}` : ""}]` : "";
+                const lane = p.status === "running" ? "实时运行" : (laneLabel[p.boardStatus ?? ""] || p.boardStatus || p.status || "静默");
+                const summary = [lane, rmTag, goal, landed].filter(Boolean).join(" · ");
+                const nodeTag = (p.nodes?.length ? p.nodes.join(",") : p.nodeId) || "";
+                return `${p.displayName || shortProj(p.projectKey)}${nodeTag ? `[${nodeTag}]` : ""}：${summary}`;
+              })
+              .join(" | ")}`,
+          ];
+        })()
       : []),
     ...(wb.opsFleet?.pendingInbox?.length
       ? [
@@ -912,31 +928,62 @@ export class StewardLlmAgent<TWorkbench extends StewardWorkbenchLike = StewardWo
       const fleet = refreshed?.snapshot ?? wb.opsFleet;
       const allProjects = fleet?.projects ?? [];
       const q = String(args.projectQuery ?? "").trim().toLowerCase();
-      const matched = q
-        ? allProjects.filter((pr) => {
-            const hay = `${pr.displayName ?? ""} ${shortProj(pr.projectKey)} ${pr.projectKey}`.toLowerCase();
-            return hay.includes(q) || q.includes(shortProj(pr.projectKey).toLowerCase());
-          })
-        : allProjects;
-      const list = (matched.length > 0 ? matched : allProjects).slice(0, q ? 5 : 15).map((pr) => ({
+      const laneLabel: Record<string, string> = {
+        blocked: "卡点/待拍板",
+        active_executing: "施工中",
+        pending_review: "待验收确认",
+        monitoring: "常驻/门禁观测",
+        planned_ready: "排期就绪/待开工",
+        idle_untracked: "静默/未建档",
+      };
+      const toProjectView = (pr: (typeof allProjects)[number]) => ({
         projectKey: pr.projectKey,
         displayName: pr.displayName || shortProj(pr.projectKey),
         nodes: pr.nodes ?? (pr.nodeId ? [pr.nodeId] : []),
-        boardStatus: pr.boardStatus || pr.status,
+        isRunningNow: pr.status === "running",
+        boardStatus: pr.boardStatus || pr.status || "idle_untracked",
+        boardStatusLabel: laneLabel[pr.boardStatus ?? ""] || pr.boardStatus || pr.status || "静默",
         boardStatusReason: pr.boardStatusReason,
         stage: pr.stage,
         lastActiveAt: pr.lastActiveAt || pr.updatedAtIso,
         statusCard: pr.statusCard,
         roadmapSummary: pr.roadmapSummary,
         executiveSummary: pr.executiveSummary,
-      }));
+      });
+      const runningNowList = allProjects.filter((pr) => pr.status === "running");
+      const activeBoardList = allProjects.filter(
+        (pr) => pr.status === "running" || ((pr.boardStatus ?? "idle_untracked") !== "idle_untracked" && pr.stage !== "archived"),
+      );
+      const counts = {
+        totalManaged: allProjects.length,
+        runningNow: runningNowList.length,
+        activeExecuting: allProjects.filter((pr) => pr.boardStatus === "active_executing").length,
+        blocked: allProjects.filter((pr) => pr.boardStatus === "blocked").length,
+        pendingReview: allProjects.filter((pr) => pr.boardStatus === "pending_review").length,
+        monitoring: allProjects.filter((pr) => pr.boardStatus === "monitoring").length,
+        plannedReady: allProjects.filter((pr) => pr.boardStatus === "planned_ready").length,
+        idleUntracked: allProjects.filter((pr) => (pr.boardStatus ?? "idle_untracked") === "idle_untracked" || pr.stage === "archived").length,
+        focusCount: allProjects.filter((pr) => pr.stage === "focus").length,
+      };
+      const matched = q
+        ? allProjects.filter((pr) => {
+            const hay = `${pr.displayName ?? ""} ${shortProj(pr.projectKey)} ${pr.projectKey}`.toLowerCase();
+            return hay.includes(q) || q.includes(shortProj(pr.projectKey).toLowerCase());
+          })
+        : activeBoardList;
+      const sourceForView = q ? matched : (activeBoardList.length > 0 ? activeBoardList : allProjects.slice(0, 8));
+      const list = sourceForView.slice(0, q ? 8 : 20).map(toProjectView);
       return {
         ok: true,
         opsBridgeConfigured: refreshed ? refreshed.configured : Boolean(fleet),
         ...(refreshed && !refreshed.ok && refreshed.reason ? { refreshWarning: refreshed.reason } : {}),
-        matchedCount: matched.length,
+        counts,
+        matchedCount: q ? matched.length : activeBoardList.length,
         totalProjects: allProjects.length,
+        runningNowProjects: runningNowList.slice(0, 12).map(toProjectView),
         projects: list,
+        idleFoldedCount: counts.idleUntracked,
+        reportingNote: "仅 runningNowProjects 代表此刻有会话正在实时运行；其余请按 boardStatusLabel（施工中/待验收确认/常驻门禁观测/待开工）汇报，切勿将静默折叠项目说成正在运行。",
         pendingInbox: fleet?.pendingInbox ?? [],
         weeklyFocus: fleet?.weeklyFocus ?? [],
       };

@@ -104,4 +104,103 @@ describe("StewardLlmAgent: Neon thought_signature preservation, deterministic gu
     expect(rFallback.intent).toBe("goals_query");
     expect(rFallback.reply).toContain("目标一");
   });
+
+  it("separates runningNow vs Kanban active lanes vs folded idle_untracked in manage_ops_fleet so idle repos are never misreported as running", async () => {
+    let capturedOverview: Record<string, unknown> | undefined;
+    let callIdx = 0;
+    const mockFetch: typeof fetch = async (_url, init) => {
+      callIdx += 1;
+      const body = JSON.parse(String(init?.body ?? "{}")) as { messages: Array<{ role: string; content?: string }> };
+      if (callIdx === 1) {
+        return new Response(
+          JSON.stringify({
+            model: "gemini-4-neon",
+            choices: [
+              {
+                message: {
+                  role: "assistant",
+                  content: null,
+                  tool_calls: [
+                    {
+                      id: "call_ops_1",
+                      type: "function",
+                      function: { name: "manage_ops_fleet", arguments: JSON.stringify({ action: "overview" }) },
+                    },
+                  ],
+                },
+              },
+            ],
+          }),
+        );
+      }
+      const toolMsg = body.messages.findLast((m) => m.role === "tool");
+      capturedOverview = JSON.parse(String(toolMsg?.content ?? "{}")) as Record<string, unknown>;
+      return new Response(
+        JSON.stringify({
+          model: "gemini-4-neon",
+          choices: [{ message: { role: "assistant", content: "当前 1 个正在运行（sugent），1 个门禁观测中（airtoken），另有 2 个静默项目已折叠。" } }],
+        }),
+      );
+    };
+
+    const { svc } = setup(mockFetch);
+    svc.ingestEdgeNodePulse({
+      nodeId: "local-mac",
+      projects: [
+        {
+          projectKey: "repo:ldc861117/sugent",
+          displayName: "sugent",
+          stage: "focus",
+          boardStatus: "active_executing",
+          status: "running",
+          updatedAtIso: "2026-11-26T04:20:00Z",
+          statusCard: { stageGoal: "统一云端大脑", reviewState: "pending_review" },
+        },
+        {
+          projectKey: "local:local-mac:old-demo-1",
+          displayName: "old-demo-1",
+          stage: "archived",
+          boardStatus: "idle_untracked",
+          status: "idle",
+          updatedAtIso: "2026-10-01T00:00:00Z",
+        },
+        {
+          projectKey: "local:local-mac:old-demo-2",
+          displayName: "old-demo-2",
+          stage: "incubating",
+          boardStatus: "idle_untracked",
+          status: "idle",
+          updatedAtIso: "2026-10-02T00:00:00Z",
+        },
+      ],
+    });
+    svc.setRemoteOpsSnapshot({
+      projects: [
+        {
+          projectKey: "repo:ldc861117/airtoken",
+          displayName: "airtoken",
+          nodeId: "gce-airtoken",
+          nodes: ["gce-airtoken"],
+          stage: "focus",
+          boardStatus: "monitoring",
+          status: "idle",
+          boardStatusReason: "H0 Canary 30 笔门禁观测中",
+          statusCard: { stageGoal: "H0 Canary 跑满 30 笔实盘闭环", reviewState: "confirmed" },
+        },
+      ],
+      pendingInbox: [],
+    });
+
+    const out = await svc.converse({ text: "现在你能看到在运行项目吗" });
+    expect(out.ok).toBe(true);
+    const counts = capturedOverview?.counts as Record<string, number> | undefined;
+    expect(counts?.totalManaged).toBe(4);
+    expect(counts?.runningNow).toBe(1);
+    expect(counts?.monitoring).toBe(1);
+    expect(counts?.idleUntracked).toBe(2);
+    const runningNowProjects = capturedOverview?.runningNowProjects as Array<{ displayName: string }> | undefined;
+    expect(runningNowProjects?.map((p) => p.displayName)).toEqual(["sugent"]);
+    const activeBoard = capturedOverview?.projects as Array<{ displayName: string }> | undefined;
+    expect(activeBoard?.map((p) => p.displayName)).toEqual(["sugent", "airtoken"]);
+  });
 });

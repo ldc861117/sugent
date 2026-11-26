@@ -176,6 +176,7 @@ export async function runEdgeTentacleMain(
 }> {
   const homeDir = deps.homeDir ?? os.homedir();
   const out = deps.stdout ?? ((line: string) => console.log(line));
+  const errOut = deps.stderr ?? ((line: string) => console.error(line));
   const cfg = parseEdgeTentacleCliConfig(argv, env, homeDir);
 
   const stateReader = new AntigravityStateReader({
@@ -189,6 +190,7 @@ export async function runEdgeTentacleMain(
     const scan = stateReader.scan();
     const projects = scanLocalProjectsForEdge({
       projectsRootDirs: cfg.projectsDirs,
+      homeDir,
       nodeId: cfg.nodeId,
       sessions: scan.sessions,
     });
@@ -214,6 +216,7 @@ export async function runEdgeTentacleMain(
     sidecarsDir: path.join(homeDir, ".gemini", "config", "sidecars"),
   });
 
+  let lastHealthy: boolean | null = null;
   const runner = deps.createRunner
     ? deps.createRunner(cfg)
     : new EdgeTentacleRunner({
@@ -221,8 +224,20 @@ export async function runEdgeTentacleMain(
         edgeToken: cfg.edgeToken,
         nodeId: cfg.nodeId,
         projectsRootDirs: cfg.projectsDirs,
+        homeDir,
         intervalMs: cfg.intervalSec * 1_000,
         scanSessions: () => stateReader.scan().sessions,
+        onCycle: (cycle) => {
+          if (cfg.once) return;
+          const ts = new Date().toISOString();
+          if (cycle.errors.length > 0) {
+            lastHealthy = false;
+            errOut(`[${ts}] [edge-tentacle:${cfg.nodeId}] hub=${cfg.hubUrl} projects=${cycle.projectCount} errors=${cycle.errors.join(" | ")}`);
+          } else if (lastHealthy !== true || cycle.commandsExecuted > 0) {
+            lastHealthy = true;
+            out(`[${ts}] [edge-tentacle:${cfg.nodeId}] connected hub=${cfg.hubUrl} projects=${cycle.projectCount} commands=${cycle.commandsExecuted}`);
+          }
+        },
         dispatchAntigravity: async (cmd) => {
           const prompt = cmd.prompt || cmd.summary || cmd.title;
           if (cmd.action === "dispatch_antigravity_resume" && cmd.conversationId) {
@@ -257,7 +272,8 @@ export async function runEdgeTentacleMain(
     return { exitCode: 0, mode: "once", config: cfg };
   }
 
-  runner.start?.();
+  out(`[${new Date().toISOString()}] [edge-tentacle:${cfg.nodeId}] starting daemon -> ${cfg.hubUrl} (interval=${cfg.intervalSec}s)`);
+  (runner as { start?: (opts?: { keepAlive?: boolean }) => void }).start?.({ keepAlive: true });
   await new Promise<void>((resolve) => {
     const onStop = () => {
       runner.stop?.();

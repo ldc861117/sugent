@@ -131,7 +131,7 @@ describe("Weixin Single-Holder Guard & GCE Steward <-> /ops WeChat Loop", () => 
       if (url.endsWith("/api/ops/node/auth")) {
         return new Response(JSON.stringify({ token: "jwt-gce", expiresInSec: 3600 }), { status: 200 });
       }
-      if (url.endsWith("/api/ops/bridge/steward-pending")) {
+      if (url.includes("/api/ops/bridge/steward-pending")) {
         return new Response(
           JSON.stringify({
             ok: true,

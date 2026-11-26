@@ -317,6 +317,7 @@ export class App {
       baseUrl: opsCfg.baseUrl,
       nodeToken: opsCfg.nodeToken,
       nodeId: opsCfg.nodeId,
+      opsNodeId: opsCfg.opsNodeId,
       stewardHubNodeId: opsCfg.stewardHubNodeId,
       getFetch: () => this.desktop?.fetch ?? globalThis.fetch,
     });

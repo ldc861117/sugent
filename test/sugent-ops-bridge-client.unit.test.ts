@@ -223,7 +223,7 @@ describe("OpsBridgeClient (/api/ops/node/auth & /api/ops/bridge/*)", () => {
         if (url.endsWith("/api/ops/node/auth")) {
           return new Response(JSON.stringify({ token: "jwt-hub", expiresInSec: 3600 }), { status: 200 });
         }
-        if (url.endsWith("/api/ops/bridge/steward-pending")) {
+        if (url.includes("/api/ops/bridge/steward-pending")) {
           return new Response(
             JSON.stringify({
               ok: true,
@@ -242,5 +242,75 @@ describe("OpsBridgeClient (/api/ops/node/auth & /api/ops/bridge/*)", () => {
     expect(hubPending.snapshot?.projects).toHaveLength(1);
     const hubSync = await hubClient.stewardSync({ weeklyFocus: ["Close GCE Resident Hub"] });
     expect(hubSync.ok).toBe(true);
+  });
+
+  it("aligns 1:1 with Andy-web /ops node auth (opsNodeId=gce-airtoken + nodeToken + bridgeJwt + expiresAt) while preserving gce-hub WeChat ownership", async () => {
+    let seenAuthBody: Record<string, unknown> | undefined;
+    let seenPendingUrl = "";
+    const nowMs = Date.parse("2026-11-26T04:00:00Z");
+
+    const cfg = resolveOpsBridgeConfig({
+      OPS_BASE_URL: MOCK_OPS_BASE,
+      OPS_NODE_TOKEN: "ops-real-node-secret",
+      SUGENT_NODE_ID: "gce-hub",
+      OPS_NODE_ID: "gce-airtoken",
+      SUGENT_STEWARD_HUB_NODE: "gce-hub",
+    });
+    expect(cfg.nodeId).toBe("gce-hub");
+    expect(cfg.opsNodeId).toBe("gce-airtoken");
+
+    const client = new OpsBridgeClient({
+      ...cfg,
+      nowMs: () => nowMs,
+      fetchImpl: (async (input, init) => {
+        const url = String(input);
+        if (url.endsWith("/api/ops/node/auth")) {
+          seenAuthBody = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+          if (!seenAuthBody.nodeToken || seenAuthBody.nodeId !== "gce-airtoken") {
+            return new Response(JSON.stringify({ error: "missing_node_token_or_bad_node" }), { status: 401 });
+          }
+          return new Response(
+            JSON.stringify({
+              bridgeJwt: "bridge-jwt-v4-live",
+              expiresAt: "2026-11-26T05:00:00Z",
+              maxTierCap: 2,
+            }),
+            { status: 200 },
+          );
+        }
+        if (url.includes("/api/ops/bridge/steward-pending")) {
+          seenPendingUrl = url;
+          return new Response(
+            JSON.stringify({
+              projects: [
+                {
+                  projectKey: "repo:ldc861117/airtoken",
+                  displayName: "airtoken",
+                  domain: "quant_trading",
+                  stage: "focus",
+                  stageSource: "user_override",
+                  boardStatus: "monitoring",
+                  boardStatusReason: "H0 交付已齐，处于门禁观测期",
+                  nodes: ["gce-airtoken"],
+                },
+              ],
+              workItems: [{ id: "wi-1", title: "核验 AirToken Canary 30 笔对账", targetNodeId: "gce-airtoken" }],
+            }),
+            { status: 200 },
+          );
+        }
+        return new Response("{}", { status: 404 });
+      }) as typeof fetch,
+    });
+
+    expect(client.isStewardHub()).toBe(true);
+    const pending = await client.stewardPending();
+    expect(seenAuthBody?.nodeToken).toBe("ops-real-node-secret");
+    expect(seenAuthBody?.nodeId).toBe("gce-airtoken");
+    expect(seenPendingUrl).toContain("/api/ops/bridge/steward-pending?nodeId=gce-airtoken");
+    expect(pending.ok).toBe(true);
+    expect(pending.snapshot?.projects[0]?.projectKey).toBe("repo:ldc861117/airtoken");
+    expect(pending.snapshot?.projects[0]?.boardStatus).toBe("monitoring");
+    expect(pending.snapshot?.pendingInbox[0]?.id).toBe("wi-1");
   });
 });

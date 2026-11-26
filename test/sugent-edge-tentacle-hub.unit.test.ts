@@ -325,4 +325,97 @@ describe("Sugent Edge-Tentacle Hub & Local Governance Scanner", () => {
     expect(dispatched).toEqual([cmd.id]);
     expect(hub.toOpsStewardSnapshot().projects[0]?.displayName).toBe("sugent");
   });
+
+  it("parses AirToken emoji/Horizon ROADMAP.md (✅ + Exit Gate -> monitoring) and excludes untouched cloned repos in Kanban mode", () => {
+    const airtokenFixturePath = path.resolve(process.cwd(), "../agy-fleet-config/tests/fixtures/airtoken_ROADMAP.md");
+    if (fs.existsSync(airtokenFixturePath)) {
+      const airtokenMd = fs.readFileSync(airtokenFixturePath, "utf8");
+      const parsedAir = parseRepoRoadmapMarkdown(airtokenMd);
+      expect(parsedAir.activeNode?.status).toBe("monitoring");
+      expect(parsedAir.activeNode?.progress.done).toBe(22);
+      expect(parsedAir.activeNode?.progress.total).toBe(22);
+      expect(parsedAir.totals.done).toBeGreaterThanOrEqual(23);
+    }
+
+    const fakeHome = makeTempDir("sugent-kanban-home-");
+    const projectsRoot = path.join(fakeHome, "Projects");
+    fs.mkdirSync(projectsRoot, { recursive: true });
+
+    for (let i = 1; i <= 45; i += 1) {
+      const cloneName = `A-Clone-${String(i).padStart(2, "0")}`;
+      const cloneDir = path.join(projectsRoot, cloneName);
+      fs.mkdirSync(path.join(cloneDir, ".git"), { recursive: true });
+      fs.writeFileSync(path.join(cloneDir, "package.json"), JSON.stringify({ name: cloneName }));
+    }
+
+    const andyDir = path.join(projectsRoot, "z-andy-web");
+    fs.mkdirSync(path.join(andyDir, ".git"), { recursive: true });
+    fs.writeFileSync(path.join(andyDir, ".git", "config"), '[remote "origin"]\n\turl = git@github.com:ldc861117/Andy-web.git\n');
+    const regProjectsDir = path.join(fakeHome, [".ge" + "mini", "config", "projects"].join(path.sep));
+    fs.mkdirSync(regProjectsDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(regProjectsDir, "andy.json"),
+      JSON.stringify({
+        id: "andy-web",
+        name: "Andy-web",
+        projectResources: { resources: [{ gitFolder: { folderUri: `file://${andyDir}` } }] },
+      }),
+    );
+
+    const sugentDir = path.join(projectsRoot, "sugent");
+    fs.mkdirSync(path.join(sugentDir, ".git"), { recursive: true });
+    fs.writeFileSync(
+      path.join(sugentDir, "STATUS.md"),
+      "---\nreview_state: pending_review\nupdated_at: 2026-11-26T04:00:00Z\n---\n## 阶段目标\n对齐看板纳管逻辑\n## 最近完成\n- 完成第 27 节门禁\n## 在途\n- 无\n## 下一步\n- 推送云端\n## 卡点\n- 无\n",
+    );
+
+    const optAirDir = path.join(fakeHome, "opt-airtoken");
+    fs.mkdirSync(optAirDir, { recursive: true });
+    fs.writeFileSync(path.join(optAirDir, ".ops-project.json"), JSON.stringify({ projectKey: "repo:ldc861117/airtoken" }));
+    fs.writeFileSync(
+      path.join(optAirDir, "ROADMAP.md"),
+      "## Horizon 0 (H0): 实盘 Canary（当前活跃阶段）\n- **Core Deliverables:**\n  - `H0.1` ✅ 已落地一\n  - `H0.2` ✅ 已落地二\n- **Exit / Profit Gate:**\n  1. 跑满 30 笔实盘闭环\n",
+    );
+
+    const coworkDir = path.join(projectsRoot, "lean-cowork");
+    fs.mkdirSync(path.join(coworkDir, ".git"), { recursive: true });
+
+    const scanned = scanLocalProjectsForEdge({
+      projectsRootDirs: [projectsRoot, optAirDir],
+      homeDir: fakeHome,
+      nodeId: "local-mac",
+      nowIso: "2026-11-26T04:30:00Z",
+      sessions: [
+        {
+          projectKey: "local:local-mac:lean-cowork",
+          workspaceRoot: coworkDir,
+          conversationId: "conv-run-1",
+          title: "执行客户交付脚本",
+          isRunning: true,
+          stepCount: 8,
+          activeSubagentCount: 1,
+          lastModifiedMs: Date.parse("2026-11-26T04:29:00Z"),
+        },
+      ],
+    });
+
+    const keys = scanned.map((p) => p.projectKey);
+    expect(keys.some((k) => k.includes("a-clone"))).toBe(false);
+    expect(scanned).toHaveLength(4);
+    expect(keys).toEqual(
+      expect.arrayContaining([
+        "repo:ldc861117/andy-web",
+        "local:local-mac:sugent",
+        "repo:ldc861117/airtoken",
+        "local:local-mac:lean-cowork",
+      ]),
+    );
+
+    const byKey = new Map(scanned.map((p) => [p.projectKey, p]));
+    expect(byKey.get("local:local-mac:lean-cowork")?.boardStatus).toBe("active_executing");
+    expect(byKey.get("local:local-mac:lean-cowork")?.status).toBe("running");
+    expect(byKey.get("local:local-mac:sugent")?.boardStatus).toBe("pending_review");
+    expect(byKey.get("repo:ldc861117/airtoken")?.boardStatus).toBe("monitoring");
+    expect(byKey.get("repo:ldc861117/andy-web")?.boardStatus).toBe("idle_untracked");
+  });
 });
