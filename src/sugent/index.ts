@@ -66,3 +66,6 @@ export * from "./worktree-and-platform-guard.js";
 export * from "./offline-digest-and-power-guard.js";
 export * from "./weixin-quota-and-briefing.js";
 export * from "./weapon-packages.js";
+export * from "./edge-tentacle-hub.js";
+export * from "./chat-transcript-recall.js";
+

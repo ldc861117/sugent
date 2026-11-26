@@ -75,6 +75,11 @@ export class OwnerChannelStewardRouter {
       steward: OwnerStewardPort;
       enabled?: () => boolean;
       maxTurns?: number;
+      hydrateHistory?: (input: {
+        channel: string;
+        peerId: string;
+        maxMessages: number;
+      }) => Array<{ role: "user" | "assistant"; content: string }>;
     },
   ) {}
 
@@ -82,8 +87,23 @@ export class OwnerChannelStewardRouter {
     return `${channel.trim().toLowerCase()}::${peerId.trim()}`;
   }
 
+  private ensurePeerHistory(channel: string, peerId: string, maxMessages: number): Array<{ role: "user" | "assistant"; content: string }> {
+    const key = this.sessionKey(channel, peerId);
+    const cached = this.historyByPeer.get(key);
+    if (cached !== undefined) return cached;
+    const hydrated = this.opts.hydrateHistory
+      ? this.opts.hydrateHistory({
+          channel: channel.trim().toLowerCase(),
+          peerId: peerId.trim(),
+          maxMessages,
+        }).slice(-maxMessages)
+      : [];
+    this.historyByPeer.set(key, hydrated);
+    return hydrated;
+  }
+
   clearSessionHistory(channel: string, peerId: string): void {
-    this.historyByPeer.delete(this.sessionKey(channel, peerId));
+    this.historyByPeer.set(this.sessionKey(channel, peerId), []);
   }
 
   canIntercept(ev: Pick<OwnerInboundChannelEvent, "isGroup" | "isOwnerPeer" | "text">): boolean {
@@ -120,7 +140,7 @@ export class OwnerChannelStewardRouter {
       if (RETRY_STRONGER_RE.test(text) && this.opts.steward.retryLastTurnStronger) {
         const retried = await this.opts.steward.retryLastTurnStronger("owner_private");
         if (!retried.ok || !retried.reply.trim()) return { handled: false };
-        const hist = this.historyByPeer.get(key) ?? [];
+        const hist = this.ensurePeerHistory(ev.channel, ev.peerId, maxMessages);
         if (hist.length >= 2 && hist[hist.length - 1]?.role === "assistant") {
           const replaced = [...hist.slice(0, -1), { role: "assistant" as const, content: retried.reply }].slice(-maxMessages);
           this.historyByPeer.set(key, replaced);
@@ -133,7 +153,7 @@ export class OwnerChannelStewardRouter {
         };
       }
 
-      const prior = [...(this.historyByPeer.get(key) ?? [])];
+      const prior = [...this.ensurePeerHistory(ev.channel, ev.peerId, maxMessages)];
       const channel = normalizeDropzoneChannel(ev.channel);
       const out = await this.opts.steward.converse({
         text,
@@ -146,7 +166,7 @@ export class OwnerChannelStewardRouter {
         return { handled: false };
       }
 
-      const latest = this.historyByPeer.get(key) ?? [];
+      const latest = this.ensurePeerHistory(ev.channel, ev.peerId, maxMessages);
       const nextHist = [...latest, { role: "user" as const, content: text }, { role: "assistant" as const, content: out.reply }].slice(
         -maxMessages,
       );

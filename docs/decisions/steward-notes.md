@@ -41,3 +41,13 @@
 3. **端-边联邦武器包确定性门禁与否定保护条款消歧（`P2.3`）**：
    - 工业现场 FDE 诊断包（`industrial-fde-diagnostics`）与一人公司合同防漏包（`opc-contract-quote-guard`）均以安全信封包裹外部不可信批次/合同文本，所有产出强制进入 `PENDING_REVIEW` 或主理人拍板卡（`requiresHumanStagingGate: true`）。
    - 合同红线扫描通过前向窗口否定词检测（`不承担/不涉及/免除/排除`）区分保护性免责条款（如“乙方不承担无限连带责任”放行）与真实毒丸条款（拦截），并由 `WeaponSoakTelemetryLedger` 执行 14 天常驻与越权事故一票否决计量。
+
+## 2026-11-25 · 云端唯一主权大脑、全渠道跨天记忆与边缘编码触手架构
+
+1. **「服务端唯一大脑 + 全端零折损触手」产品哲学对齐**：
+   - 将 Sugent 明确收敛为常驻云端的唯一顶层管家与总协调者（不把状态锁死在某台笔记本客户端上，也不让顶层管家越俎代庖硬写业务代码）。微信与 HTTPS Web 工作台连接同一颗云端大脑，共享 100% 对等记忆与全局态势；具体编码开发任务通过 `dispatch_edge_antigravity` 下发至本机 `local-mac` 或云端 `gce-remote` 的轻量 `edge:tentacle` 守护代调 Antigravity 落地，完工后幂等回执并推送微信通知。
+2. **自然语言跨天时间浏览查询防误杀与容器冷启动回填**：
+   - 此前微信端回答“日常对话不会跨天存留”，根因在于：(a) 容器重启后 `OwnerChannelStewardRouter` 内存滑窗清零；(b) `StewardLlmAgent` 缺少历史对话检索工具。`ChatTranscriptRecallService` 在不改动上游 `anymodel.db` 表结构的前提下合并 SQLite 历史消息与 `0o600` `steward-web-turns.jsonl`，对“昨天我们聊了什么”（含拼音误触“昨天我没聊了什么”）自动剥离时间/元提问词并聚焦昨日时间窗，避免拿“昨天”做字面子串过滤导致零命中。
+3. **反向代理鉴权安全细节（`Secure` Cookie + `no-referrer` + 最小权限边缘令牌）**：
+   - 经 HTTPS 反向代理首次通过 `/?token=<ui-token>` 换取长效 `amb_token` Cookie 时，根据 `X-Forwarded-Proto: https` 自动追加 `; Secure` 与 `Referrer-Policy: no-referrer` 响应头，杜绝令牌经 `Referer` 外泄；`SUGENT_EDGE_TOKEN` 采用 SHA-256 摘要 `crypto.timingSafeEqual` 恒定时间比对，且仅放行 `/amb/api/steward/edge/*` 路由，与浏览器全权管理令牌严格隔离。
+

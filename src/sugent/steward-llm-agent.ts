@@ -35,6 +35,8 @@ import type {
   RoutingStrategyPreset,
   TaskArchetype,
 } from "./routing-experience-store.js";
+import type { ChatHistoryRecallResult, RecallChatHistoryInput } from "./chat-transcript-recall.js";
+import type { EdgeNodeStatus, EdgeQueuedCommand } from "./edge-tentacle-hub.js";
 
 export interface StewardLlmEndpoint {
   baseUrl: string;
@@ -150,6 +152,16 @@ export interface StewardLlmToolsPort<TWorkbench extends StewardWorkbenchLike = S
     requiresDashboardConfirm?: boolean;
     weeklyFocus?: string[];
   }): Promise<Record<string, unknown>>;
+  recallChatHistory?(input: RecallChatHistoryInput): ChatHistoryRecallResult;
+  dispatchEdgeAntigravity?(input: {
+    targetNodeId?: string;
+    mode?: "new" | "resume";
+    title: string;
+    prompt: string;
+    projectQuery?: string;
+    conversationId?: string;
+    workspaceHint?: string;
+  }): Promise<{ ok: boolean; command?: EdgeQueuedCommand; nodes?: EdgeNodeStatus[]; errorCode?: string; message?: string }> | { ok: boolean; command?: EdgeQueuedCommand; nodes?: EdgeNodeStatus[]; errorCode?: string; message?: string };
 }
 
 export interface LocalTaskDelegationInput {
@@ -182,6 +194,8 @@ export const STEWARD_CAPABILITY_DESCRIPTORS: readonly CapabilityDescriptor[] = [
   { toolName: "manage_model_routing", title: "CLIProxyAPI 全量模型对齐与自适应路由", summary: "查看模型池与经验评分、同步全量可用模型、切换省配额/平衡/旗舰策略或设定偏好约束", whenToUse: ["同步模型池/查看当前自动选模情况/切换省钱或旗舰策略/以后某类任务优先或禁用某模型"] },
   { toolName: "manage_hot_update", title: "分层热启动与热更新控制 (L0-L3)", summary: "查看热更新/A-B槽位状态、触发 UI 热刷新、Core 热重启、安全回滚槽位或恢复出厂金丝雀", whenToUse: ["热重启/热更新状态/UI热刷新/回滚槽位/恢复出厂镜像"] },
   { toolName: "delegate_local_execution", title: "本机终端/文件/桌面操控异步下沉执行", summary: "将耗时终端命令、本地文件整理或原生桌面软件操控委托给后台 DSH 执行引擎异步推进", whenToUse: ["执行本机命令/整理本地文件夹/操控桌面软件/导出本地报表"] },
+  { toolName: "recall_chat_history", title: "全渠道跨天对话记忆召回", summary: "检索微信、网页端与飞书跨天原始聊天记录（支持昨天/前天/上周或按项目关键词检索）", whenToUse: ["昨天我们聊了什么/回忆之前对话/查找某天聊过的决定"] },
+  { toolName: "dispatch_edge_antigravity", title: "边缘触手 Antigravity 远程派单", summary: "作为顶层管家将具体编码开发与验证任务下发给本机 local-mac 或云端 gce-remote 的 Antigravity 触手执行", whenToUse: ["让本机或云端 Antigravity 改代码/给某项目派开发任务/唤醒远端会话"] },
 ];
 const LLM_TOOLS = [
   {
@@ -408,6 +422,42 @@ const LLM_TOOLS = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "recall_chat_history",
+      description: "检索主人与管家在微信、网页端、飞书等全渠道的跨天历史对话记录（自动脱敏密钥）。当主人询问“昨天我们聊了什么”、“之前聊过某事吗”、“上次说的决定”时，必须优先调用此工具，严禁声称不保存跨天对话。",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "时间线索或话题关键词，如 '昨天我们聊了什么' 或 'airtoken'" },
+          daysBack: { type: "number", description: "向前追溯天数，默认按时间词自动推断（如昨天=2，上周=14）" },
+          channel: { type: "string", enum: ["all", "weixin", "feishu", "web", "web_ui"], description: "渠道筛选，默认 all 全渠道合并" },
+          limit: { type: "number", description: "返回条数上限，默认 24" },
+        },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "dispatch_edge_antigravity",
+      description: "作为常驻云端的顶层管家与总协调者，将具体的代码编写、功能迭代或测试修复任务派发给边缘节点的 Antigravity 执行触手（如本机 local-mac 或云端远程开发机 gce-remote）落地执行，完工后自动向微信推送回执。",
+      parameters: {
+        type: "object",
+        properties: {
+          targetNodeId: { type: "string", description: "目标执行节点 ID（如 local-mac 或 gce-remote），留空则按项目所在节点自动路由" },
+          mode: { type: "string", enum: ["new", "resume"], description: "新建会话 new 或唤醒既有会话 resume，默认 new" },
+          title: { type: "string", description: "简明开发任务标题" },
+          prompt: { type: "string", description: "发给 Antigravity 的完整任务背景、目标与验收要求" },
+          projectQuery: { type: "string", description: "关联项目名称或代号，如 airtoken、sugent" },
+          conversationId: { type: "string", description: "mode='resume' 时要唤醒的目标会话 ID" },
+          workspaceHint: { type: "string", description: "可选项目目录名提示" },
+        },
+        required: ["title", "prompt"],
+      },
+    },
+  },
 ];
 const shortProj = (k: string): string => k.replace(/^repo:[^/]+\//, "").replace(/^local:[^:]+:/, "");
 const tierLabel = (t: 0 | 1 | 2): string => (t === 0 ? "私密（仅本机）" : t === 1 ? "脱敏摘要" : "深度协同");
@@ -454,10 +504,11 @@ function buildSystemPrompt(wb: StewardWorkbenchLike): string {
     : "";
 
   return [
-    "你是主人的贴身私人管家与生命幕僚（Sugent），围着主人本人生长，而不是技术控制台。",
+    "你是常驻云端的主权顶层管家与生命幕僚（Sugent），围着主人本人生长；微信与网页端都只是连接你这颗唯一大脑的零折损触手。",
     "表达准则：全程用自然、简练、像真人助理聊天的中文直接回应（说人话）。绝对禁止暴露任何内部实现术语或代号（如 Epoch、T0/T1/T2、L0/L1/L3、superseded、CASCADE_RUN_STATUS、tool_calls、JSON 字段名）。隐私档位统一说“私密（仅本机）/ 脱敏摘要 / 深度协同”。",
-    "项目命名与状态铁律：称呼 Antigravity 项目时一律优先用工具返回的显示名（如 Andy-web），不要拿底层仓库后缀代替；当主人询问某个项目的最新进展、状态或路线图（如“查一下 airtoken 最新进展”）时，务必优先调用 manage_ops_fleet(action='overview', projectQuery='项目名') 实时拉取 /ops 上的状态卡（阶段目标/最近完成/下一步/卡点）和路线图进度，绝不可只看本机有没有活跃会话就回答“看不到活跃会话”；当本机存在运行中会话时可再配合 manage_antigravity(action='comprehend_session') 补充现场细节。",
-    "行动准则：遇到查询目标/待办/档案/来信/开发项目、读取完整本地 .md 或报告全文、记录事项、更改目标、处理来信、绑定仓或发起定制开发时，务必先调用对应工具获取真实现场数据或执行状态变更再回答，绝不靠猜或编造结果；工具返回 ok=false 时必须如实告知限制原因，绝不越权伪造成功。",
+    "跨天全渠道记忆铁律：当主人询问“昨天我们聊了什么”、“上次提过的某件事”、“前几天讨论的方案”等历史对话时，必须第一时间调用 recall_chat_history 检索微信与网页端真实历史对话记录，绝不可声称“日常对话不会跨天存留”。",
+    "管家统筹与编码触手分工铁律：你的定位是顶层协调者与大管家，不亲自下场硬写业务代码；当主人询问任意项目的最新进展、状态或路线图（如 airtoken、sugent、近期推进的项目）时，务必先调用 manage_ops_fleet(action='overview') 实时拉取全节点触手汇聚的状态卡与路线图；当需要具体改代码、跑开发任务时，优先调用 dispatch_edge_antigravity 派单给本机 local-mac 或云端 gce-remote 的 Antigravity 触手落地执行。",
+    "行动准则：遇到查询目标/待办/档案/历史聊天/来信/开发项目、读取完整本地 .md 或报告全文、记录事项、更改目标、处理来信或派发开发任务时，务必先调用对应工具获取真实现场数据或执行状态变更再回答，绝不靠猜或编造结果；工具返回 ok=false 时必须如实告知限制原因，绝不越权伪造成功。",
     ...(capBlock ? ["", capBlock] : []),
     "",
     `当前状况速览（免打扰=${wb.quietHoursActive ? "开启" : "关闭"}，待回复外部来信=${msgCount}条，本机 Antigravity 主会话=${wb.antigravity.totalSessions}个）：`,
@@ -655,6 +706,8 @@ export class StewardLlmAgent<TWorkbench extends StewardWorkbenchLike = StewardWo
     if (name === "manage_hot_update") return this.executeHotUpdateTool(args);
     if (name === "delegate_local_execution") return this.executeLocalDelegationTool(args, channel);
     if (name === "manage_ops_fleet") return this.executeOpsFleetTool(args, wb);
+    if (name === "recall_chat_history") return this.executeRecallChatHistoryTool(args, domain);
+    if (name === "dispatch_edge_antigravity") return this.executeDispatchEdgeAntigravityTool(args, domain);
     return this.executePrefsTool(args, wb, domain);
   }
 
@@ -901,6 +954,43 @@ export class StewardLlmAgent<TWorkbench extends StewardWorkbenchLike = StewardWo
       ...(typeof args.requiresDashboardConfirm === "boolean" ? { requiresDashboardConfirm: args.requiresDashboardConfirm } : {}),
       ...(Array.isArray(args.weeklyFocus) ? { weeklyFocus: args.weeklyFocus.map(String) } : {}),
     });
+  }
+
+  private executeRecallChatHistoryTool(args: Record<string, unknown>, domain: CallerAccessDomain): Record<string, unknown> {
+    if (domain !== "owner_private") {
+      return { ok: false, errorCode: "OWNER_ONLY_TOOL", reason: "跨渠道历史对话记录仅对主理人私域开放" };
+    }
+    const fn = this.opts.toolsPort.recallChatHistory;
+    if (!fn) return { ok: false, errorCode: "CHAT_RECALL_UNAVAILABLE" };
+    const res = fn({
+      ...(typeof args.query === "string" ? { query: args.query } : {}),
+      ...(typeof args.daysBack === "number" && Number.isFinite(args.daysBack) ? { daysBack: args.daysBack } : {}),
+      ...(typeof args.channel === "string" ? { channel: args.channel as RecallChatHistoryInput["channel"] } : {}),
+      ...(typeof args.limit === "number" && Number.isFinite(args.limit) ? { limit: args.limit } : {}),
+      ownerOnly: true,
+    });
+    return { ...res };
+  }
+
+  private async executeDispatchEdgeAntigravityTool(args: Record<string, unknown>, domain: CallerAccessDomain): Promise<Record<string, unknown>> {
+    if (domain !== "owner_private") {
+      return { ok: false, errorCode: "OWNER_ONLY_TOOL", reason: "跨节点编码派单仅限主理人私域调用" };
+    }
+    const fn = this.opts.toolsPort.dispatchEdgeAntigravity;
+    if (!fn) return { ok: false, errorCode: "EDGE_DISPATCH_UNAVAILABLE" };
+    const title = String(args.title ?? "").trim();
+    const prompt = String(args.prompt ?? "").trim();
+    if (!title || !prompt) return { ok: false, errorCode: "MISSING_TITLE_OR_PROMPT" };
+    const out = await fn({
+      ...(typeof args.targetNodeId === "string" && args.targetNodeId.trim() ? { targetNodeId: args.targetNodeId.trim() } : {}),
+      mode: args.mode === "resume" ? "resume" : "new",
+      title,
+      prompt,
+      ...(typeof args.projectQuery === "string" && args.projectQuery.trim() ? { projectQuery: args.projectQuery.trim() } : {}),
+      ...(typeof args.conversationId === "string" && args.conversationId.trim() ? { conversationId: args.conversationId.trim() } : {}),
+      ...(typeof args.workspaceHint === "string" && args.workspaceHint.trim() ? { workspaceHint: args.workspaceHint.trim() } : {}),
+    });
+    return { ...out };
   }
 
   private async invokeChat(ep: ResolvedRouteEndpoint, messages: Array<Record<string, unknown>>) {

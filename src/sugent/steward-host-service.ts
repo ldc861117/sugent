@@ -125,6 +125,17 @@ import {
   type RedlineDiffCard,
   type WeaponPackageManifest,
 } from "./weapon-packages.js";
+import {
+  EdgeTentacleHub,
+  type EdgeIngestPulseInput,
+  type EdgeNodeStatus,
+  type EdgeQueuedCommand,
+} from "./edge-tentacle-hub.js";
+import {
+  ChatTranscriptRecallService,
+  type ChatHistoryRecallResult,
+  type RecallChatHistoryInput,
+} from "./chat-transcript-recall.js";
 
 export interface SugentStewardHostServiceOptions {
   dataDir: string;
@@ -155,6 +166,8 @@ export interface SugentStewardHostServiceOptions {
   vibeCommandRunner?: CommandExecPort;
   delegateLocalTask?: (input: LocalTaskDelegationInput) => Promise<LocalTaskDelegationResult>;
   opsBridge?: OpsBridgeClient;
+  chatRecall?: ChatTranscriptRecallService;
+  edgeTokens?: readonly string[];
   manifestPath?: string;
   workspaceRoot?: string;
   powerSaveBlockerDriver?: PowerSaveBlockerDriver;
@@ -417,6 +430,8 @@ export class SugentStewardHostService {
   readonly offlineVault: E2eeOfflineDigestVault;
   readonly weixinQuotaGuard: WeixinAdaptiveQuotaGuard;
   readonly weaponSoakLedger: WeaponSoakTelemetryLedger;
+  readonly edgeHub: EdgeTentacleHub;
+  readonly chatRecall: ChatTranscriptRecallService;
   private readonly homeDir: string;
   private lastBootNotice?: PostBootNotice;
   private lastRouteTurn?: {
@@ -519,6 +534,15 @@ export class SugentStewardHostService {
     this.offlineVault = new E2eeOfflineDigestVault({ dataDir: opts.dataDir });
     this.weixinQuotaGuard = new WeixinAdaptiveQuotaGuard();
     this.weaponSoakLedger = new WeaponSoakTelemetryLedger(opts.dataDir);
+    this.edgeHub = new EdgeTentacleHub({
+      dataDir: opts.dataDir,
+      edgeTokens: opts.edgeTokens,
+      now: () => Date.parse(this.nowIsoFn()) || Date.now(),
+    });
+    this.chatRecall = opts.chatRecall ?? new ChatTranscriptRecallService({
+      dataDir: opts.dataDir,
+      nowMs: () => Date.parse(this.nowIsoFn()) || Date.now(),
+    });
     this.codingHarnesses = new CodingHarnessRegistry([
       new AntigravityCodingHarness(this.dispatcher),
       new AcpCodingHarness({ backend: "claude_code" }),
@@ -640,6 +664,8 @@ export class SugentStewardHostService {
         manageHotUpdate: (input) => this.executeHotUpdateAction(input),
         refreshOpsFleet: () => this.refreshRemoteOpsSnapshot(),
         proposeOpsInbox: (input) => this.proposeOpsInbox(input),
+        recallChatHistory: (input) => this.recallChatHistory(input),
+        dispatchEdgeAntigravity: (input) => this.dispatchEdgeAntigravity(input),
         ...(opts.delegateLocalTask ? { delegateLocalTask: opts.delegateLocalTask } : {}),
         ...(opts.conciergeBridge ? { executeConciergeCommand: (cmd, ch) => opts.conciergeBridge!.executeOwnerCommand(cmd, ch) } : {}),
       },
@@ -986,8 +1012,11 @@ export class SugentStewardHostService {
       ...(callerDomain === "owner_private"
         ? { skillCandidates: this.opts.knowledgeGraph.listSkillCandidates({ threshold: 3 }) }
         : {}),
-      ...(callerDomain === "owner_private" && this.remoteOpsSnapshot
-        ? { opsFleet: this.remoteOpsSnapshot }
+      ...(callerDomain === "owner_private"
+        ? (() => {
+            const mergedFleet = this.getMergedOpsFleetSnapshot();
+            return mergedFleet ? { opsFleet: mergedFleet } : {};
+          })()
         : {}),
       routing,
       ...(this.opts.hotUpdatePort ? { hotUpdate: this.getHotUpdateStatus() } : {}),
@@ -1660,7 +1689,100 @@ export class SugentStewardHostService {
   }
 
   getRemoteOpsSnapshot(): OpsStewardPendingSnapshot | undefined {
-    return this.remoteOpsSnapshot;
+    return this.getMergedOpsFleetSnapshot();
+  }
+
+  getMergedOpsFleetSnapshot(): OpsStewardPendingSnapshot | undefined {
+    const edgeSnap = this.edgeHub.toOpsStewardSnapshot();
+    const hasEdge = edgeSnap.projects.length > 0 || this.edgeHub.listNodes().length > 0;
+    if (!hasEdge && !this.remoteOpsSnapshot) return undefined;
+    if (!this.remoteOpsSnapshot) {
+      return {
+        ...edgeSnap,
+        pendingInbox: Array.from(this.stagedOpsInbox.values()),
+      };
+    }
+    if (!hasEdge) return this.remoteOpsSnapshot;
+
+    const byKey = new Map<string, OpsStewardPendingSnapshot["projects"][number]>();
+    for (const p of this.remoteOpsSnapshot.projects) {
+      if (p?.projectKey) byKey.set(p.projectKey, p);
+    }
+    for (const ep of edgeSnap.projects) {
+      if (!ep?.projectKey) continue;
+      const prev = byKey.get(ep.projectKey);
+      if (!prev) {
+        byKey.set(ep.projectKey, ep);
+        continue;
+      }
+      const combinedNodes = Array.from(new Set([...(prev.nodes ?? (prev.nodeId ? [prev.nodeId] : [])), ...(ep.nodes ?? (ep.nodeId ? [ep.nodeId] : []))]));
+      byKey.set(ep.projectKey, {
+        ...prev,
+        ...ep,
+        nodes: combinedNodes,
+        statusCard: ep.statusCard ?? prev.statusCard,
+        roadmapSummary: ep.roadmapSummary ?? prev.roadmapSummary,
+        executiveSummary: ep.executiveSummary ?? prev.executiveSummary,
+      });
+    }
+    return {
+      fetchedAtIso: edgeSnap.fetchedAtIso ?? this.remoteOpsSnapshot.fetchedAtIso,
+      projects: Array.from(byKey.values()),
+      pendingInbox: this.remoteOpsSnapshot.pendingInbox.length > 0 ? this.remoteOpsSnapshot.pendingInbox : Array.from(this.stagedOpsInbox.values()),
+      ...(this.remoteOpsSnapshot.weeklyFocus ? { weeklyFocus: this.remoteOpsSnapshot.weeklyFocus } : {}),
+      ...(edgeSnap.stageGoals ?? this.remoteOpsSnapshot.stageGoals ? { stageGoals: edgeSnap.stageGoals ?? this.remoteOpsSnapshot.stageGoals } : {}),
+    };
+  }
+
+  ingestEdgeNodePulse(input: EdgeIngestPulseInput) {
+    return this.edgeHub.ingestNodePulse(input);
+  }
+
+  recallChatHistory(input: RecallChatHistoryInput = {}): ChatHistoryRecallResult {
+    return this.chatRecall.recallChatHistory(input);
+  }
+
+  dispatchEdgeAntigravity(input: {
+    targetNodeId?: string;
+    mode?: "new" | "resume";
+    title: string;
+    prompt: string;
+    projectQuery?: string;
+    conversationId?: string;
+    workspaceHint?: string;
+  }): { ok: boolean; command: EdgeQueuedCommand; nodes: EdgeNodeStatus[]; message: string } {
+    const fleet = this.getMergedOpsFleetSnapshot();
+    const q = String(input.projectQuery ?? "").trim().toLowerCase();
+    const matchedProj = q
+      ? fleet?.projects.find((p) => `${p.displayName ?? ""} ${p.projectKey}`.toLowerCase().includes(q))
+      : undefined;
+    const targetNodeId =
+      input.targetNodeId?.trim() ||
+      matchedProj?.nodeId ||
+      matchedProj?.nodes?.[0] ||
+      this.edgeHub.listNodes().find((n) => n.online)?.nodeId ||
+      "local-mac";
+    const action = input.mode === "resume" && input.conversationId ? "dispatch_antigravity_resume" : "dispatch_antigravity_new";
+    const command = this.edgeHub.enqueueCommand({
+      targetNodeId,
+      action,
+      title: input.title,
+      prompt: input.prompt,
+      summary: input.prompt.slice(0, 200),
+      ...(matchedProj?.projectKey ? { projectKey: matchedProj.projectKey } : (input.projectQuery ? { projectKey: input.projectQuery } : {})),
+      ...(input.conversationId ? { conversationId: input.conversationId } : {}),
+      ...(input.workspaceHint ? { workspaceHint: input.workspaceHint } : (matchedProj?.displayName ? { workspaceHint: matchedProj.displayName } : {})),
+    });
+    const nodes = this.edgeHub.listNodes();
+    const targetOnline = nodes.some((n) => n.nodeId === targetNodeId && n.online);
+    return {
+      ok: true,
+      command,
+      nodes,
+      message: targetOnline
+        ? `已将编码任务「${command.title}」派发至在线触手节点 ${targetNodeId}（指令号 ${command.id}），完工后将通过微信推送回执。`
+        : `已将编码任务「${command.title}」挂入节点 ${targetNodeId} 队列（指令号 ${command.id}）；该节点当前离线，唤醒联网后将自动拉取执行。`,
+    };
   }
 
   async refreshRemoteOpsSnapshot(): Promise<{
@@ -1671,14 +1793,19 @@ export class SugentStewardHostService {
   }> {
     const bridge = this.opts.opsBridge;
     if (!bridge || !bridge.isConfigured()) {
-      return { ok: false, configured: false, snapshot: this.remoteOpsSnapshot, reason: "OPS_BRIDGE_UNCONFIGURED" };
+      const merged = this.getMergedOpsFleetSnapshot();
+      if (merged) {
+        return { ok: true, configured: true, snapshot: merged };
+      }
+      return { ok: false, configured: this.edgeHub.hasConfiguredTokens(), snapshot: undefined, reason: "OPS_BRIDGE_UNCONFIGURED" };
     }
     const res = await bridge.fetchFleetSnapshot();
     if (res.ok && res.snapshot) {
       this.setRemoteOpsSnapshot(res.snapshot);
-      return { ok: true, configured: true, snapshot: res.snapshot };
+      return { ok: true, configured: true, snapshot: this.getMergedOpsFleetSnapshot() ?? res.snapshot };
     }
-    return { ok: false, configured: true, snapshot: this.remoteOpsSnapshot, ...(res.reason ? { reason: res.reason } : {}) };
+    const fallback = this.getMergedOpsFleetSnapshot();
+    return { ok: Boolean(fallback), configured: true, snapshot: fallback, ...(res.reason ? { reason: res.reason } : {}) };
   }
 
   stageOpsInboxProposal(item: OpsInboxItem): void {
@@ -1814,6 +1941,15 @@ export class SugentStewardHostService {
       ...(target.projectKey ? { projectKey: target.projectKey } : {}),
       createdAtIso: this.nowIsoFn(),
     };
+
+    this.edgeHub.enqueueCommand({
+      targetNodeId: cmd.targetNodeId,
+      action: "execute_approved_inbox",
+      title: target.title,
+      ...(target.summary ? { prompt: target.summary, summary: target.summary } : {}),
+      ...(target.projectKey ? { projectKey: target.projectKey } : {}),
+      createdAtIso: cmd.createdAtIso,
+    });
 
     if (this.opts.opsBridge?.isConfigured() && this.opts.opsBridge.isStewardHub()) {
       const syncRes = await this.opts.opsBridge.stewardSync({

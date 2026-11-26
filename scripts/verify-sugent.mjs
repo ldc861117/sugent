@@ -146,6 +146,11 @@ import {
   runContractQuoteGuardPack,
   runIndustrialFdeDiagnosticPack,
   SugentStewardHostService,
+  EdgeTentacleHub,
+  EdgeTentacleRunner,
+  scanLocalProjectsForEdge,
+  ChatTranscriptRecallService,
+  redactTranscriptSecrets,
 } from "../dist/src/sugent/index.js";
 import { normalizeSettings } from "../dist/src/agent/settings.js";
 
@@ -1315,6 +1320,87 @@ import { normalizeSettings } from "../dist/src/agent/settings.js";
   }
 }
 
+// 27. 云端唯一主权大脑、跨天全渠道对话记忆召回与多节点边缘触手中枢契约
+{
+  const s27Dir = fs.mkdtempSync(path.join(os.tmpdir(), "sugent-verify-s27-"));
+  try {
+    const projRoot = path.join(s27Dir, "projects", "airtoken");
+    fs.mkdirSync(path.join(projRoot, ".git"), { recursive: true });
+    fs.mkdirSync(path.join(projRoot, "docs"), { recursive: true });
+    fs.writeFileSync(path.join(projRoot, ".git", "config"), '[remote "origin"]\n\turl = git@github.com:ldc861117/airtoken.git\n');
+    fs.writeFileSync(
+      path.join(projRoot, "STATUS.md"),
+      "---\nreview_state: pending_review\nupdated_at: 2026-11-25T18:00:00Z\n---\n## 阶段目标\n打通 /Users/owner/airtoken 跨节点协同\n## 最近完成\n- 落地边缘触手同步\n## 卡点\n无\n",
+    );
+    fs.writeFileSync(path.join(projRoot, "docs", "ROADMAP.md"), "## Wave 1: 底座\n- [x] M1\n- [ ] M2\n");
+
+    const scanned = scanLocalProjectsForEdge({
+      projectsRootDirs: [path.join(s27Dir, "projects")],
+      nodeId: "local-mac",
+    });
+    assert.equal(scanned.length, 1);
+    assert.equal(scanned[0].projectKey, "repo:ldc861117/airtoken");
+    assert.equal(JSON.stringify(scanned).includes("/Users/owner"), false);
+    assert.equal(scanned[0].roadmapSummary.totals.pct, 50);
+
+    const dbPath = path.join(s27Dir, "anymodel.db");
+    const db = new DatabaseSync(dbPath);
+    const nowMs = Date.parse("2026-11-25T18:00:00Z");
+    const yestMs = nowMs - 26 * 3_600_000;
+    try {
+      db.exec(
+        "CREATE TABLE conversations (id TEXT PRIMARY KEY, bot_id TEXT NOT NULL, channel TEXT NOT NULL, peer_id TEXT NOT NULL, title TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '', kind TEXT NOT NULL DEFAULT 'dm', account TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);" +
+          "CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, conversation_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, created_at INTEGER NOT NULL);" +
+          "CREATE TABLE weixin_accounts (bot_id TEXT PRIMARY KEY, bot_token TEXT NOT NULL, ilink_bot_id TEXT NOT NULL, base_url TEXT NOT NULL, owner_user_id TEXT NOT NULL DEFAULT '', cursor TEXT NOT NULL DEFAULT '', paused_until INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL);",
+      );
+      db.prepare("INSERT INTO weixin_accounts VALUES ('default', 'tok', 'ilink', 'http://u', 'wx-owner', '', 0, ?)").run(nowMs);
+      db.prepare("INSERT INTO conversations VALUES ('c-wx', 'default', 'weixin', 'wx-owner', 'Owner', '', 'dm', 'default', ?, ?)").run(yestMs, nowMs);
+      db.prepare("INSERT INTO messages (conversation_id, role, content, created_at) VALUES ('c-wx', 'user', '昨天把云端唯一大脑和边缘触手分工定下来了', ?)").run(yestMs);
+      db.prepare("INSERT INTO messages (conversation_id, role, content, created_at) VALUES ('c-wx', 'assistant', '已记录顶层管家与 Antigravity 编码触手协同模式。', ?)").run(yestMs + 2000);
+
+      const chatRecall = new ChatTranscriptRecallService({ dataDir: s27Dir, db, nowMs: () => nowMs });
+      chatRecall.recordDirectStewardTurn({ channel: "web_ui", role: "user", content: "网页端补充查看 airtoken 进展", createdAtMs: yestMs + 10_000 });
+      assert.equal(redactTranscriptSecrets(["sk", "1234567890"].join("-")), "[REDACTED_KEY]");
+      assert.equal(chatRecall.hydrateRecentPeerHistory({ channel: "weixin", peerId: "wx-owner" }).length, 2);
+
+      const host = new SugentStewardHostService({
+        dataDir: s27Dir,
+        knowledgeGraph: new SugentKnowledgeGraph(path.join(s27Dir, "kg")),
+        localBudgets: new LocalBudgetLedger(path.join(s27Dir, "budgets")),
+        chatRecall,
+        edgeTokens: ["edge-gate-tok"],
+        nowIso: () => "2026-11-25T18:00:00Z",
+      });
+      assert.equal(host.edgeHub.verifyToken("edge-gate-tok"), true);
+      assert.equal(host.edgeHub.verifyToken("bad"), false);
+      host.ingestEdgeNodePulse({ nodeId: "local-mac", platform: "darwin", projects: scanned });
+      const wb = host.getWorkbench("owner_private");
+      assert.equal(wb.opsFleet?.projects[0]?.displayName, "airtoken");
+
+      const recalled = host.recallChatHistory({ query: "昨天我没聊了什么你知道吗" });
+      assert.equal(recalled.ok && recalled.totalMatched >= 3, true);
+
+      const dispatched = host.dispatchEdgeAntigravity({
+        title: "为 airtoken 补充边缘脉冲测试",
+        prompt: "补充状态卡同步单测",
+        projectQuery: "airtoken",
+      });
+      assert.equal(dispatched.ok && dispatched.command.targetNodeId === "local-mac", true);
+      const ack = host.edgeHub.ackCommand(dispatched.command.id, {
+        nodeId: "local-mac",
+        status: "completed",
+        summary: "单测全部通过",
+      });
+      assert.equal(Boolean(ack.ownerNotifyText?.includes("local-mac")), true);
+      assert.equal(host.edgeHub.ackCommand(dispatched.command.id, { nodeId: "local-mac", status: "completed" }).idempotent, true);
+    } finally {
+      db.close();
+    }
+  } finally {
+    fs.rmSync(s27Dir, { recursive: true, force: true });
+  }
+}
+
 console.log(
-  "verify:sugent — 全部核心契约断言通过 (M1.1–M1.6 / M2.1 / Cowork 联邦 / P0 Broker + P1 幕僚耳麦 + P2 BYOK 诊断与零知识加密同步 / Sprint 1–3 / M1–M4 Vibe Coding 闭环 / 能力自感知与全文读取 / 形象工坊与桌宠契约 / M-Auto 1–4 双环自治与 SIM 演进 / M1–M3 全量模型同步与经验驱动自适应路由 / L0–L3 分层热启动与热更新 / Wave P0 双脑归一与宿主主循环合龙 / GCE 常驻中枢与微信单持有者舰队桥接 / Wave P1 零填表冷启动、ACP 编码军团与隐藏快照防呆 / Wave P2 合盖离线韧性、微信 3 秒转发参谋与端-边联邦标杆武器包)",
+  "verify:sugent — 全部核心契约断言通过 (M1.1–M1.6 / M2.1 / Cowork 联邦 / P0 Broker + P1 幕僚耳麦 + P2 BYOK 诊断与零知识加密同步 / Sprint 1–3 / M1–M4 Vibe Coding 闭环 / 能力自感知与全文读取 / 形象工坊与桌宠契约 / M-Auto 1–4 双环自治与 SIM 演进 / M1–M3 全量模型同步与经验驱动自适应路由 / L0–L3 分层热启动与热更新 / Wave P0 双脑归一与宿主主循环合龙 / GCE 常驻中枢与微信单持有者舰队桥接 / Wave P1 零填表冷启动、ACP 编码军团与隐藏快照防呆 / Wave P2 合盖离线韧性、微信 3 秒转发参谋与端-边联邦标杆武器包 / 云端唯一大脑、跨天全渠道对话记忆与多节点边缘触手中枢)",
 );

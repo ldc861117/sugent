@@ -54,6 +54,7 @@ import { lockDataDir, type DataDirLock } from "./store/lock.js";
 import { detached, setLangPref, t, t as tr } from "./i18n/index.js";
 import { Attention, approvalItems, deliveryItem, type AttentionItem } from "./tasks/attention.js";
 import {
+  ChatTranscriptRecallService,
   ConciergeChannelBridge,
   HotBundleSlotManager,
   HotReloadBus,
@@ -309,7 +310,9 @@ export class App {
     });
     this.opsEnv = opts.opsEnv ?? process.env;
     const opsCfg = resolveOpsBridgeConfig(this.opsEnv);
+    const edgeToken = String(this.opsEnv.SUGENT_EDGE_TOKEN ?? "").trim();
     if (opsCfg.nodeToken) registerSecret(opsCfg.nodeToken);
+    if (edgeToken) registerSecret(edgeToken);
     this.opsBridge = new OpsBridgeClient({
       baseUrl: opsCfg.baseUrl,
       nodeToken: opsCfg.nodeToken,
@@ -317,10 +320,16 @@ export class App {
       stewardHubNodeId: opsCfg.stewardHubNodeId,
       getFetch: () => this.desktop?.fetch ?? globalThis.fetch,
     });
+    const chatRecall = new ChatTranscriptRecallService({
+      dataDir: config.dataDir,
+      getDb: () => this.store.db,
+    });
     this.stewardService = new SugentStewardHostService({
       dataDir: config.dataDir,
       nodeId: opsCfg.nodeId,
       opsBridge: this.opsBridge,
+      chatRecall,
+      edgeTokens: [edgeToken, opsCfg.nodeToken].filter(Boolean),
       knowledgeGraph: this.knowledgeGraph,
       localBudgets: this.localBudgets,
       providerRegistry: this.providers,
@@ -518,6 +527,8 @@ export class App {
     );
     this.ownerStewardRouter = new OwnerChannelStewardRouter({
       steward: this.stewardService,
+      hydrateHistory: ({ channel, peerId, maxMessages }) =>
+        this.stewardService.chatRecall.hydrateRecentPeerHistory({ channel, peerId, maxMessages }),
       enabled: () =>
         (opts.enableOwnerStewardRouter ?? (!opts.models && process.env.SUGENT_OWNER_STEWARD_BRIDGE !== "0")) &&
         this.stewardService.hasLiveLlmEndpoint(),

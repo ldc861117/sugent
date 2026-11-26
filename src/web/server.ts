@@ -289,13 +289,27 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
       res.writeHead(421).end("bad host");
       return false;
     }
+    if (url.pathname.startsWith("/amb/api/steward/edge/")) {
+      const bearer = String(req.headers.authorization || "").replace(/^Bearer\s+/i, "").trim();
+      const edgeHdr = String(req.headers["x-sugent-edge-token"] || "").trim();
+      const candidate = bearer || edgeHdr;
+      if (candidate && app.stewardService.edgeHub.verifyToken(candidate)) {
+        return true;
+      }
+    }
     if (!token) return true;
     const cookie = String(req.headers.cookie || "");
     const ok = cookie.split(/;\s*/).includes(`amb_token=${token}`) || req.headers["x-amb-token"] === token;
     if (ok) return true;
     if (url.searchParams.get("token") === token) {
       url.searchParams.delete("token");
-      res.writeHead(302, { "set-cookie": `amb_token=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=34560000`, location: url.pathname + url.search });
+      const xfProto = String(req.headers["x-forwarded-proto"] || "").split(",")[0]?.trim().toLowerCase();
+      const secureAttr = xfProto === "https" ? "; Secure" : "";
+      res.writeHead(302, {
+        "set-cookie": `amb_token=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=34560000${secureAttr}`,
+        "referrer-policy": "no-referrer",
+        location: url.pathname + url.search,
+      });
       res.end();
       return false;
     }
@@ -587,7 +601,69 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
         return send(res, 200, app.stewardService.getWorkbench(domain));
       }
       if (sub === "converse" && m === "POST") {
-        return send(res, 200, await app.stewardService.converse(await readJson(req)));
+        const b = await readJson(req);
+        const userText = typeof b?.text === "string" ? b.text.trim() : "";
+        const turnDomain = b?.callerDomain === "work_project" || b?.callerDomain === "cowork_shared" ? b.callerDomain : domain;
+        if (userText && turnDomain === "owner_private") {
+          app.stewardService.chatRecall.recordDirectStewardTurn({
+            channel: typeof b?.channel === "string" ? b.channel : "web_ui",
+            role: "user",
+            content: userText,
+          });
+        }
+        const out = await app.stewardService.converse(b);
+        if (out.ok && typeof out.reply === "string" && out.reply.trim() && turnDomain === "owner_private") {
+          app.stewardService.chatRecall.recordDirectStewardTurn({
+            channel: typeof b?.channel === "string" ? b.channel : "web_ui",
+            role: "assistant",
+            content: out.reply,
+          });
+        }
+        return send(res, 200, out);
+      }
+      if (sub === "edge/pulse" && m === "POST") {
+        const b = await readJson(req);
+        const nodeId = typeof b?.nodeId === "string" ? b.nodeId.trim() : "";
+        if (!nodeId) throw new HttpError(400, "nodeId is required");
+        if (!Array.isArray(b?.projects)) throw new HttpError(400, "projects array is required");
+        return send(res, 200, app.stewardService.ingestEdgeNodePulse({
+          nodeId,
+          ...(typeof b.platform === "string" ? { platform: b.platform } : {}),
+          ...(typeof b.hostname === "string" ? { hostname: b.hostname } : {}),
+          ...(typeof b.atIso === "string" ? { atIso: b.atIso } : {}),
+          projects: b.projects,
+        }));
+      }
+      if (sub === "edge/commands" && m === "GET") {
+        const nodeId = String(url.searchParams.get("nodeId") ?? "").trim();
+        if (!nodeId) throw new HttpError(400, "nodeId query parameter is required");
+        return send(res, 200, { ok: true, commands: app.stewardService.edgeHub.pullPendingCommands(nodeId) });
+      }
+      if (seg[1] === "edge" && seg[2] === "commands" && seg[4] === "ack" && seg.length === 5 && m === "POST") {
+        const cmdId = decodeURIComponent(seg[3] ?? "").trim();
+        const b = await readJson(req);
+        if (b?.status !== "accepted" && b?.status !== "completed" && b?.status !== "failed") {
+          throw new HttpError(400, "status must be accepted, completed, or failed");
+        }
+        const ack = app.stewardService.edgeHub.ackCommand(cmdId, {
+          nodeId: typeof b.nodeId === "string" ? b.nodeId.trim() : "",
+          status: b.status,
+          ...(typeof b.summary === "string" ? { summary: b.summary } : {}),
+          ...(typeof b.conversationId === "string" ? { conversationId: b.conversationId } : {}),
+        });
+        if (!ack.ok) throw new HttpError(404, "edge command not found");
+        if (ack.ownerNotifyText && !app.stewardService.getWorkbench("owner_private").quietHoursActive) {
+          void app.pushToOwner(ack.ownerNotifyText).catch(() => false);
+        }
+        return send(res, 200, ack);
+      }
+      if (sub === "edge/snapshot" && m === "GET") {
+        return send(res, 200, {
+          ok: true,
+          nodes: app.stewardService.edgeHub.listNodes(),
+          snapshot: app.stewardService.getMergedOpsFleetSnapshot() ?? app.stewardService.edgeHub.toOpsStewardSnapshot(),
+          recentCommands: app.stewardService.edgeHub.listCommands({ limit: 20 }),
+        });
       }
       if (sub === "preferences" && m === "POST") {
         const b = await readJson(req);
