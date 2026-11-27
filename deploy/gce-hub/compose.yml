@@ -1,6 +1,6 @@
 # Sugent GCE 常驻中枢 (gce-hub) Docker Compose 编排
-# 目标机器：airtoken-micro (e2-medium 2 vCPU / 4 GB，与远程开发共享宿主机)
-# 安全边界：宿主机仅监听 127.0.0.1:3600，绝不暴露公网端口，管理面板一律走 SSH 本地端口转发访问。
+# 目标机器：airtoken-micro (e2-medium 2 vCPU / 4 GB，与远程开发及 airtoken 共存)
+# 安全边界：宿主机仅监听 127.0.0.1:3600，绝不暴露公网端口；自动更新严格限定 label-enable，绝不触碰同机其他容器。
 
 services:
   sugent-hub:
@@ -9,6 +9,8 @@ services:
     restart: always
     mem_limit: 1536m
     memswap_limit: 2048m
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
     ports:
       - "127.0.0.1:3600:3600"
     env_file:
@@ -36,6 +38,24 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
+
+  sugent-updater:
+    image: ${WATCHTOWER_IMAGE:-containrrr/watchtower:latest}
+    container_name: sugent-image-updater
+    restart: unless-stopped
+    mem_limit: 64m
+    memswap_limit: 128m
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      # 严格仅监控带 watchtower.enable=true 标签的容器，物理隔离同机 airtoken 等服务
+      WATCHTOWER_LABEL_ENABLE: "true"
+      WATCHTOWER_CLEANUP: "true"
+      WATCHTOWER_POLL_INTERVAL: ${SUGENT_AUTO_UPDATE_INTERVAL_SEC:-300}
+      WATCHTOWER_ROLLING_RESTART: "true"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
 
 volumes:
   sugent-data:

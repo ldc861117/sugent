@@ -2,30 +2,30 @@
 status_version: 1
 project: sugent
 review_state: pending_review
-updated_by: agent@local-mac
-updated_at: "2026-11-27T10:02:00+08:00"
+updated_by: antigravity@cloud-vm
+updated_at: "2026-11-27T12:55:00+08:00"
 confirmed_by: ""
 confirmed_at: ""
 ---
 
 ## 阶段目标
 
-收官 Wave P3 并落地人机混合项目待办全闭环
+完成边车 v1 契约与自动升级，静待助理微信养号期满扫码
 
 ## 最近完成
 
-- 完成 Wave P3（`P3.1`–`P3.4`）双微信号前店后厂、无头边车与群静默纪要代码交付，并补入 `P3.5`–`P3.6` 现实关口与 TS 双轨路线图解析（`monitoring` 状态同构）。
-- 打通 `OpsBridgeClient`、`StewardHostService`、`StewardLlmAgent`（含 `complete_todo` 提前核销 `snoozed` 项）与 `/done` 微信双端销账及到期唤醒早报闭环；完成浮宠互动与 AirToken 运维桥联调，并为 `AntigravityDispatcher` 加上测试环境禁调宿主机 `agentapi` 防误触护栏。
-- 落盘 `2026-11-26` 方案文档、`docs/decisions/steward-notes.md` 决策笔记与 `verify:sugent` 第 29 节门禁验收。
+- 对齐 `WeChatEnvoySidecarClient` 至 `agent-wechat-native` `/v1` 真实接口（`serverId` 重建保护、SSE 游标与 `live` 6 分钟防刷屏过滤、`Idempotency-Key` 幂等外发回执恢复）及共享容器环回网络。
+- 在 `deploy/gce-hub/compose.yml` 新增标签限定的 `sugent-updater` 自动滚动升级守护（物理隔离同机 `airtoken`），并将 `App.pushToOwner` 接入 `WeixinAdaptiveQuotaGuard` 低配额合卡与飞书降级。
+- 归档主理人已完成的备用机新号注册（`P3.5`），将数字运维工作全量收归 AI 自动执行。
 
 ## 在途
 
-- 待审阅提交本轮 Wave P3 与人机混合待办桥接改动后，推进云端容器升级及新助理微信号养号。
+- [观察窗·2026-12-02] 备用机助理微信号 5–7 天移动流量日常养号静默期（关联 P3.6）
 
 ## 下一步
 
-1. [我] 审阅提交并推送代码，升级云端 `sugent-gce-hub` 容器，备用手机新卡注册助理微信号并开启日常养号（关联 P3.5）
-2. [我·2026-12-02] 养号满 5–7 天后在 GCE 启动 `compose.wechat-envoy.yml` 扫码绑号并配置首批项目群白名单（关联 P3.6）
+1. [我·2026-12-02] 养号满期当天拿备用手机扫一次二维码确认登录助理微信号（关联 P3.7）
+2. [AI] 助理号扫码合龙后在内部测试群验证非 `@` 静默纪要与耳麦代回闭环
 
 ## 卡点
 

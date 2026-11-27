@@ -191,15 +191,157 @@ describe("Wave P3.3 — External agent-wechat Sidecar Client & Poller", () => {
     expect(cycle2.routedConcierge).toBe(0);
   });
 
-  it("provides hardened compose.wechat-envoy.yml with 384m cap and loopback binding", () => {
+  it("provides hardened compose.wechat-envoy.yml with 384m cap, shared loopback namespace, and label-scoped auto-updater", () => {
     const composeText = fs.readFileSync(
       path.resolve("deploy", "gce-hub", "compose.wechat-envoy.yml"),
       "utf8",
     );
     expect(composeText).toContain("mem_limit: 384m");
-    expect(composeText).toContain("127.0.0.1:6174:6174");
+    expect(composeText).toContain('network_mode: "service:sugent-hub"');
     expect(composeText).toContain("no-new-privileges:true");
+
+    const mainCompose = fs.readFileSync(path.resolve("deploy", "gce-hub", "compose.yml"), "utf8");
+    expect(mainCompose).toContain("com.centurylinklabs.watchtower.enable=true");
+    expect(mainCompose).toContain('WATCHTOWER_LABEL_ENABLE: "true"');
+
     const readmeText = fs.readFileSync(path.resolve("deploy", "gce-hub", "README.md"), "utf8");
     expect(readmeText).toContain("双微信号「前店后厂」");
+  });
+
+  it("supports agent-wechat-native /v1 SSE stream, live freshness filter, serverId rotation reset, and Idempotency-Key receipt recovery", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sugent-p33-v1-"));
+    tmpDirs.push(dir);
+
+    const nowMs = 1_764_200_000_000;
+    let currentServerId = "srv_epoch_1";
+    let sendPostCount = 0;
+    let simulateSend502Once = true;
+    const seenSendIdempKeys: string[] = [];
+
+    const v1Client = new WeChatEnvoySidecarClient(
+      { enabled: true, baseUrl: `${LOOPBACK_ENVOY}/v1`, apiToken: "tok-v1" },
+      {
+        nowFn: () => nowMs,
+        fetchFn: async (input, init) => {
+          const u = String(input);
+          if (u.endsWith("/v1/status")) {
+            return new Response(
+              JSON.stringify({ online: true, serverId: currentServerId }),
+              { status: 200, headers: { "content-type": "application/json" } },
+            );
+          }
+          if (u.endsWith("/v1/accounts")) {
+            return new Response(
+              JSON.stringify([{ id: "acct_envoy_01", wxid: "wxid_envoy", nickname: "Sugent助理", online: true }]),
+              { status: 200, headers: { "content-type": "application/json" } },
+            );
+          }
+          if (u.includes("/v1/events/stream")) {
+            const sseBody = [
+              'id: 101\nevent: message.committed\ndata: {"messageId":"m_catchup","origin":"catchup"}',
+              'id: 102\nevent: message.committed\ndata: {"messageId":"m_stale","origin":"live"}',
+              'id: 103\nevent: message.committed\ndata: {"messageId":"m_recalled","origin":"live"}',
+              'id: 104\nevent: message.recalled\ndata: {"messageId":"m_recalled"}',
+              'id: 105\nevent: message.committed\ndata: {"messageId":"m_live_ok","origin":"live"}',
+              "",
+            ].join("\n\n");
+            return new Response(sseBody, {
+              status: 200,
+              headers: { "content-type": "text/event-stream" },
+            });
+          }
+          if (u.endsWith("/v1/messages/m_catchup")) {
+            return new Response(
+              JSON.stringify({ id: "m_catchup", chatId: "wxid_client_1", senderId: "wxid_client_1", text: "历史同步消息", timestampMs: nowMs - 10_000, origin: "catchup" }),
+              { status: 200 },
+            );
+          }
+          if (u.endsWith("/v1/messages/m_stale")) {
+            return new Response(
+              JSON.stringify({ id: "m_stale", chatId: "wxid_client_1", senderId: "wxid_client_1", text: "10分钟前的积压消息", timestampMs: nowMs - 10 * 60_000, origin: "live" }),
+              { status: 200 },
+            );
+          }
+          if (u.endsWith("/v1/messages/m_recalled")) {
+            return new Response(
+              JSON.stringify({ id: "m_recalled", chatId: "wxid_client_1", senderId: "wxid_client_1", text: "刚发完就撤回", timestampMs: nowMs - 2_000, origin: "live" }),
+              { status: 200 },
+            );
+          }
+          if (u.endsWith("/v1/messages/m_live_ok")) {
+            return new Response(
+              JSON.stringify({ id: "m_live_ok", chatId: "wxid_client_1", senderId: "wxid_client_1", senderName: "李总", text: "明天下午方便通个电话吗？", timestampMs: nowMs - 5_000, origin: "live" }),
+              { status: 200 },
+            );
+          }
+          if (u.endsWith("/v1/accounts/acct_envoy_01/sends") && init?.method === "POST") {
+            sendPostCount += 1;
+            const hdrs = new Headers(init.headers);
+            const ik = hdrs.get("idempotency-key") ?? "";
+            seenSendIdempKeys.push(ik);
+            if (simulateSend502Once) {
+              simulateSend502Once = false;
+              return new Response(JSON.stringify({ error: "gateway_timeout" }), { status: 502 });
+            }
+            return new Response(JSON.stringify({ sendId: "snd_2", messageId: "wx_out_2", status: "accepted" }), { status: 200 });
+          }
+          if (u.includes("/v1/accounts/acct_envoy_01/sends/by-idempotency-key/")) {
+            return new Response(
+              JSON.stringify({ sendId: "snd_1", messageId: "wx_out_1", status: "accepted" }),
+              { status: 200 },
+            );
+          }
+          return new Response("{}", { status: 404 });
+        },
+      },
+    );
+
+    const status = await v1Client.getStatus();
+    expect(status.ok && status.serverId === "srv_epoch_1" && status.accountId === "acct_envoy_01").toBe(true);
+
+    const cfg = resolveWeChatEnvoyConfig({
+      SUGENT_WECHAT_ENVOY_ENABLED: "true",
+      SUGENT_WECHAT_ENVOY_TOKEN: "tok-v1",
+      SUGENT_WECHAT_ENVOY_SELF_WXID: "wxid_envoy",
+      SUGENT_WECHAT_ENVOY_ALLOW_DMS: "wxid_client_1",
+    });
+
+    const actionableIds: string[] = [];
+    const poller = new WeChatEnvoyPoller({
+      config: cfg,
+      client: v1Client,
+      dataDir: dir,
+      onActionableInbound: (ev) => {
+        actionableIds.push(ev.message.messageId);
+      },
+    });
+
+    const c1 = await poller.runCycleOnce();
+    expect(c1.ok).toBe(true);
+    expect(c1.nextCursor).toBe("105");
+    expect(c1.serverId).toBe("srv_epoch_1");
+    expect(actionableIds).toEqual(["m_live_ok"]);
+
+    // Simulate Native server recreation (new serverId) -> must reset cursor safely without processing stale cursor
+    currentServerId = "srv_epoch_2";
+    const cRotate = await poller.runCycleOnce();
+    expect(cRotate.ok).toBe(true);
+    expect(cRotate.cursorResetOnServerChange).toBe(true);
+    expect(cRotate.serverId).toBe("srv_epoch_2");
+    expect(cRotate.nextCursor).toBeUndefined();
+
+    // Test outbound 502 recovery via GET .../by-idempotency-key/{key} WITHOUT blind re-POST!
+    const send1 = await v1Client.sendMessage({
+      chatId: "wxid_client_1",
+      text: "明天下午三点可以，我准时打给您。",
+      idempotencyKey: "idem-fixed-001",
+    });
+    expect(send1.ok).toBe(true);
+    if (send1.ok) {
+      expect(send1.recoveredViaReceipt).toBe(true);
+      expect(send1.messageId).toBe("wx_out_1");
+    }
+    expect(sendPostCount).toBe(1);
+    expect(seenSendIdempKeys).toEqual(["idem-fixed-001"]);
   });
 });

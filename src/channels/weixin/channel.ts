@@ -532,6 +532,15 @@ export class WeixinChannel {
     return this.notify(this.store.getWeixinAccount(this.account)?.ownerUserId ?? "", text);
   }
 
+  /** 只读查询扫码主人会话的主动配额水位（供 Sugent 主动脉搏自适应合卡与降级） */
+  ownerQuotaSnapshot(): { ownerUserId: string; open: boolean; remaining: number; connected: boolean } {
+    const ownerUserId = this.store.getWeixinAccount(this.account)?.ownerUserId ?? "";
+    if (!ownerUserId || !this.client) return { ownerUserId, open: false, remaining: 0, connected: false };
+    const open = this.quota.open(ownerUserId);
+    const remaining = open ? this.quota.remaining(ownerUserId) : 0;
+    return { ownerUserId, open, remaining, connected: open };
+  }
+
   /**
    * 主动发到一个微信会话的回复（代理自己醒来的一轮：后台命令结束）：和普通回复一样经出站队列，id 由 key 推出；
    * 会话凭证、24 小时窗口和配额在发送时才查（deliverWeixin），发不出去就留着，等对方下次发消息时先发。

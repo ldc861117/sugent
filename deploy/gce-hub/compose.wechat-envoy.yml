@@ -5,25 +5,30 @@
 # Security & Resource Contract (GCE e2-medium / 4 GiB co-tenancy with airtoken):
 #   - Headless Rust native `wx serve` (no X11/Xvfb, no SYS_PTRACE, cap_drop: ALL)
 #   - Strict memory cap: 384m RAM / 512m RAM+Swap
-#   - Host loopback-only port binding: 127.0.0.1:6174:6174
+#   - Shared loopback namespace (`network_mode: "service:sugent-hub"`): `wx serve` stays strictly bound
+#     to `127.0.0.1:6174`, directly reachable by `sugent-gce-hub` over loopback without bridge exposure.
 
 services:
   agent-wechat:
     image: ${AGENT_WECHAT_IMAGE:-ghcr.io/thisnick/agent-wechat-native:latest}
     container_name: agent-wechat-native
     restart: unless-stopped
+    network_mode: "service:sugent-hub"
+    depends_on:
+      - sugent-hub
     mem_limit: 384m
     memswap_limit: 512m
-    ports:
-      - "127.0.0.1:6174:6174"
     cap_drop:
       - ALL
     security_opt:
       - no-new-privileges:true
     environment:
       TZ: ${TZ:-Asia/Shanghai}
+      TMPDIR: /var/cache/agent-wechat
       AGENT_WECHAT_TOKEN: ${SUGENT_WECHAT_ENVOY_TOKEN:-}
       PROXY: ${AGENT_WECHAT_PROXY:-}
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m,mode=1777
     volumes:
       - agent-wechat-data:/var/lib/agent-wechat
       - agent-wechat-cache:/var/cache/agent-wechat

@@ -10,6 +10,7 @@ export interface WeChatEnvoyConfig {
   enabled: boolean;
   baseUrl: string;
   apiToken: string;
+  accountId?: string;
   selfWxid: string;
   selfAliases: string[];
   dmPolicy: WeChatEnvoyDmPolicy;
@@ -17,6 +18,7 @@ export interface WeChatEnvoyConfig {
   groupPolicy: WeChatEnvoyGroupPolicy;
   allowedGroupIds: string[];
   allowRemoteHttps: boolean;
+  liveMaxAgeMs?: number;
 }
 
 export interface WeChatEnvoyInboundMessage {
@@ -29,6 +31,8 @@ export interface WeChatEnvoyInboundMessage {
   timestampMs: number;
   fromSelf: boolean;
   mentionedIds: string[];
+  origin?: string;
+  recalled?: boolean;
   rawPayload: Record<string, unknown>;
 }
 
@@ -37,6 +41,7 @@ export interface WeChatEnvoySendInput {
   text: string;
   replyToMessageId?: string;
   mentions?: string[];
+  idempotencyKey?: string;
 }
 
 export type WeChatEnvoySkippedResult = {
@@ -50,6 +55,8 @@ export type WeChatEnvoyErrorResult = {
   status?: number;
   rateLimited?: boolean;
   retryAfterMs?: number;
+  needsReview?: boolean;
+  idempotencyKey?: string;
   error: string;
 };
 
@@ -60,6 +67,8 @@ export type WeChatEnvoyStatusResult =
       ok: true;
       online: boolean;
       loggedIn: boolean;
+      serverId?: string;
+      accountId?: string;
       selfWxid?: string;
       selfName?: string;
       accounts?: unknown[];
@@ -84,7 +93,10 @@ export type WeChatEnvoyFetchUnreadResult =
       ok: true;
       messages: WeChatEnvoyInboundMessage[];
       nextCursor?: string;
-      mode: "events" | "chats_fallback";
+      serverId?: string;
+      cursorResetOnServerChange?: boolean;
+      ignoredStaleOrHistory?: number;
+      mode: "v1_events" | "events" | "chats_fallback";
     };
 
 export type WeChatEnvoySendResult =
@@ -93,12 +105,17 @@ export type WeChatEnvoySendResult =
   | {
       ok: true;
       messageId?: string;
+      sendId?: string;
+      idempotencyKey?: string;
+      recoveredViaReceipt?: boolean;
       data: unknown;
     };
 
 export interface WeChatEnvoyClientRuntimeOptions {
   fetchFn?: typeof fetch;
   timeoutMs?: number;
+  streamReadTimeoutMs?: number;
+  liveMaxAgeMs?: number;
   rateLimitMaxPerMinute?: number;
   rateLimitWindowMs?: number;
   nowFn?: () => number;
@@ -108,7 +125,7 @@ export type WeChatEnvoyClientInit = Partial<WeChatEnvoyConfig> & WeChatEnvoyClie
 
 export interface WeChatEnvoyClientLike {
   isConfigured(): boolean;
-  fetchUnreadEvents(cursor?: string): Promise<WeChatEnvoyFetchUnreadResult>;
+  fetchUnreadEvents(cursor?: string, serverIdHint?: string): Promise<WeChatEnvoyFetchUnreadResult>;
 }
 
 export type WeChatEnvoySealedEvent = ReturnType<typeof sealExternalEvent>;
@@ -149,11 +166,14 @@ export interface WeChatEnvoyPollCycleResult {
   deduplicated: number;
   decisions: WeChatEnvoyRoutedDecision[];
   nextCursor?: string;
+  serverId?: string;
+  cursorResetOnServerChange?: boolean;
   error?: string;
 }
 
 export interface WeChatEnvoyPersistedState {
   cursor?: string;
+  serverId?: string;
   processedMessageIds: string[];
   updatedAt: string;
 }
@@ -174,6 +194,8 @@ export interface WeChatEnvoyPollerOptions {
 const HTTP_SCHEME = ["http", "://"].join("");
 const DEFAULT_ENVOY_BASE_URL = `${HTTP_SCHEME}127.0.0.1:6174`;
 const DEFAULT_TIMEOUT_MS = 10_000;
+const DEFAULT_STREAM_READ_TIMEOUT_MS = 500;
+const DEFAULT_LIVE_MAX_AGE_MS = 6 * 60_000;
 const DEFAULT_RATE_LIMIT_MAX_PER_MINUTE = 6;
 const DEFAULT_RATE_LIMIT_WINDOW_MS = 60_000;
 const DEFAULT_POLL_INTERVAL_MS = 3_000;
@@ -324,10 +346,18 @@ export function resolveWeChatEnvoyConfig(
     else throw new Error(`Invalid SUGENT_WECHAT_ENVOY_GROUP_POLICY "${env.SUGENT_WECHAT_ENVOY_GROUP_POLICY}"`);
   }
 
+  const rawAccountId = (env.SUGENT_WECHAT_ENVOY_ACCOUNT_ID ?? "").trim();
+  const rawLiveMaxSec = Number((env.SUGENT_WECHAT_ENVOY_LIVE_MAX_AGE_SEC ?? "").trim());
+  const liveMaxAgeMs =
+    Number.isFinite(rawLiveMaxSec) && rawLiveMaxSec > 0
+      ? Math.trunc(rawLiveMaxSec * 1_000)
+      : undefined;
+
   return {
     enabled,
     baseUrl,
     apiToken: (env.SUGENT_WECHAT_ENVOY_TOKEN ?? "").trim(),
+    ...(rawAccountId ? { accountId: rawAccountId } : {}),
     selfWxid: (env.SUGENT_WECHAT_ENVOY_SELF_WXID ?? "").trim(),
     selfAliases: parseCommaList(env.SUGENT_WECHAT_ENVOY_SELF_ALIASES, { stripLeadingAt: true }),
     dmPolicy,
@@ -335,6 +365,7 @@ export function resolveWeChatEnvoyConfig(
     groupPolicy,
     allowedGroupIds: parseCommaList(env.SUGENT_WECHAT_ENVOY_ALLOW_GROUPS),
     allowRemoteHttps,
+    ...(liveMaxAgeMs ? { liveMaxAgeMs } : {}),
   };
 }
 
@@ -377,6 +408,10 @@ function normalizeInboundRecord(
     inner.timestampMs ?? inner.timestamp_ms ?? inner.timestamp ?? inner.createTime ?? outer.timestamp,
     nowMs,
   );
+  const origin = asNonEmptyString(inner.origin ?? outer.origin);
+  const recalled = Boolean(
+    inner.recalled ?? inner.isRecalled ?? outer.recalled ?? outer.type === "message.recalled",
+  );
 
   return {
     messageId,
@@ -388,16 +423,60 @@ function normalizeInboundRecord(
     timestampMs,
     fromSelf,
     mentionedIds,
+    ...(origin ? { origin } : {}),
+    ...(recalled ? { recalled: true } : {}),
     rawPayload: inner,
   };
+}
+
+interface ParsedSseEventFrame {
+  id?: string;
+  event?: string;
+  data: unknown;
+}
+
+function parseSseFrames(rawSse: string): ParsedSseEventFrame[] {
+  const frames: ParsedSseEventFrame[] = [];
+  const normalized = rawSse.replace(/\r\n/g, "\n");
+  for (const block of normalized.split("\n\n")) {
+    const lines = block.split("\n");
+    let id: string | undefined;
+    let event: string | undefined;
+    const dataLines: string[] = [];
+    for (const line of lines) {
+      if (!line || line.startsWith(":")) continue;
+      const colon = line.indexOf(":");
+      const field = colon === -1 ? line : line.slice(0, colon);
+      const rawVal = colon === -1 ? "" : line.slice(colon + 1).replace(/^ /, "");
+      if (field === "id") id = rawVal.trim() || id;
+      else if (field === "event") event = rawVal.trim() || event;
+      else if (field === "data") dataLines.push(rawVal);
+    }
+    if (!id && !event && dataLines.length === 0) continue;
+    const joined = dataLines.join("\n").trim();
+    let parsed: unknown = {};
+    if (joined) {
+      try {
+        parsed = JSON.parse(joined);
+      } catch {
+        parsed = { rawText: joined };
+      }
+    }
+    frames.push({ ...(id ? { id } : {}), ...(event ? { event } : {}), data: parsed });
+  }
+  return frames;
 }
 
 export class WeChatEnvoySidecarClient implements WeChatEnvoyClientLike {
   private readonly enabled: boolean;
   private readonly baseUrl: string;
   private readonly apiToken: string;
+  private cachedAccountId: string;
+  private cachedServerId: string | undefined;
   private readonly fetchFn: typeof fetch;
   private readonly timeoutMs: number;
+  private readonly streamReadTimeoutMs: number;
+  private readonly liveMaxAgeMs: number;
   private readonly rateLimitMaxPerMinute: number;
   private readonly rateLimitWindowMs: number;
   private readonly nowFn: () => number;
@@ -406,13 +485,18 @@ export class WeChatEnvoySidecarClient implements WeChatEnvoyClientLike {
   constructor(config: WeChatEnvoyClientInit = {}, runtimeOpts: WeChatEnvoyClientRuntimeOptions = {}) {
     this.enabled = Boolean(config.enabled);
     const allowRemoteHttps = Boolean(config.allowRemoteHttps);
-    const rawUrl = (config.baseUrl ?? "").trim();
+    const rawUrl = (config.baseUrl ?? "").trim().replace(/\/v1$/i, "");
     this.baseUrl = rawUrl
       ? assertSafeEnvoyTransportUrl(rawUrl, allowRemoteHttps)
       : DEFAULT_ENVOY_BASE_URL;
     this.apiToken = (config.apiToken ?? "").trim();
+    this.cachedAccountId = (config.accountId ?? "").trim();
     this.fetchFn = runtimeOpts.fetchFn ?? config.fetchFn ?? globalThis.fetch;
     this.timeoutMs = runtimeOpts.timeoutMs ?? config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    this.streamReadTimeoutMs =
+      runtimeOpts.streamReadTimeoutMs ?? config.streamReadTimeoutMs ?? DEFAULT_STREAM_READ_TIMEOUT_MS;
+    this.liveMaxAgeMs =
+      runtimeOpts.liveMaxAgeMs ?? config.liveMaxAgeMs ?? DEFAULT_LIVE_MAX_AGE_MS;
     this.rateLimitMaxPerMinute = Math.max(
       1,
       Math.trunc(runtimeOpts.rateLimitMaxPerMinute ?? config.rateLimitMaxPerMinute ?? DEFAULT_RATE_LIMIT_MAX_PER_MINUTE),
@@ -432,19 +516,23 @@ export class WeChatEnvoySidecarClient implements WeChatEnvoyClientLike {
     method: "GET" | "POST",
     subpath: string,
     body?: Record<string, unknown>,
-  ): Promise<{ ok: boolean; status: number; data?: unknown; error?: string }> {
+    extraHeaders?: Record<string, string>,
+    customTimeoutMs?: number,
+  ): Promise<{ ok: boolean; status: number; contentType?: string; rawText?: string; data?: unknown; error?: string }> {
     try {
       const headers: Record<string, string> = {
         authorization: `Bearer ${this.apiToken}`,
         accept: "application/json",
+        ...extraHeaders,
       };
       if (body !== undefined) headers["content-type"] = "application/json";
       const res = await this.fetchFn(`${this.baseUrl}${subpath}`, {
         method,
         headers,
         ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
-        signal: AbortSignal.timeout(this.timeoutMs),
+        signal: AbortSignal.timeout(customTimeoutMs ?? this.timeoutMs),
       });
+      const contentType = res.headers?.get("content-type") ?? "";
       const text = await res.text();
       let parsed: unknown = {};
       if (text.trim()) {
@@ -457,16 +545,72 @@ export class WeChatEnvoySidecarClient implements WeChatEnvoyClientLike {
       if (!res.ok) {
         const rec = asRecord(parsed);
         const msg = asNonEmptyString(rec?.error ?? rec?.message) ?? `HTTP_${res.status}`;
-        return { ok: false, status: res.status, data: parsed, error: msg };
+        return { ok: false, status: res.status, contentType, rawText: text, data: parsed, error: msg };
       }
-      return { ok: true, status: res.status, data: parsed };
+      return { ok: true, status: res.status, contentType, rawText: text, data: parsed };
     } catch (err) {
       return { ok: false, status: 0, error: err instanceof Error ? err.message : String(err) };
     }
   }
 
+  private extractAccountsList(data: unknown): Record<string, unknown>[] | undefined {
+    const rec = asRecord(data);
+    const rawArr = Array.isArray(data)
+      ? data
+      : Array.isArray(rec?.accounts)
+        ? rec.accounts
+        : Array.isArray(rec?.items)
+          ? rec.items
+          : undefined;
+    if (!rawArr) return undefined;
+    return rawArr.map((x) => asRecord(x)).filter((x): x is Record<string, unknown> => x !== null);
+  }
+
   async getStatus(): Promise<WeChatEnvoyStatusResult> {
     if (!this.isConfigured()) return { ok: false, skipped: true };
+
+    // 1. Prefer agent-wechat-native /v1/status + /v1/accounts when available
+    const v1Res = await this.requestJson("GET", "/v1/status");
+    const v1Rec = v1Res.ok ? asRecord(v1Res.data) : null;
+    const v1ServerId = asNonEmptyString(v1Rec?.serverId ?? v1Rec?.server_id);
+    if (v1Res.ok && (v1ServerId || Array.isArray(v1Rec?.accounts))) {
+      if (v1ServerId) this.cachedServerId = v1ServerId;
+      let accounts = this.extractAccountsList(v1Res.data);
+      if (!accounts) {
+        const acctsRes = await this.requestJson("GET", "/v1/accounts");
+        if (acctsRes.ok) accounts = this.extractAccountsList(acctsRes.data);
+      }
+      const primaryAcct = accounts && accounts.length > 0 ? accounts[0] : null;
+      const accountId =
+        this.cachedAccountId ||
+        asNonEmptyString(primaryAcct?.accountId ?? primaryAcct?.account_id ?? primaryAcct?.id);
+      if (accountId && !this.cachedAccountId) this.cachedAccountId = accountId;
+      const selfWxid = asNonEmptyString(
+        v1Rec?.selfWxid ?? v1Rec?.wxid ?? primaryAcct?.wxid ?? primaryAcct?.username,
+      );
+      const selfName = asNonEmptyString(
+        v1Rec?.selfName ?? v1Rec?.nickname ?? primaryAcct?.nickname ?? primaryAcct?.alias ?? primaryAcct?.name,
+      );
+      const loggedIn =
+        typeof v1Rec?.loggedIn === "boolean"
+          ? v1Rec.loggedIn
+          : primaryAcct
+            ? primaryAcct.online !== false && primaryAcct.loggedIn !== false && primaryAcct.state !== "logged_out"
+            : Boolean(selfWxid);
+      return {
+        ok: true,
+        online: v1Rec?.online !== false,
+        loggedIn,
+        ...(v1ServerId ? { serverId: v1ServerId } : {}),
+        ...(accountId ? { accountId } : {}),
+        ...(selfWxid ? { selfWxid } : {}),
+        ...(selfName ? { selfName } : {}),
+        ...(accounts ? { accounts } : {}),
+        data: v1Res.data,
+      };
+    }
+
+    // 2. Fallback to generic /api/status or /api/accounts
     let res = await this.requestJson("GET", "/api/status");
     if (!res.ok && res.status === 404) {
       res = await this.requestJson("GET", "/api/accounts");
@@ -512,7 +656,12 @@ export class WeChatEnvoySidecarClient implements WeChatEnvoyClientLike {
 
   async getLoginQr(): Promise<WeChatEnvoyLoginQrResult> {
     if (!this.isConfigured()) return { ok: false, skipped: true };
-    let res = await this.requestJson("POST", "/api/auth/login", {});
+    let res = this.cachedAccountId
+      ? await this.requestJson("POST", `/v1/accounts/${encodeURIComponent(this.cachedAccountId)}/login`, {})
+      : await this.requestJson("POST", "/api/auth/login", {});
+    if (!res.ok && (res.status === 404 || res.status === 405)) {
+      res = await this.requestJson("POST", "/api/auth/login", {});
+    }
     if (!res.ok && (res.status === 404 || res.status === 405)) {
       res = await this.requestJson("GET", "/api/auth/qr");
     }
@@ -536,9 +685,156 @@ export class WeChatEnvoySidecarClient implements WeChatEnvoyClientLike {
     };
   }
 
-  async fetchUnreadEvents(cursor?: string): Promise<WeChatEnvoyFetchUnreadResult> {
+  private isFreshLiveV1Message(msg: WeChatEnvoyInboundMessage, nowMs: number): boolean {
+    if (msg.recalled) return false;
+    if (msg.origin !== undefined && msg.origin !== "live") {
+      return false;
+    }
+    if (msg.origin === "live") {
+      const skewAllowanceMs = 60_000;
+      const ageMs = nowMs - msg.timestampMs;
+      if (ageMs > this.liveMaxAgeMs || ageMs < -skewAllowanceMs) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  async fetchUnreadEvents(cursor?: string, serverIdHint?: string): Promise<WeChatEnvoyFetchUnreadResult> {
     if (!this.isConfigured()) return { ok: false, skipped: true };
     const nowMs = this.nowFn();
+
+    // 1. Check /v1/status for Native serverId & server recreation guard
+    const v1Status = await this.requestJson("GET", "/v1/status");
+    const v1StatusRec = v1Status.ok ? asRecord(v1Status.data) : null;
+    const liveServerId = asNonEmptyString(v1StatusRec?.serverId ?? v1StatusRec?.server_id);
+    if (liveServerId) {
+      this.cachedServerId = liveServerId;
+      const prevServerId = serverIdHint?.trim();
+      if (prevServerId && prevServerId !== liveServerId) {
+        return {
+          ok: true,
+          messages: [],
+          serverId: liveServerId,
+          cursorResetOnServerChange: true,
+          mode: "v1_events",
+        };
+      }
+    }
+
+    // 2. If Native /v1 is detected (or /v1/events/stream returns SSE/v1 payload), consume /v1/events/stream
+    if (liveServerId || this.cachedAccountId) {
+      const qs = cursor ? `?after=${encodeURIComponent(cursor)}` : "";
+      const streamHeaders: Record<string, string> = {
+        accept: "text/event-stream, application/json",
+        ...(cursor ? { "last-event-id": cursor } : {}),
+      };
+      const streamRes = await this.requestJson(
+        "GET",
+        `/v1/events/stream${qs}`,
+        undefined,
+        streamHeaders,
+        this.streamReadTimeoutMs,
+      );
+      if (streamRes.status === 410) {
+        return {
+          ok: false,
+          status: 410,
+          error: "WECHAT_ENVOY_CURSOR_EXPIRED_410: Native event cursor expired; inspect sidecar event retention",
+        };
+      }
+      if (streamRes.ok) {
+        const rawText = streamRes.rawText ?? "";
+        const isSse =
+          (streamRes.contentType ?? "").includes("text/event-stream") ||
+          /(?:^|\n)(?:event|data|id):/.test(rawText);
+        const recalledIds = new Set<string>();
+        const candidateItems: unknown[] = [];
+        let nextCursor = cursor;
+
+        if (isSse) {
+          for (const frame of parseSseFrames(rawText)) {
+            if (frame.id) nextCursor = frame.id;
+            const dRec = asRecord(frame.data);
+            const evType = frame.event ?? asNonEmptyString(dRec?.type ?? dRec?.event) ?? "";
+            if (evType === "message.recalled" || dRec?.recalled === true) {
+              const rId = asNonEmptyString(dRec?.messageId ?? dRec?.message_id ?? dRec?.id);
+              if (rId) recalledIds.add(rId);
+              continue;
+            }
+            if (!evType || evType === "message.committed" || evType === "message") {
+              candidateItems.push(frame.data);
+            }
+          }
+        } else {
+          const rec = asRecord(streamRes.data);
+          const arr = Array.isArray(streamRes.data)
+            ? streamRes.data
+            : Array.isArray(rec?.events)
+              ? rec.events
+              : undefined;
+          if (arr) {
+            candidateItems.push(...arr);
+            nextCursor = asNonEmptyString(rec?.nextCursor ?? rec?.next_cursor ?? rec?.cursor) ?? nextCursor;
+          }
+        }
+
+        const messages: WeChatEnvoyInboundMessage[] = [];
+        let ignoredStaleOrHistory = 0;
+
+        for (const item of candidateItems) {
+          const itemRec = asRecord(item);
+          const refMsgId = asNonEmptyString(
+            itemRec?.messageId ?? itemRec?.message_id ?? asRecord(itemRec?.message)?.id ?? itemRec?.id,
+          );
+          if (refMsgId && recalledIds.has(refMsgId)) {
+            ignoredStaleOrHistory += 1;
+            continue;
+          }
+
+          let norm = normalizeInboundRecord(item, undefined, nowMs);
+          if ((!norm || !norm.text) && refMsgId) {
+            const detailRes = await this.requestJson("GET", `/v1/messages/${encodeURIComponent(refMsgId)}`);
+            if (detailRes.ok) {
+              const detailRec = asRecord(detailRes.data);
+              const merged = {
+                ...(itemRec ?? {}),
+                ...(detailRec ?? {}),
+                origin: detailRec?.origin ?? itemRec?.origin,
+              };
+              norm = normalizeInboundRecord(merged, undefined, nowMs);
+            }
+          }
+          if (!norm || !norm.text) continue;
+          if (recalledIds.has(norm.messageId) || !this.isFreshLiveV1Message(norm, nowMs)) {
+            ignoredStaleOrHistory += 1;
+            continue;
+          }
+          messages.push(norm);
+        }
+
+        return {
+          ok: true,
+          messages,
+          ...(nextCursor ? { nextCursor } : {}),
+          ...(liveServerId ? { serverId: liveServerId } : {}),
+          ...(ignoredStaleOrHistory > 0 ? { ignoredStaleOrHistory } : {}),
+          mode: "v1_events",
+        };
+      }
+      // Timeout with empty SSE stream during quiet period is normal (zero new events)
+      if (streamRes.status === 0 && /timeout|aborted/i.test(streamRes.error ?? "")) {
+        return {
+          ok: true,
+          messages: [],
+          ...(cursor ? { nextCursor: cursor } : {}),
+          ...(liveServerId ? { serverId: liveServerId } : {}),
+          mode: "v1_events",
+        };
+      }
+    }
+
+    // 3. Fallback to /api/events or /api/chats
     const qs = cursor ? `?cursor=${encodeURIComponent(cursor)}` : "";
     const eventsRes = await this.requestJson("GET", `/api/events${qs}`);
     if (eventsRes.ok) {
@@ -628,6 +924,17 @@ export class WeChatEnvoySidecarClient implements WeChatEnvoyClientLike {
     };
   }
 
+  private async resolveV1AccountId(): Promise<string | undefined> {
+    if (this.cachedAccountId) return this.cachedAccountId;
+    const acctsRes = await this.requestJson("GET", "/v1/accounts");
+    if (!acctsRes.ok) return undefined;
+    const list = this.extractAccountsList(acctsRes.data);
+    if (!list || list.length === 0) return undefined;
+    const id = asNonEmptyString(list[0]?.accountId ?? list[0]?.account_id ?? list[0]?.id);
+    if (id) this.cachedAccountId = id;
+    return id;
+  }
+
   async sendMessage(input: WeChatEnvoySendInput): Promise<WeChatEnvoySendResult> {
     if (!this.isConfigured()) return { ok: false, skipped: true };
     const chatId = String(input.chatId ?? "").trim();
@@ -650,18 +957,107 @@ export class WeChatEnvoySidecarClient implements WeChatEnvoyClientLike {
       };
     }
 
+    const idempotencyKey = (input.idempotencyKey ?? "").trim() || crypto.randomUUID();
     const payload: Record<string, unknown> = {
       chatId,
+      target: chatId,
       message: text,
       text,
       ...(input.replyToMessageId ? { replyTo: input.replyToMessageId } : {}),
       ...(input.mentions?.length ? { mentions: [...input.mentions] } : {}),
     };
-    const res = await this.requestJson("POST", "/api/messages/send", payload);
+
+    // 1. Prefer agent-wechat-native POST /v1/accounts/{accountId}/sends with Idempotency-Key & single-shot receipt recovery
+    const v1AccountId =
+      this.cachedAccountId || (this.cachedServerId ? await this.resolveV1AccountId() : undefined);
+    if (v1AccountId) {
+      const v1SendPath = `/v1/accounts/${encodeURIComponent(v1AccountId)}/sends`;
+      const v1Res = await this.requestJson("POST", v1SendPath, payload, {
+        "idempotency-key": idempotencyKey,
+      });
+      if (v1Res.ok) {
+        const rec = asRecord(v1Res.data);
+        const sendStatus = asNonEmptyString(rec?.status);
+        if (sendStatus === "partial" || sendStatus === "needs_review") {
+          return {
+            ok: false,
+            needsReview: true,
+            idempotencyKey,
+            error: `WECHAT_ENVOY_SEND_NEEDS_REVIEW: status=${sendStatus} (do not auto-resend)`,
+          };
+        }
+        prevStamps.push(now);
+        this.sendWindows.set(chatId, prevStamps);
+        const messageId = asNonEmptyString(rec?.messageId ?? rec?.message_id ?? rec?.id);
+        const sendId = asNonEmptyString(rec?.sendId ?? rec?.send_id ?? rec?.id);
+        return {
+          ok: true,
+          ...(messageId ? { messageId } : {}),
+          ...(sendId ? { sendId } : {}),
+          idempotencyKey,
+          data: v1Res.data,
+        };
+      }
+
+      // Uncertain network timeout / 408 / 429 / 5xx -> inspect receipt by Idempotency-Key instead of blind resend
+      if (v1Res.status === 0 || v1Res.status === 408 || v1Res.status === 429 || v1Res.status >= 500) {
+        const receiptRes = await this.requestJson(
+          "GET",
+          `/v1/accounts/${encodeURIComponent(v1AccountId)}/sends/by-idempotency-key/${encodeURIComponent(idempotencyKey)}`,
+        );
+        if (receiptRes.ok) {
+          const rRec = asRecord(receiptRes.data);
+          const rStatus = asNonEmptyString(rRec?.status);
+          if (rStatus === "accepted" || rStatus === "sent" || rStatus === "completed") {
+            prevStamps.push(now);
+            this.sendWindows.set(chatId, prevStamps);
+            const messageId = asNonEmptyString(rRec?.messageId ?? rRec?.message_id ?? rRec?.id);
+            const sendId = asNonEmptyString(rRec?.sendId ?? rRec?.send_id ?? rRec?.id);
+            return {
+              ok: true,
+              ...(messageId ? { messageId } : {}),
+              ...(sendId ? { sendId } : {}),
+              idempotencyKey,
+              recoveredViaReceipt: true,
+              data: receiptRes.data,
+            };
+          }
+          if (rStatus === "partial" || rStatus === "needs_review") {
+            return {
+              ok: false,
+              needsReview: true,
+              idempotencyKey,
+              error: `WECHAT_ENVOY_SEND_NEEDS_REVIEW: receipt status=${rStatus}`,
+            };
+          }
+        }
+        return {
+          ok: false,
+          ...(v1Res.status ? { status: v1Res.status } : {}),
+          idempotencyKey,
+          error: v1Res.error ?? "V1_SEND_UNCERTAIN",
+        };
+      }
+
+      if (v1Res.status !== 404) {
+        return {
+          ok: false,
+          ...(v1Res.status ? { status: v1Res.status } : {}),
+          idempotencyKey,
+          error: v1Res.error ?? "V1_SEND_FAILED",
+        };
+      }
+    }
+
+    // 2. Fallback to generic /api/messages/send
+    const res = await this.requestJson("POST", "/api/messages/send", payload, {
+      "idempotency-key": idempotencyKey,
+    });
     if (!res.ok) {
       return {
         ok: false,
         ...(res.status ? { status: res.status } : {}),
+        idempotencyKey,
         error: res.error ?? "SEND_MESSAGE_FAILED",
       };
     }
@@ -673,6 +1069,7 @@ export class WeChatEnvoySidecarClient implements WeChatEnvoyClientLike {
     return {
       ok: true,
       ...(messageId ? { messageId } : {}),
+      idempotencyKey,
       data: res.data,
     };
   }
@@ -704,6 +1101,7 @@ export class WeChatEnvoyPoller {
   private readonly onActionableInbound?: WeChatEnvoyPollerOptions["onActionableInbound"];
   private readonly onError?: WeChatEnvoyPollerOptions["onError"];
   private cursor: string | undefined;
+  private serverId: string | undefined;
   private processedIds: string[] = [];
   private processedSet = new Set<string>();
   private timer: NodeJS.Timeout | undefined;
@@ -735,6 +1133,9 @@ export class WeChatEnvoyPoller {
       if (typeof parsed.cursor === "string" && parsed.cursor.trim()) {
         this.cursor = parsed.cursor.trim();
       }
+      if (typeof parsed.serverId === "string" && parsed.serverId.trim()) {
+        this.serverId = parsed.serverId.trim();
+      }
       if (Array.isArray(parsed.processedMessageIds)) {
         const trimmed = parsed.processedMessageIds
           .filter((x): x is string => typeof x === "string" && x.trim().length > 0)
@@ -750,6 +1151,7 @@ export class WeChatEnvoyPoller {
   private persistState(): void {
     const state: WeChatEnvoyPersistedState = {
       ...(this.cursor ? { cursor: this.cursor } : {}),
+      ...(this.serverId ? { serverId: this.serverId } : {}),
       processedMessageIds: [...this.processedIds],
       updatedAt: new Date().toISOString(),
     };
@@ -829,7 +1231,7 @@ export class WeChatEnvoyPoller {
         };
       }
 
-      const fetched = await this.client.fetchUnreadEvents(this.cursor);
+      const fetched = await this.client.fetchUnreadEvents(this.cursor, this.serverId);
       if (!fetched.ok) {
         if ("skipped" in fetched && fetched.skipped) {
           return {
@@ -856,6 +1258,24 @@ export class WeChatEnvoyPoller {
           deduplicated: 0,
           decisions: [],
           error: errMsg,
+        };
+      }
+
+      if (fetched.cursorResetOnServerChange) {
+        this.cursor = undefined;
+        this.serverId = fetched.serverId;
+        this.persistState();
+        return {
+          ok: true,
+          fetchedCount: 0,
+          droppedSelf: 0,
+          droppedPolicy: 0,
+          routedGroupSilent: 0,
+          routedConcierge: 0,
+          deduplicated: 0,
+          decisions: [],
+          ...(this.serverId ? { serverId: this.serverId } : {}),
+          cursorResetOnServerChange: true,
         };
       }
 
@@ -950,10 +1370,15 @@ export class WeChatEnvoyPoller {
         });
       }
 
+      let serverChanged = false;
+      if (fetched.serverId && fetched.serverId !== this.serverId) {
+        this.serverId = fetched.serverId;
+        serverChanged = true;
+      }
       if (fetched.nextCursor !== undefined) {
         this.cursor = fetched.nextCursor;
       }
-      if (fetched.messages.length > 0 || fetched.nextCursor !== undefined) {
+      if (fetched.messages.length > 0 || fetched.nextCursor !== undefined || serverChanged) {
         this.persistState();
       }
 
@@ -967,6 +1392,7 @@ export class WeChatEnvoyPoller {
         deduplicated,
         decisions,
         ...(this.cursor ? { nextCursor: this.cursor } : {}),
+        ...(this.serverId ? { serverId: this.serverId } : {}),
       };
     };
 

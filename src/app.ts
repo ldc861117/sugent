@@ -782,7 +782,7 @@ export class App {
           "【幕僚高优提醒】",
           ...urgent.slice(0, 3).map((c) => `- ${c.title}：${c.threeLineBody[0]}`),
         ];
-        await this.pushToOwner(lines.join("\n")).catch(() => false);
+        await this.pushToOwner(lines.join("\n"), { urgency: "urgent", title: "幕僚高优提醒" }).catch(() => false);
       }
     }
     return res;
@@ -1150,15 +1150,61 @@ export class App {
     return account;
   }
 
-  async pushToOwner(text: string): Promise<boolean> {
+  async pushToOwner(
+    text: string,
+    opts?: { urgency?: "normal" | "high" | "urgent"; title?: string },
+  ): Promise<boolean> {
+    const urgency = opts?.urgency ?? "normal";
+    const firstLine = text.split("\n")[0]?.replace(/^【|】$/g, "").trim() || "幕僚提醒";
+    const title = opts?.title?.trim() || firstLine.slice(0, 48);
+    let fallbackBody = text;
+
     for (const [key, ch] of this.channels) {
       try {
-        if (ch?.weixin && (await ch.weixin.notifyOwner(text))) return true;
-        const chat = ch?.feishu ? (this.access.owner(key, "feishu")?.peerId ?? this.store.listAccountConversations(key, "feishu").find((c) => c.kind === "dm")?.peerId) : undefined;
-        if (chat && ch?.feishu?.notify(chat, text)) return true;
+        if (ch?.weixin) {
+          if (typeof ch.weixin.ownerQuotaSnapshot === "function") {
+            const snap = ch.weixin.ownerQuotaSnapshot();
+            if (snap.ownerUserId) {
+              const guard = this.stewardService.weixinQuotaGuard;
+              // If quota recovered above lowWatermark and there are buffered items, flush digest first
+              if (snap.connected && snap.remaining > guard.lowWatermark + 1 && guard.getBufferedCount(snap.ownerUserId) > 0) {
+                const flushed = guard.flushCoalescedDigest(snap.ownerUserId, snap.remaining);
+                if (flushed.flushedCount > 0 && flushed.digestText) {
+                  await ch.weixin.notifyOwner(flushed.digestText).catch(() => false);
+                }
+              }
+              const refreshedSnap = ch.weixin.ownerQuotaSnapshot();
+              const decision = guard.routeProactivePush({
+                peerId: snap.ownerUserId,
+                title,
+                body: text,
+                urgency,
+                remainingQuota: refreshedSnap.remaining,
+                channelState: refreshedSnap.connected ? "connected" : "expired",
+              });
+              if (decision.action === "buffered_low_quota") {
+                return true;
+              }
+              if (decision.action === "send_weixin_now") {
+                const outText =
+                  refreshedSnap.remaining <= guard.lowWatermark ? decision.formattedText : text;
+                if (await ch.weixin.notifyOwner(outText)) return true;
+              } else if (decision.action === "fallback_channel") {
+                fallbackBody = decision.alertText;
+              }
+            }
+          } else if (await ch.weixin.notifyOwner(text)) {
+            return true;
+          }
+        }
+        const chat = ch?.feishu
+          ? (this.access.owner(key, "feishu")?.peerId ??
+              this.store.listAccountConversations(key, "feishu").find((c) => c.kind === "dm")?.peerId)
+          : undefined;
+        if (chat && ch?.feishu?.notify(chat, fallbackBody)) return true;
         for (const id of MESSENGERS) {
           const owner = this.access.owner(key, id)?.peerId;
-          if (owner && ch?.messengers?.[id]?.notify(owner, text)) return true;
+          if (owner && ch?.messengers?.[id]?.notify(owner, fallbackBody)) return true;
         }
       } catch (e) {
         log.warn("push to owner failed", { account: key, message: (e as Error).message.slice(0, 200) });

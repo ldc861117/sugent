@@ -107,8 +107,9 @@ Sugent 按「外环私人幕僚（[`docs/PHILOSOPHY.md`](./PHILOSOPHY.md)）× �
   - 严格执行公私域物理隔离：助理微信号收到的外部私聊与白名单群 `@提及` 消息强制经 [`security-envelope.ts`](../src/sugent/security-envelope.ts) 密封为 `0o400` 只读上下文，零权限访问 `owner_private` 私密账本，自动防自发回环（`selfWxid` 过滤）与单会话限频；经 [`concierge-channel-bridge.ts`](../src/sugent/concierge-channel-bridge.ts) 向主理人主号微信推送耳麦请示卡（含稳健 A / 积极 B 拟稿），主理人拍板后经 15 秒反悔冷静期与金额二次确认由助理微信号原路代回。
 - [x] **P3.4 白名单项目群静默纪要员（`GroupChatScribe`）与五维人脉账本沉淀**
   - 新增 [`src/sugent/group-chat-scribe.ts`](../src/sugent/group-chat-scribe.ts)：助理微信号在授权白名单项目群中默认遵守“非 `@` 绝对禁言、静默旁听记录”铁律，滚动脱敏缓存群聊上下文，自动提炼**「对方承诺（`waiting_for`）/ 我方待办（`i_owe`）/ 干系人沟通偏好与忌讳」**生成待确认纪要卡推送主理人主号，经一键确认后正式写入五维生命账本。
-- [ ] **P3.5 [我] 主号先行上线与新助理号实名养号**：推送升级云端 `sugent-gce-hub` 容器，备用机新手机号注册助理微信号并走移动流量日常养号。
-- [ ] **P3.6 [我·2026-12-02] GCE 原生无头边车扫码合龙**：养号满 5–7 天后在 GCE 启动 `compose.wechat-envoy.yml` 扫码绑号并配置首批项目群白名单。
+- [x] **P3.5 [我] 备用手机新卡实名注册助理微信号**：主理人已完成备用机新手机号注册并开启移动流量日常养号。
+- [ ] **P3.6 [观察窗·2026-12-02] 助理微信号 5–7 天日常养号静默期**：期间云端 `sugent-gce-hub` 由镜像守护自动滚动升级，主号先行承接合并转发参谋与公域访客拍板。
+- [ ] **P3.7 [我·2026-12-02] 养号满期拿备用手机扫二维码确认登录助理微信号**：无头边车容器与项目群白名单由 AI 及编排脚本自动就绪，仅需主理人真机扫码一次完成合龙。
 
 **Wave P3 验收门禁（Exit / Profit Gate）**：主号微信转发记录 3 秒出红线参谋与双拟稿；公域访客与助理微信号入站 100% 经 `0o400` 安全信封物理隔离且零 `owner_private` 泄露；群聊非 `@` 消息 100% 零误发外溢；`npm run typecheck`、全量 Vitest 单测与 `npm run verify:sugent`（第 1–29 节 + `docs:check`）全绿。
 

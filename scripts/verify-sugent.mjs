@@ -1602,6 +1602,50 @@ import { extractForwardedRecordText, weixinParts } from "../dist/src/channels/we
     const ap2 = scribe.approveDigest(gDigest.digestId, host.ledger, "2026-11-26T10:06:05.000Z");
     assert.equal(ap1.ok && ap1.writtenCommitments >= 1, true);
     assert.equal(ap2.idempotent, true);
+
+    // 28.4 agent-wechat-native /v1 SSE 实时过滤与 Idempotency-Key 回执恢复契约
+    let v1Posts = 0;
+    const v1GateClient = new WeChatEnvoySidecarClient(
+      { enabled: true, baseUrl: `${loopbackEnvoyUrl}/v1`, apiToken: "envoy-v1-gate" },
+      {
+        nowFn: () => 1_764_200_000_000,
+        fetchFn: async (input, init) => {
+          const u = String(input);
+          if (u.endsWith("/v1/status")) {
+            return new Response(JSON.stringify({ online: true, serverId: "srv_gate_v1" }), { status: 200 });
+          }
+          if (u.endsWith("/v1/accounts")) {
+            return new Response(JSON.stringify([{ id: "acct_gate_1", wxid: "wxid_bot_p3", online: true }]), { status: 200 });
+          }
+          if (u.includes("/v1/events/stream")) {
+            return new Response(
+              'id: 9\nevent: message.committed\ndata: {"messageId":"m_v1_live","origin":"live"}\n\n',
+              { status: 200, headers: { "content-type": "text/event-stream" } },
+            );
+          }
+          if (u.endsWith("/v1/messages/m_v1_live")) {
+            return new Response(
+              JSON.stringify({ id: "m_v1_live", chatId: "wxid_client_1", senderId: "wxid_client_1", text: "v1 live ping", timestampMs: 1_764_199_998_000, origin: "live" }),
+              { status: 200 },
+            );
+          }
+          if (u.endsWith("/v1/accounts/acct_gate_1/sends") && init?.method === "POST") {
+            v1Posts += 1;
+            return new Response(JSON.stringify({ error: "timeout" }), { status: 504 });
+          }
+          if (u.includes("/v1/accounts/acct_gate_1/sends/by-idempotency-key/")) {
+            return new Response(JSON.stringify({ sendId: "s_gate_1", messageId: "m_gate_out", status: "accepted" }), { status: 200 });
+          }
+          return new Response("{}", { status: 404 });
+        },
+      },
+    );
+    const v1St = await v1GateClient.getStatus();
+    assert.equal(v1St.ok && v1St.serverId === "srv_gate_v1" && v1St.accountId === "acct_gate_1", true);
+    const v1Ev = await v1GateClient.fetchUnreadEvents(undefined, "srv_gate_v1");
+    assert.equal(v1Ev.ok && v1Ev.mode === "v1_events" && v1Ev.messages.length === 1 && v1Ev.nextCursor === "9", true);
+    const v1Snd = await v1GateClient.sendMessage({ chatId: "wxid_client_1", text: "pong", idempotencyKey: "ik-gate-1" });
+    assert.equal(v1Snd.ok && v1Snd.recoveredViaReceipt === true && v1Posts === 1, true);
   } finally {
     fs.rmSync(s28Dir, { recursive: true, force: true });
   }

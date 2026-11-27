@@ -68,3 +68,13 @@
 3. **早报唤醒时序与 `snoozed` 提前核销**：
    - `StewardHostService.runScheduledPulse` 必须严格保持 **「`unsnoozeDueCommitments` → `drainMorning` → `drainFlowBoundary` → `scanCadence` → 再将刚解冻唤醒的候选合并进 `morningDrain.emitNow`」**；若把 `scanCadence` 提前到 `drainMorning` 之前，会把夜间 `morningDigestQueue` 提前消费滤除。
    - `StewardLlmAgent` 的 `complete_todo` 工具必须覆盖 `snoozed` 状态的待办，并通过 `mutateCommitment` 同步回传 `commitmentUpdates` 至 `/ops`。
+
+## 2026-11-27 · `agent-wechat-native` `/v1` 真实契约对齐、标签限定自动升级与人机边界铁律
+
+1. **对齐 `agent-wechat-native` `/v1` 真实契约与共享容器环回命名空间**：
+   - `WeChatEnvoySidecarClient` 原生支持 `GET /v1/status`（校验 `serverId` 并在服务端重建时安全重置过期游标）、`GET /v1/events/stream?after=<cursor>`（SSE 帧解析 + `GET /v1/messages/{id}` 补全 + `origin === "live"` 6 分钟实时窗过滤与撤回丢弃）以及 `POST /v1/accounts/{accountId}/sends`（附 `Idempotency-Key` 并在超时/5xx 时经 `by-idempotency-key` 单次核查回执而不盲目重发）。
+   - `compose.wechat-envoy.yml` 改为 `network_mode: "service:sugent-hub"`，使 `wx serve` 严守 `127.0.0.1:6174` 环回限制的同时与 `sugent-gce-hub` 零桥接直通。
+2. **标签限定镜像自动更新（零干扰同机 `airtoken`）与微信主动配额守卫接线**：
+   - `compose.yml` 新增 `64m` `sugent-updater`（强制 `WATCHTOWER_LABEL_ENABLE=true` 仅升级带标签的 `sugent-gce-hub` 并自动清理悬空旧镜像），推 `main` 后云端 5 分钟内自动换新；`App.pushToOwner` 正式接入 `WeixinAdaptiveQuotaGuard`，低水位缓冲合并常规通知，耗尽平滑转飞书。
+3. **人机职责边界硬约束**：
+   - 严禁在 `STATUS.md` / `ROADMAP.md` 中将推代码、拉镜像、改配置等数字环境工作标记为 `[我]`；`[我]` 仅限实体卡实名、真机摄像头扫码与资金/承诺最终拍板，且每条待办必须保持单一原子动作。

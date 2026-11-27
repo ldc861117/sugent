@@ -101,7 +101,8 @@ describe("Hybrid project planning & /ops commitment bridge", () => {
       const parsed = parseRepoRoadmapMarkdown(realRoadmap);
       expect(parsed.activeNode?.status).toBe("monitoring");
       expect(parsed.activeNode?.progress.codeDone).toBe(4);
-      expect(parsed.activeNode?.progress.realTotal).toBe(2);
+      expect(parsed.activeNode?.progress.realDone).toBe(1);
+      expect(parsed.activeNode?.progress.realTotal).toBe(3);
       expect(parsed.activeNode?.progress.pct).toBeLessThan(100);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
