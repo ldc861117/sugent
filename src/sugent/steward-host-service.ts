@@ -95,8 +95,12 @@ import { RoutingExperienceStore, type RoutingOperatingMode, type RoutingPolicySt
 import { AdaptiveModelRouter, type AdaptiveRoutingDashboardSnapshot } from "./adaptive-router.js";
 import {
   OpsBridgeClient,
+  type OpsCommitmentStatusUpdate,
+  type OpsHumanCommitmentSyncItem,
   type OpsInboxItem,
   type OpsProjectPulseInput,
+  type OpsPublicConciergeDecision,
+  type OpsPublicConciergeItem,
   type OpsRemoteCommand,
   type OpsStewardPendingSnapshot,
 } from "./ops-bridge-client.js";
@@ -112,6 +116,8 @@ import {
 import {
   WeixinAdaptiveQuotaGuard,
   buildThreeSecondForwardedBriefing,
+  ingestForwardedBriefingToLedger,
+  type IngestForwardedBriefingResult,
   type ThreeSecondForwardedBriefingResult,
 } from "./weixin-quota-and-briefing.js";
 import {
@@ -127,6 +133,7 @@ import {
 } from "./weapon-packages.js";
 import {
   EdgeTentacleHub,
+  redactLocalPaths,
   type EdgeIngestPulseInput,
   type EdgeNodeStatus,
   type EdgeQueuedCommand,
@@ -136,6 +143,23 @@ import {
   type ChatHistoryRecallResult,
   type RecallChatHistoryInput,
 } from "./chat-transcript-recall.js";
+import {
+  WeChatEnvoyPoller,
+  WeChatEnvoySidecarClient,
+  resolveWeChatEnvoyConfig,
+  type WeChatEnvoyDmPolicy,
+  type WeChatEnvoyGroupPolicy,
+  type WeChatEnvoyPollCycleResult,
+} from "./wechat-envoy-sidecar.js";
+import {
+  GroupChatScribe,
+  type GroupScribeDigestCard,
+} from "./group-chat-scribe.js";
+import {
+  AirTokenOpsBridgeClient,
+  buildAirTokenBridgeMethods,
+  type AirTokenOpsToolInput,
+} from "./airtoken-ops-bridge.js";
 
 export interface SugentStewardHostServiceOptions {
   dataDir: string;
@@ -171,6 +195,10 @@ export interface SugentStewardHostServiceOptions {
   manifestPath?: string;
   workspaceRoot?: string;
   powerSaveBlockerDriver?: PowerSaveBlockerDriver;
+  wechatEnvoyEnv?: Record<string, string | undefined>;
+  wechatEnvoyFetch?: typeof fetch;
+  airtokenEnv?: Record<string, string | undefined>;
+  airtokenFetch?: typeof fetch;
 }
 
 export interface RecentDropRecord {
@@ -242,6 +270,8 @@ export interface StewardWorkbenchSnapshot {
   routing?: AdaptiveRoutingDashboardSnapshot;
   hotUpdate?: Record<string, unknown>;
   opsFleet?: OpsStewardPendingSnapshot;
+  groupDigests?: GroupScribeDigestCard[];
+  publicConciergeQueue?: OpsPublicConciergeItem[];
 }
 
 function writeJsonAtomic600(filePath: string, data: unknown): void {
@@ -432,6 +462,11 @@ export class SugentStewardHostService {
   readonly weaponSoakLedger: WeaponSoakTelemetryLedger;
   readonly edgeHub: EdgeTentacleHub;
   readonly chatRecall: ChatTranscriptRecallService;
+  readonly wechatEnvoyClient: WeChatEnvoySidecarClient;
+  readonly wechatEnvoyPoller: WeChatEnvoyPoller;
+  readonly groupScribe: GroupChatScribe;
+  readonly airtokenOpsClient: AirTokenOpsBridgeClient;
+  private readonly airtokenOpsMethods: ReturnType<typeof buildAirTokenBridgeMethods>;
   private readonly homeDir: string;
   private lastBootNotice?: PostBootNotice;
   private lastRouteTurn?: {
@@ -458,6 +493,12 @@ export class SugentStewardHostService {
   private lastMorningDrain?: StewardWorkbenchSnapshot["cadence"]["lastMorningDrain"];
   private remoteOpsSnapshot?: OpsStewardPendingSnapshot;
   private readonly stagedOpsInbox = new Map<string, OpsInboxItem>();
+  private readonly opsCommitmentsMetaPath: string;
+  private opsCommitmentsMeta: Record<
+    string,
+    { updatedAt: string; projectKey?: string; projectName?: string; roadmapItemId?: string; nextAiHint?: string; status: string }
+  > = {};
+  private readonly pendingOpsCommitmentUpdates = new Map<string, OpsCommitmentStatusUpdate>();
 
   constructor(private readonly opts: SugentStewardHostServiceOptions) {
     this.nowIsoFn = opts.nowIso ?? (() => new Date().toISOString());
@@ -492,6 +533,9 @@ export class SugentStewardHostService {
     });
     this.dispatcher = new AntigravityDispatcher({
       runner: opts.agentApiRunner,
+      ...(opts.homeDir && !opts.agentApiRunner
+        ? { binPath: path.join(homeDir, ".gemini", "antigravity", "bin", "agentapi") }
+        : {}),
       causalLedger: this.causalLedger,
       sidecarsDir: opts.sidecarsDir ?? path.join(homeDir, ".gemini", "config", "sidecars"),
       nowIso: this.nowIsoFn,
@@ -519,6 +563,8 @@ export class SugentStewardHostService {
     this.viewedPath = path.join(stewardDir, "viewed-sessions.json");
     this.prefsPath = path.join(stewardDir, "steward-prefs.json");
     this.pulseStatePath = path.join(stewardDir, "pulse-state.json");
+    this.opsCommitmentsMetaPath = path.join(stewardDir, "ops-human-commitments-meta.json");
+    this.loadOpsCommitmentsMeta();
     this.loadViewedWatermarks();
     this.loadPrefs();
     this.repoBindings = new RepoBindingRegistry({ dataDir: opts.dataDir, nowIso: this.nowIsoFn });
@@ -542,6 +588,41 @@ export class SugentStewardHostService {
     this.chatRecall = opts.chatRecall ?? new ChatTranscriptRecallService({
       dataDir: opts.dataDir,
       nowMs: () => Date.parse(this.nowIsoFn()) || Date.now(),
+    });
+    const wechatEnvoyCfg = resolveWeChatEnvoyConfig(opts.wechatEnvoyEnv ?? process.env);
+    this.groupScribe = new GroupChatScribe({
+      dataDir: opts.dataDir,
+      whitelistedGroupIds: wechatEnvoyCfg.allowedGroupIds,
+      nowIso: this.nowIsoFn,
+    });
+    this.wechatEnvoyClient = new WeChatEnvoySidecarClient(wechatEnvoyCfg, {
+      ...(opts.wechatEnvoyFetch ?? opts.llmFetch ? { fetchFn: opts.wechatEnvoyFetch ?? opts.llmFetch } : {}),
+    });
+    this.airtokenOpsClient = new AirTokenOpsBridgeClient({
+      ...(opts.airtokenEnv ? { env: opts.airtokenEnv } : {}),
+      ...(opts.airtokenFetch ?? opts.llmFetch ? { fetchFn: opts.airtokenFetch ?? opts.llmFetch } : {}),
+      homeDir,
+    });
+    this.airtokenOpsMethods = buildAirTokenBridgeMethods(this.airtokenOpsClient);
+    this.wechatEnvoyPoller = new WeChatEnvoyPoller({
+      config: wechatEnvoyCfg,
+      client: this.wechatEnvoyClient,
+      dataDir: opts.dataDir,
+      onGroupSilentMessage: (m) => {
+        this.groupScribe.recordGroupMessage({
+          groupId: m.chatId,
+          messageId: m.messageId,
+          senderId: m.senderId,
+          senderName: m.senderName,
+          content: m.text,
+          createdAtMs: m.timestampMs,
+        });
+      },
+      onActionableInbound: async (ev) => {
+        if (opts.conciergeBridge) {
+          await opts.conciergeBridge.ingestWeChatEnvoyEvent(ev);
+        }
+      },
     });
     this.codingHarnesses = new CodingHarnessRegistry([
       new AntigravityCodingHarness(this.dispatcher),
@@ -598,6 +679,7 @@ export class SugentStewardHostService {
       decideVibeTask: (i) => this.decideVibeTask(i),
       searchAuthorizedFiles: (i) => this.searchAuthorizedFiles(i),
       readAuthorizedFile: (i) => this.readAuthorizedFile(i),
+      handleAirTokenShortcut: (t, d) => (d === "owner_private" ? this.handleAirTokenShortcut(t) : Promise.resolve({ handled: false })),
       ...(opts.conciergeBridge
         ? {
             executeConciergeCommand: (cmd, ch) => opts.conciergeBridge!.executeOwnerCommand(cmd, ch),
@@ -666,6 +748,9 @@ export class SugentStewardHostService {
         proposeOpsInbox: (input) => this.proposeOpsInbox(input),
         recallChatHistory: (input) => this.recallChatHistory(input),
         dispatchEdgeAntigravity: (input) => this.dispatchEdgeAntigravity(input),
+        analyzeForwardedChat: (input) => this.ingestForwardedWeixinChat(input),
+        manageWeChatEnvoy: (input) => this.executeWeChatEnvoyToolAction(input),
+        manageAirTokenOps: (input) => this.executeAirTokenOpsToolAction(input),
         ...(opts.delegateLocalTask ? { delegateLocalTask: opts.delegateLocalTask } : {}),
         ...(opts.conciergeBridge ? { executeConciergeCommand: (cmd, ch) => opts.conciergeBridge!.executeOwnerCommand(cmd, ch) } : {}),
       },
@@ -1015,7 +1100,13 @@ export class SugentStewardHostService {
       ...(callerDomain === "owner_private"
         ? (() => {
             const mergedFleet = this.getMergedOpsFleetSnapshot();
-            return mergedFleet ? { opsFleet: mergedFleet } : {};
+            const pendingGroupDigests = this.groupScribe.listDigests({ status: "pending_approval" });
+            const pubQueue = this.getPublicConciergeQueue();
+            return {
+              ...(mergedFleet ? { opsFleet: mergedFleet } : {}),
+              ...(pendingGroupDigests.length ? { groupDigests: pendingGroupDigests } : {}),
+              ...(pubQueue.length ? { publicConciergeQueue: pubQueue } : {}),
+            };
           })()
         : {}),
       routing,
@@ -1171,7 +1262,7 @@ export class SugentStewardHostService {
     dueAt?: string;
     status?: CommitmentItem["status"];
     callerDomain?: CallerAccessDomain;
-  }): { ok: true; commitment: CommitmentItem; workbench: StewardWorkbenchSnapshot } {
+  }): { ok: true; commitment: CommitmentItem; workbench: StewardWorkbenchSnapshot; roadmapItemId?: string; nextAiHint?: string } {
     const callerDomain = input.callerDomain ?? "owner_private";
     const nowIso = this.nowIsoFn();
     const commitment =
@@ -1189,11 +1280,38 @@ export class SugentStewardHostService {
             },
             nowIso,
           );
+    let roadmapItemId: string | undefined;
+    let nextAiHint: string | undefined;
     if (input.action === "status" && input.status === "closed") {
       const ownerRel = this.ledger.snapshotForCaller("owner_private").relationships.find((r) => r.subjectType === "owner_trust");
       if (ownerRel) this.ledger.recordVerifiedObservation(ownerRel.id, nowIso);
+      const prevMeta = this.opsCommitmentsMeta[commitment.id];
+      if (commitment.id.startsWith("todo:") || prevMeta) {
+        roadmapItemId = prevMeta?.roadmapItemId;
+        nextAiHint = prevMeta?.nextAiHint;
+        if (prevMeta) {
+          this.opsCommitmentsMeta[commitment.id] = { ...prevMeta, updatedAt: commitment.updatedAt, status: "closed" };
+          this.saveOpsCommitmentsMeta();
+        }
+        const upd: OpsCommitmentStatusUpdate = { id: commitment.id, status: "closed", updatedAt: commitment.updatedAt };
+        this.pendingOpsCommitmentUpdates.set(commitment.id, upd);
+        if (this.opts.opsBridge?.isConfigured() && this.opts.opsBridge.isStewardHub()) {
+          void this.opts.opsBridge
+            .stewardSync({ commitmentUpdates: [upd] })
+            .then((r) => {
+              if (r.ok) this.pendingOpsCommitmentUpdates.delete(commitment.id);
+            })
+            .catch(() => {});
+        }
+      }
     }
-    return { ok: true, commitment, workbench: this.getWorkbench(callerDomain) };
+    return {
+      ok: true,
+      commitment,
+      workbench: this.getWorkbench(callerDomain),
+      ...(roadmapItemId ? { roadmapItemId } : {}),
+      ...(nextAiHint ? { nextAiHint } : {}),
+    };
   }
 
   scanCadence(input: {
@@ -1600,6 +1718,168 @@ export class SugentStewardHostService {
     };
   }
 
+  private loadOpsCommitmentsMeta(): void {
+    try {
+      if (!fs.existsSync(this.opsCommitmentsMetaPath)) return;
+      const parsed = JSON.parse(fs.readFileSync(this.opsCommitmentsMetaPath, "utf8")) as Record<string, unknown>;
+      if (parsed && typeof parsed === "object") {
+        this.opsCommitmentsMeta = parsed as typeof this.opsCommitmentsMeta;
+      }
+    } catch {
+      this.opsCommitmentsMeta = {};
+    }
+  }
+
+  private saveOpsCommitmentsMeta(): void {
+    writeJsonAtomic600(this.opsCommitmentsMetaPath, this.opsCommitmentsMeta);
+  }
+
+  private localDateKeyFromIso(iso: string): string {
+    const dt = new Date(Date.parse(iso) || Date.now());
+    return `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, "0")}-${String(dt.getDate()).padStart(2, "0")}`;
+  }
+
+  syncOpsHumanCommitments(items: readonly OpsHumanCommitmentSyncItem[], nowIso = this.nowIsoFn()): { synced: number; closed: number } {
+    if (!Array.isArray(items) || items.length === 0) return { synced: 0, closed: 0 };
+    const localDateKey = this.localDateKeyFromIso(nowIso);
+    const existingById = new Map(
+      this.ledger.snapshotForCaller("owner_private").commitments.map((c) => [c.id, c]),
+    );
+    let synced = 0;
+    let closed = 0;
+    let metaDirty = false;
+    for (const item of items) {
+      if (!item?.id || !item.title) continue;
+      const existing = existingById.get(item.id);
+      const prevMeta = this.opsCommitmentsMeta[item.id];
+      const incomingMs = Date.parse(item.updatedAt || nowIso) || 0;
+      const localMs = existing ? Date.parse(existing.updatedAt || prevMeta?.updatedAt || "") || 0 : 0;
+      this.opsCommitmentsMeta[item.id] = {
+        updatedAt: existing && localMs > incomingMs ? existing.updatedAt : (item.updatedAt || nowIso),
+        ...(item.projectKey ? { projectKey: item.projectKey } : prevMeta?.projectKey ? { projectKey: prevMeta.projectKey } : {}),
+        ...(item.projectName ? { projectName: item.projectName } : prevMeta?.projectName ? { projectName: prevMeta.projectName } : {}),
+        ...(item.roadmapItemId ? { roadmapItemId: item.roadmapItemId } : prevMeta?.roadmapItemId ? { roadmapItemId: prevMeta.roadmapItemId } : {}),
+        ...(item.nextAiHint ? { nextAiHint: item.nextAiHint } : prevMeta?.nextAiHint ? { nextAiHint: prevMeta.nextAiHint } : {}),
+        status: existing?.status === "closed" && localMs > incomingMs ? "closed" : item.stage === "done" ? "closed" : "open",
+      };
+      metaDirty = true;
+
+      if (existing?.status === "closed" && localMs > incomingMs) {
+        if (item.stage !== "done") {
+          this.pendingOpsCommitmentUpdates.set(item.id, { id: item.id, status: "closed", updatedAt: existing.updatedAt });
+        }
+        continue;
+      }
+      if (item.stage === "done") {
+        if (existing && existing.status !== "closed") {
+          this.ledger.updateCommitmentStatus(item.id, "closed", item.updatedAt || nowIso);
+          closed += 1;
+        }
+        continue;
+      }
+      const shouldSnooze = Boolean(item.snoozeUntil && item.snoozeUntil.slice(0, 10) > localDateKey);
+      const targetStatus: CommitmentItem["status"] = shouldSnooze ? "snoozed" : "open";
+      const safeSummary = redactLocalPaths(item.title).slice(0, 180) || "项目待办";
+      const refParts = [item.projectName || item.projectKey, item.roadmapItemId ? `#${item.roadmapItemId}` : ""].filter(Boolean);
+      const counterpartyOrRef = redactLocalPaths(refParts.join(" · ")) || "项目待办";
+      const dueAt = item.dueAt || item.snoozeUntil;
+      const remindLeadDays = item.snoozeUntil ? 0 : 1;
+      const unchanged =
+        existing &&
+        existing.status === targetStatus &&
+        existing.summary === safeSummary &&
+        existing.dueAt === dueAt &&
+        existing.counterpartyOrRef === counterpartyOrRef;
+      if (!unchanged) {
+        try {
+          this.ledger.upsertCommitment(
+            {
+              id: item.id,
+              partition: "work_project",
+              direction: item.direction === "waiting_for" || item.direction === "expiring" ? item.direction : "i_owe",
+              status: targetStatus,
+              summary: safeSummary,
+              counterpartyOrRef,
+              ...(dueAt ? { dueAt } : {}),
+              remindLeadDays,
+            },
+            item.updatedAt || nowIso,
+          );
+          synced += 1;
+        } catch {
+          // ignore invalid/secret-like external summary
+        }
+      }
+    }
+    if (metaDirty) this.saveOpsCommitmentsMeta();
+    return { synced, closed };
+  }
+
+  unsnoozeDueCommitments(input: { nowIso?: string; localDateKey?: string } = {}): CommitmentItem[] {
+    const nowIso = input.nowIso ?? this.nowIsoFn();
+    const targetDateKey = input.localDateKey?.trim() || this.localDateKeyFromIso(nowIso);
+    const wakeups: CommitmentItem[] = [];
+    for (const c of this.ledger.snapshotForCaller("owner_private").commitments) {
+      if (c.status !== "snoozed" || !c.dueAt) continue;
+      if (c.dueAt.slice(0, 10) <= targetDateKey) {
+        wakeups.push(this.ledger.updateCommitmentStatus(c.id, "open", nowIso));
+      }
+    }
+    return wakeups;
+  }
+
+  peekPendingOpsCommitmentUpdates(): OpsCommitmentStatusUpdate[] {
+    return Array.from(this.pendingOpsCommitmentUpdates.values());
+  }
+
+  ackOpsCommitmentUpdates(ids: readonly string[]): void {
+    for (const id of ids) this.pendingOpsCommitmentUpdates.delete(id);
+  }
+
+  drainPendingOpsCommitmentUpdates(): OpsCommitmentStatusUpdate[] {
+    const out = this.peekPendingOpsCommitmentUpdates();
+    this.pendingOpsCommitmentUpdates.clear();
+    return out;
+  }
+
+  async completeCommitmentByRef(
+    refText: string,
+  ): Promise<{ ok: boolean; handled: boolean; reply?: string; commitment?: CommitmentItem }> {
+    const q = String(refText ?? "").trim().replace(/^#/, "");
+    if (!q) return { ok: false, handled: false };
+    const qLower = q.toLowerCase();
+    const openList = this.ledger
+      .snapshotForCaller("owner_private")
+      .commitments.filter((c) => c.status === "open" || c.status === "snoozed" || c.status === "waiting_review");
+    let target =
+      openList.find((c) => c.id.toLowerCase() === qLower || c.id.toLowerCase().endsWith(`:${qLower}`)) ??
+      openList.find((c) => this.opsCommitmentsMeta[c.id]?.roadmapItemId?.toLowerCase() === qLower) ??
+      openList.find((c) => c.counterpartyOrRef.toLowerCase().includes(`#${qLower}`));
+    if (!target && q.length >= 2) {
+      const subMatches = openList.filter((c) => c.summary.toLowerCase().includes(qLower));
+      if (subMatches.length === 1) target = subMatches[0];
+    }
+    if (!target) return { ok: false, handled: false };
+
+    const nowIso = this.nowIsoFn();
+    const closed = this.ledger.updateCommitmentStatus(target.id, "closed", nowIso);
+    const prevMeta = this.opsCommitmentsMeta[target.id];
+    if (prevMeta) {
+      this.opsCommitmentsMeta[target.id] = { ...prevMeta, updatedAt: closed.updatedAt, status: "closed" };
+      this.saveOpsCommitmentsMeta();
+    }
+    const update: OpsCommitmentStatusUpdate = { id: target.id, status: "closed", updatedAt: closed.updatedAt };
+    this.pendingOpsCommitmentUpdates.set(target.id, update);
+    if (this.opts.opsBridge?.isConfigured() && this.opts.opsBridge.isStewardHub()) {
+      const syncRes = await this.opts.opsBridge.stewardSync({ commitmentUpdates: [update] });
+      if (syncRes.ok) this.pendingOpsCommitmentUpdates.delete(target.id);
+    }
+    const hints: string[] = [`✅ 已销账「${closed.summary}」`];
+    if (prevMeta?.roadmapItemId) hints.push(`已安排回勾路线图 ${prevMeta.roadmapItemId}`);
+    if (prevMeta?.nextAiHint) hints.push(`下一步 AI 提示：${prevMeta.nextAiHint}`);
+    return { ok: true, handled: true, reply: hints.join("；") + "。", commitment: closed };
+  }
+
   private readPulseState(): { lastMorningDateKey?: string; lastGardenerAtMs?: number; prevSurpriseMomentum?: number } {
     try {
       if (!fs.existsSync(this.pulseStatePath)) return {};
@@ -1627,6 +1907,7 @@ export class SugentStewardHostService {
     morningDrain?: { emitNow: ProactiveCandidate[]; supersededIds: string[] };
     boundaryDrain?: { emitNow: ProactiveCandidate[]; supersededIds: string[] };
     gardener?: GardenerCycleOutput;
+    unsnoozedWakeups?: CommitmentItem[];
   } {
     const nowMs = input.nowMs ?? (Date.parse(this.nowIsoFn()) || Date.now());
     const nowDate = new Date(nowMs);
@@ -1635,12 +1916,14 @@ export class SugentStewardHostService {
     const localDateKey = `${nowDate.getFullYear()}-${String(nowDate.getMonth() + 1).padStart(2, "0")}-${String(nowDate.getDate()).padStart(2, "0")}`;
     const localHour = nowDate.getHours();
     const state = this.readPulseState();
+    const unsnoozedWakeups = this.unsnoozeDueCommitments({ nowIso: atIso, localDateKey });
+    const wakeupIds = new Set(unsnoozedWakeups.map((w) => w.id));
 
     let morningDrain: { emitNow: ProactiveCandidate[]; supersededIds: string[] } | undefined;
     const inMorningWindow = localHour >= 7 && localHour < 11;
     if (input.forceMorningDrain || (inMorningWindow && state.lastMorningDateKey !== localDateKey)) {
       const drained = this.drainMorning({ nextDateKey: localDateKey });
-      morningDrain = { emitNow: drained.emitNow, supersededIds: drained.supersededIds };
+      morningDrain = { emitNow: [...drained.emitNow], supersededIds: drained.supersededIds };
       state.lastMorningDateKey = localDateKey;
     }
 
@@ -1653,6 +1936,15 @@ export class SugentStewardHostService {
     }
 
     const scanned = this.scanCadence();
+    if (morningDrain && wakeupIds.size > 0) {
+      const seenKeys = new Set(morningDrain.emitNow.map((c) => c.dedupeKey));
+      for (const cand of [...scanned.emitNow, ...scanned.foldToMorningDigest]) {
+        if (cand.targetRefId && wakeupIds.has(cand.targetRefId) && !seenKeys.has(cand.dedupeKey)) {
+          morningDrain.emitNow.push(cand);
+          seenKeys.add(cand.dedupeKey);
+        }
+      }
+    }
     const scan = {
       emitNow: scanned.emitNow,
       foldToMorningDigest: scanned.foldToMorningDigest,
@@ -1675,6 +1967,7 @@ export class SugentStewardHostService {
       ...(morningDrain ? { morningDrain } : {}),
       ...(boundaryDrain ? { boundaryDrain } : {}),
       ...(gardener ? { gardener } : {}),
+      ...(unsnoozedWakeups.length > 0 ? { unsnoozedWakeups } : {}),
     };
   }
 
@@ -1685,6 +1978,9 @@ export class SugentStewardHostService {
       for (const item of snapshot.pendingInbox) {
         if (item?.id) this.stagedOpsInbox.set(item.id, item);
       }
+    }
+    if (snapshot?.humanCommitments?.length) {
+      this.syncOpsHumanCommitments(snapshot.humanCommitments);
     }
   }
 
@@ -1772,6 +2068,9 @@ export class SugentStewardHostService {
         this.remoteOpsSnapshot.pendingInbox.length > 0
           ? this.remoteOpsSnapshot.pendingInbox
           : Array.from(this.stagedOpsInbox.values()),
+      ...(this.remoteOpsSnapshot.publicConciergeQueue
+        ? { publicConciergeQueue: this.remoteOpsSnapshot.publicConciergeQueue }
+        : {}),
       ...(this.remoteOpsSnapshot.weeklyFocus ? { weeklyFocus: this.remoteOpsSnapshot.weeklyFocus } : {}),
       ...(edgeSnap.stageGoals ?? this.remoteOpsSnapshot.stageGoals
         ? { stageGoals: edgeSnap.stageGoals ?? this.remoteOpsSnapshot.stageGoals }
@@ -2077,6 +2376,243 @@ export class SugentStewardHostService {
     });
   }
 
+  ingestForwardedWeixinChat(input: {
+    rawForwardedText: string;
+    ownerName?: string;
+    autoRecordToLedger?: boolean;
+  }): IngestForwardedBriefingResult {
+    return ingestForwardedBriefingToLedger({
+      workspaceDir: path.join(this.opts.dataDir, "sugent-stewardship", "weixin-briefings"),
+      ledger: this.ledger,
+      rawForwardedText: input.rawForwardedText,
+      ...(input.ownerName ? { ownerName: input.ownerName } : {}),
+      ...(input.autoRecordToLedger !== undefined ? { autoRecordToLedger: input.autoRecordToLedger } : {}),
+      nowIso: this.nowIsoFn(),
+    });
+  }
+
+  getPublicConciergeQueue(): OpsPublicConciergeItem[] {
+    return [...(this.remoteOpsSnapshot?.publicConciergeQueue ?? [])];
+  }
+
+  async replyPublicConcierge(decision: OpsPublicConciergeDecision): Promise<{
+    ok: boolean;
+    synced: boolean;
+    sessionId: string;
+    action: OpsPublicConciergeDecision["action"];
+    message: string;
+  }> {
+    const sessionId = String(decision.sessionId ?? "").trim();
+    if (!sessionId) {
+      return { ok: false, synced: false, sessionId: "", action: decision.action, message: "缺少访客会话编号 sessionId。" };
+    }
+    if (this.opts.opsBridge?.isConfigured() && this.opts.opsBridge.isStewardHub()) {
+      const syncRes = await this.opts.opsBridge.stewardSync({
+        conciergeDecisions: [decision],
+      });
+      if (!syncRes.ok) {
+        return {
+          ok: false,
+          synced: false,
+          sessionId,
+          action: decision.action,
+          message: `同步官网公域接待回复失败（${syncRes.reason ?? "network_error"}），请稍后重试。`,
+        };
+      }
+    }
+    if (this.remoteOpsSnapshot?.publicConciergeQueue) {
+      this.remoteOpsSnapshot = {
+        ...this.remoteOpsSnapshot,
+        publicConciergeQueue: this.remoteOpsSnapshot.publicConciergeQueue.filter(
+          (it) => it.sessionId !== sessionId && it.id !== sessionId,
+        ),
+      };
+    }
+    return {
+      ok: true,
+      synced: Boolean(this.opts.opsBridge?.isConfigured() && this.opts.opsBridge.isStewardHub()),
+      sessionId,
+      action: decision.action,
+      message:
+        decision.action === "approve_reply"
+          ? `已将您的回复同步至官网数字分身访客会话（${sessionId}）。`
+          : `已对官网访客会话（${sessionId}）执行 ${decision.action}。`,
+    };
+  }
+
+  getWeChatEnvoyOverview(): {
+    configured: boolean;
+    pollerRunning: boolean;
+    config: Omit<ReturnType<WeChatEnvoyPoller["getConfig"]>, "apiToken"> & { hasToken: boolean };
+    whitelistedGroups: string[];
+    pendingGroupDigests: GroupScribeDigestCard[];
+    publicConciergeQueue: OpsPublicConciergeItem[];
+  } {
+    const cfg = this.wechatEnvoyPoller.getConfig();
+    const { apiToken, ...restCfg } = cfg;
+    return {
+      configured: this.wechatEnvoyClient.isConfigured(),
+      pollerRunning: this.wechatEnvoyPoller.isRunning(),
+      config: { ...restCfg, hasToken: Boolean(apiToken) },
+      whitelistedGroups: this.groupScribe.getWhitelistedGroupIds(),
+      pendingGroupDigests: this.groupScribe.listDigests({ status: "pending_approval" }),
+      publicConciergeQueue: this.getPublicConciergeQueue(),
+    };
+  }
+
+  async pollWeChatEnvoyOnce(): Promise<WeChatEnvoyPollCycleResult> {
+    return this.wechatEnvoyPoller.runCycleOnce();
+  }
+
+  updateWeChatEnvoyAllowlist(patch: {
+    addGroupId?: string;
+    removeGroupId?: string;
+    addDmPeerId?: string;
+    removeDmPeerId?: string;
+    dmPolicy?: WeChatEnvoyDmPolicy;
+    groupPolicy?: WeChatEnvoyGroupPolicy;
+  }) {
+    const cur = this.wechatEnvoyPoller.getConfig();
+    const groups = new Set(cur.allowedGroupIds);
+    const dms = new Set(cur.allowedDmPeerIds);
+    if (patch.addGroupId?.trim()) {
+      groups.add(patch.addGroupId.trim());
+      this.groupScribe.addWhitelistedGroup(patch.addGroupId.trim());
+    }
+    if (patch.removeGroupId?.trim()) {
+      groups.delete(patch.removeGroupId.trim());
+      this.groupScribe.removeWhitelistedGroup(patch.removeGroupId.trim());
+    }
+    if (patch.addDmPeerId?.trim()) dms.add(patch.addDmPeerId.trim());
+    if (patch.removeDmPeerId?.trim()) dms.delete(patch.removeDmPeerId.trim());
+    this.wechatEnvoyPoller.updateConfig({
+      allowedGroupIds: Array.from(groups),
+      allowedDmPeerIds: Array.from(dms),
+      ...(patch.dmPolicy ? { dmPolicy: patch.dmPolicy } : {}),
+      ...(patch.groupPolicy ? { groupPolicy: patch.groupPolicy } : {}),
+    });
+    return this.getWeChatEnvoyOverview();
+  }
+
+  async distillGroupScribeDigest(input: {
+    groupId: string;
+    groupName?: string;
+    projectKey?: string;
+    ownerAliases?: string[];
+  }): Promise<GroupScribeDigestCard> {
+    return this.groupScribe.distillGroupDigest(input);
+  }
+
+  decideGroupScribeDigest(input: {
+    digestId: string;
+    decision: "approve" | "dismiss";
+  }): {
+    ok: boolean;
+    decision: "approve" | "dismiss";
+    digest: GroupScribeDigestCard;
+    writtenCommitments?: number;
+    writtenRelationships?: number;
+    message: string;
+  } {
+    if (input.decision === "approve") {
+      const res = this.groupScribe.approveDigest(input.digestId, this.ledger, this.nowIsoFn());
+      return {
+        ok: true,
+        decision: "approve",
+        digest: res.digest,
+        writtenCommitments: res.writtenCommitments,
+        writtenRelationships: res.writtenRelationships,
+        message: res.idempotent
+          ? `群纪要（${res.digest.digestId}）此前已入账，无需重复写入。`
+          : `已批准群纪要「${res.digest.groupName}」（${res.digest.digestId}），写入待办 ${res.writtenCommitments} 项、更新人脉画像 ${res.writtenRelationships} 人。`,
+      };
+    }
+    const dis = this.groupScribe.dismissDigest(input.digestId, this.nowIsoFn());
+    return {
+      ok: true,
+      decision: "dismiss",
+      digest: dis.digest,
+      message: `已忽略群纪要「${dis.digest.groupName}」（${dis.digest.digestId}），未写入账本。`,
+    };
+  }
+
+  async executeWeChatEnvoyToolAction(input: {
+    action:
+      | "status"
+      | "poll_now"
+      | "distill_group"
+      | "approve_digest"
+      | "dismiss_digest"
+      | "update_allowlist"
+      | "reply_public_visitor";
+    groupId?: string;
+    groupName?: string;
+    projectKey?: string;
+    digestId?: string;
+    addGroupId?: string;
+    removeGroupId?: string;
+    addDmPeerId?: string;
+    removeDmPeerId?: string;
+    sessionId?: string;
+    publicAction?: OpsPublicConciergeDecision["action"];
+    ownerReply?: string;
+  }): Promise<Record<string, unknown>> {
+    if (input.action === "status") {
+      const liveStatus = this.wechatEnvoyClient.isConfigured()
+        ? await this.wechatEnvoyClient.getStatus()
+        : { ok: false, skipped: true };
+      return { ok: true, ...this.getWeChatEnvoyOverview(), sidecarStatus: liveStatus };
+    }
+    if (input.action === "poll_now") {
+      return { ok: true, cycle: await this.pollWeChatEnvoyOnce(), ...this.getWeChatEnvoyOverview() };
+    }
+    if (input.action === "distill_group") {
+      const gid = String(input.groupId ?? "").trim() || this.groupScribe.getWhitelistedGroupIds()[0] || "";
+      if (!gid) return { ok: false, errorCode: "MISSING_GROUP_ID", message: "请指定白名单群聊 ID（如 xxx@chatroom）。" };
+      const card = await this.distillGroupScribeDigest({
+        groupId: gid,
+        ...(input.groupName ? { groupName: input.groupName } : {}),
+        ...(input.projectKey ? { projectKey: input.projectKey } : {}),
+      });
+      return { ok: true, digest: card };
+    }
+    if (input.action === "approve_digest" || input.action === "dismiss_digest") {
+      const did =
+        String(input.digestId ?? "").trim() ||
+        this.groupScribe.listDigests({ status: "pending_approval" })[0]?.digestId ||
+        "";
+      if (!did) return { ok: false, errorCode: "NO_PENDING_DIGEST", message: "当前没有待审批的群纪要卡片。" };
+      return this.decideGroupScribeDigest({
+        digestId: did,
+        decision: input.action === "approve_digest" ? "approve" : "dismiss",
+      });
+    }
+    if (input.action === "update_allowlist") {
+      return {
+        ok: true,
+        ...this.updateWeChatEnvoyAllowlist({
+          ...(input.addGroupId ? { addGroupId: input.addGroupId } : {}),
+          ...(input.removeGroupId ? { removeGroupId: input.removeGroupId } : {}),
+          ...(input.addDmPeerId ? { addDmPeerId: input.addDmPeerId } : {}),
+          ...(input.removeDmPeerId ? { removeDmPeerId: input.removeDmPeerId } : {}),
+        }),
+      };
+    }
+    if (input.action === "reply_public_visitor") {
+      const sid =
+        String(input.sessionId ?? "").trim() ||
+        this.getPublicConciergeQueue()[0]?.sessionId ||
+        "";
+      if (!sid) return { ok: false, errorCode: "NO_PUBLIC_VISITOR", message: "当前没有待处理的官网访客咨询。" };
+      return this.replyPublicConcierge({
+        sessionId: sid,
+        action: input.publicAction ?? "approve_reply",
+        ...(input.ownerReply ? { ownerReply: input.ownerReply } : {}),
+      });
+    }
+    return { ok: false, errorCode: `UNKNOWN_ENVOY_ACTION:${String(input.action)}` };
+  }
+
   listBuiltinWeaponPackages(): WeaponPackageManifest[] {
     return listWeaponPackages();
   }
@@ -2118,5 +2654,13 @@ export class SugentStewardHostService {
 
   getWeaponSoakProof(targetSoakDays = 14): CommercialProofSummary {
     return this.weaponSoakLedger.exportCommercialProofSummary(targetSoakDays);
+  }
+
+  async handleAirTokenShortcut(text: string): Promise<{ handled: boolean; reply?: string }> {
+    return this.airtokenOpsMethods.handleShortcut(text);
+  }
+
+  async executeAirTokenOpsToolAction(input: AirTokenOpsToolInput): Promise<Record<string, unknown>> {
+    return this.airtokenOpsMethods.executeAction(input);
   }
 }

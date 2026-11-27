@@ -23,6 +23,11 @@ import {
   type OutboundChannelTransport,
   type SuspendedRoundStorePort,
 } from "./concierge-dispatcher.js";
+import { computeOutboundConfirmHash } from "./concierge-guardrails.js";
+
+function computeGroupProxyHash(peerId: string, body: string): string {
+  return computeOutboundConfirmHash(peerId, body, "owner_approved_proxy");
+}
 
 export interface OpcConciergeConfig {
   workspaceDir: string;
@@ -97,22 +102,56 @@ export class OpcConciergeOrchestrator {
       assessment.redLineInspection.requiresSuspendApproval;
 
     if (envelope.chatType === "group") {
+      const envoyGroupMention =
+        envelope.channel === "wechat_envoy" &&
+        envelope.scalarMetadata.mentionedSelf === true &&
+        Boolean(envelope.groupId);
+      const targetPeerId = envoyGroupMention ? envelope.groupId! : envelope.peerId;
+      const targetDisplayName = envoyGroupMention
+        ? `${envelope.peerDisplayName}（群 ${envelope.groupId} @提及）`
+        : envelope.peerDisplayName;
+      const targetDraftA = envoyGroupMention
+        ? {
+            body: assessment.optionA.body,
+            confirmHash: computeGroupProxyHash(targetPeerId, assessment.optionA.body),
+          }
+        : { body: assessment.optionA.body, confirmHash: assessment.optionA.confirmHash };
+      const targetDraftB = envoyGroupMention
+        ? {
+            body: assessment.optionB.body,
+            confirmHash: computeGroupProxyHash(targetPeerId, assessment.optionB.body),
+          }
+        : { body: assessment.optionB.body, confirmHash: assessment.optionB.confirmHash };
+
       this.dispatcher.registerEarpieceCard({
         cardId,
         channel: envelope.channel,
         chatType: "group",
-        peerId: envelope.peerId,
-        peerDisplayName: envelope.peerDisplayName,
+        ...(envoyGroupMention ? { allowApprovedGroupReply: true } : {}),
+        peerId: targetPeerId,
+        peerDisplayName: targetDisplayName,
         summary: assessment.summary,
         briefDigest: subgraph.briefDigest,
-        riskLevel: "group_locked",
+        riskLevel: envoyGroupMention ? (isRedLine ? "red_line" : "normal") : "group_locked",
         matchedRedLines: assessment.redLineInspection.matchedDomains,
         createdAtMs: envelope.timestampMs,
         crossPeerCanaryTokens: subgraph.crossPeerCanaryTokens,
-        draftA: { body: assessment.optionA.body, confirmHash: assessment.optionA.confirmHash },
-        draftB: { body: assessment.optionB.body, confirmHash: assessment.optionB.confirmHash },
+        draftA: targetDraftA,
+        draftB: targetDraftB,
       });
-      await this.pushOwnerEarpiece(cardId, envelope, subgraph, assessment, false);
+      await this.pushOwnerEarpiece(
+        cardId,
+        { ...envelope, peerId: targetPeerId, peerDisplayName: targetDisplayName },
+        subgraph,
+        envoyGroupMention
+          ? {
+              ...assessment,
+              optionA: { ...assessment.optionA, confirmHash: targetDraftA.confirmHash },
+              optionB: { ...assessment.optionB, confirmHash: targetDraftB.confirmHash },
+            }
+          : assessment,
+        envoyGroupMention,
+      );
       return { routeTaken: "whisper_earpiece_group_digest", cardId };
     }
 

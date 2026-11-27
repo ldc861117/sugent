@@ -16,6 +16,7 @@ import {
   inferPoseSheetLayout,
   rigPoseSheetImageBuffer,
   type PoseSheetLayoutMode,
+  type PoseSheetRigMetadata,
 } from "./avatar-pose-rig.js";
 import type { ProviderRegistry } from "./provider-registry.js";
 
@@ -37,17 +38,36 @@ export interface AvatarStudioState {
   imageModelSource: string;
 }
 
+const SUGENT_CORE_POSE_META: PoseSheetRigMetadata = {
+  ...CANONICAL_POSE_SHEET_META,
+  cells: {
+    ...CANONICAL_POSE_SHEET_META.cells,
+    idle_left: { ...CANONICAL_POSE_SHEET_META.cells.idle_left!, headEndY: 0.4773 },
+    idle: {
+      ...CANONICAL_POSE_SHEET_META.cells.idle,
+      headEndY: 0.474,
+      eyeSpots: { left: [0.4382, 0.36], right: [0.5637, 0.3601], r: 0.0137, bgRgb: [68, 76, 85], eyeRgb: [198, 225, 184] },
+    },
+    idle_right: { ...CANONICAL_POSE_SHEET_META.cells.idle_right!, headEndY: 0.475 },
+    waiting: {
+      ...CANONICAL_POSE_SHEET_META.cells.waiting,
+      headEndY: 0.435,
+      eyeSpots: { left: [0.4294, 0.3633], right: [0.5561, 0.3479], r: 0.0135, bgRgb: [76, 82, 91], eyeRgb: [198, 230, 185] },
+    },
+  },
+};
+
 export const BUILTIN_AVATAR_PACKS: readonly AvatarPackManifest[] = [
   {
     id: "sugent-core",
     schemaVersion: "pose_sheet_v2",
     name: "曜石雕塑 · Core",
-    about: "深炭黑哑光陶瓷全身搭档，配极简微光细节与六态物理舞台。",
+    about: "深炭黑哑光陶瓷全身搭档，含首行三向真·扭头帧与双目微光追踪。",
     kind: "builtin",
     spriteUrl: "/amb/static/design/bots/sugent-core.png",
     poseSheetUrl: "/amb/static/design/bots/sugent-core-v2-poses.png",
     portraitUrl: "/amb/static/design/bots/sugent-core-v2-portrait.png",
-    poseMeta: CANONICAL_POSE_SHEET_META,
+    poseMeta: SUGENT_CORE_POSE_META,
     accentColor: "#9fe870",
     hasGlow: true,
     eyeStyle: "capsule",

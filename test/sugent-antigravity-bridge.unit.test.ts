@@ -192,4 +192,14 @@ describe("Sprint 3: ArtifactComprehensionPipeline, AntigravityDispatcher & Proje
       expect(comp.livePulse.activeChildActivities[0]).toContain("陀飞轮");
     }
   });
+
+  it("blocks default host agentapi execution inside test runtimes to avoid spawning ghost sessions", async () => {
+    const disp = new AntigravityDispatcher();
+    const newRes = await disp.startNewSession({ prompt: "should be blocked in vitest" });
+    expect(newRes.ok).toBe(false);
+    expect(newRes.errorCode).toBe("AGENTAPI_FAILED");
+    const resumeRes = await disp.resumeSession({ conversationId: "11111111-1111-4111-8111-111111111111", content: "noop" });
+    expect(resumeRes.ok).toBe(false);
+    expect(resumeRes.errorCode).toBe("SESSION_UNAVAILABLE");
+  });
 });

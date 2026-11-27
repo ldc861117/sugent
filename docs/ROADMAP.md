@@ -1,4 +1,4 @@
-# Sugent 演进蓝图 (Product & Architecture Roadmap v2.0)
+# Sugent 演进蓝图 (Product & Architecture Roadmap v2.1)
 
 > **定位锚点（2026-11 批判校准版）**：Sugent (`ldc861117/sugent`) 不与 T3 Code (`pingdotgg/t3code`)、Paseo (`getpaseo/paseo`)、Paradev (`ParadevAI/Paradev`) 在「L2 纯代码仓多 CLI 并发面板」红海同维内卷，而是守住正上方的 **「L3 个人主权幕僚 OS × 端-边治理总线」** 生态位——向上承接微信、飞书与桌面的全天候碎片意图，中间靠五维生命账本、显著性仲裁与防社死护栏消解“多 Agent 看护税”，向下按需调遣自适应模型网关、原生桌面 GUI（CUA `trycua/cua`）与 ACP (`agentclientprotocol/agent-client-protocol`) 编码特种兵团，向外通过 `1 × Cowork Hub (:28080) + N × Sugent Edge` 联邦切入小微团队与工业现场交付。完整竞品对标与自我批判审计见 [`research/2026-11-23-t3code-landscape-and-sugent-critical-review.md`](../research/2026-11-23-t3code-landscape-and-sugent-critical-review.md)。
 
@@ -11,9 +11,9 @@
 | 自省维度 | 核心拷问 | 本版路线图的收敛与守线决策 |
 | :--- | :--- | :--- |
 | **1. 付费锚点（Why Pay & Moat）** | 哪些属开源引流基座，哪些构成商业溢价？对比 T3 Code 与大厂办公套件优势在哪？ | **开源引流基座**：本地唯一幕僚内核、BYOK 自适应路由、五维生命账本、ACP 多 CLI 协同、隐藏 Git 快照与安全信封 100% 开源透明。**商业付费增值**：`Sugent Auth Broker` 驱动的外出手机 E2EE 离线摘要舱与秒级「批奏折」中继、跨设备加密记忆/SIM 漫游，以及 `Cowork Hub + Sugent Edge` 垂直行业武器包（工业 FDE 诊断、合同报价防漏）。相比 T3 Code 仅服务程序员盯终端，Sugent 交付跨模型不失忆的业务防错资产与非代码桌面/现实事务闭环。 |
-| **2. 合规与分发（Distribution & ToS Risk）** | 能否顺利通过 macOS 公证、Windows 签名与企业审计？有无平台封号隐患？ | 严守只读签名外壳（[`hot-bundle-slots.ts`](../src/sugent/hot-bundle-slots.ts) 外置 Ed25519 签名热更槽不改 `app.asar` 一字节）；CUA 屏幕录制与辅助功能改为**首次触发按需懒授权**以消除安装恐慌；微信通道严守官方 `Tencent/openclaw-weixin` iLink 边界（主打转发/截图秒回小抄，不采用非官方私人聊天窗读取手段）；绝不默认预置跳过权限确认选项，灰盒适配器严格隔离在商业发行默认路径之外。 |
+| **2. 合规与分发（Distribution & ToS Risk）** | 能否顺利通过 macOS 公证、Windows 签名与企业审计？有无平台封号隐患？ | 严守只读签名外壳（[`hot-bundle-slots.ts`](../src/sugent/hot-bundle-slots.ts) 外置 Ed25519 签名热更槽不改 `app.asar` 一字节）；CUA 屏幕录制与辅助功能改为**首次触发按需懒授权**以消除安装恐慌；主力个人微信严守官方 `Tencent/openclaw-weixin` iLink 边界（零封号风险）；对外独立助理微信号统一通过**外置 HTTP 边车协议（`127.0.0.1` Loopback Sidecar，默认静默关闭）**隔离承载，绝不在 Sugent 核心开源仓或商业发行安装包中内置非官方协议二进制与内存注入代码。 |
 | **3. 离线退路（Sovereignty Fallback）** | 剥离云端账号进入 `mode: "none"` 后，核心闭环是否依然完整自洽？ | 在 `mode: "none"` 免登录离线主权模式下，本地 BYOK / Ollama 对话、CLIProxyAPI 模型池缓存、五维账本、安全信封、Worktree 隐藏快照、客观门禁验证与 L0–L3 热重载 100% 单机闭环运行，零遥测、零云端强依赖。 |
-| **4. 一人公司运维杠杆（OPC Ops Leverage）** | 是否符合“无状态边缘服务 + 端侧重逻辑”，防止单人维护半径过载？ | **先做减法再推进**：冻结横向新概念扩张，优先合龙既有 61 个模块与 [`src/app.ts`](../src/app.ts) 主循环，隐藏上游遗留多 Bot / Modelflare 冗余包袱，通过标准 ACP 协议复用外部成熟编码 CLI，云端仅保留极薄无状态 Auth Broker 与 E2EE 密文队列。 |
+| **4. 一人公司运维杠杆（OPC Ops Leverage）** | 是否符合“无状态边缘服务 + 端侧重逻辑”，防止单人维护半径过载？ | **先做减法再推进**：冻结横向新概念扩张，优先合龙既有核心模块与 [`src/app.ts`](../src/app.ts) 主循环，隐藏上游遗留多 Bot / Modelflare 冗余包袱，通过标准 ACP 协议与轻量边车 HTTP 协议复用外部成熟组件，云端仅保留常驻主脑与受限容器边车。 |
 
 ---
 
@@ -32,9 +32,9 @@ Sugent 按「外环私人幕僚（[`docs/PHILOSOPHY.md`](./PHILOSOPHY.md)）× �
 
 ---
 
-## 二、下一阶段三大核心战役（收敛堵点 · 削平门槛 · 商业打样）
+## 二、四大核心演进战役（收敛堵点 · 削平门槛 · 商业打样 · 前店后厂）
 
-针对实盘代码批判审计（[`2026-11-23 批判报告`](../research/2026-11-23-t3code-landscape-and-sugent-critical-review.md)）识别出的**「双运行时撕裂、宿主主循环未接线、首日空心账本冷启动、笔记本合盖失联悖论、微信 iLink 边界与维护面过宽」**六大堵点，后续研发严禁横向新增概念模块，严格按 **Wave P0 → Wave P1 → Wave P2** 顺序收敛推进：
+针对实盘代码批判审计（[`2026-11-23 批判报告`](../research/2026-11-23-t3code-landscape-and-sugent-critical-review.md)）识别出的工程堵点与云端常驻主脑演进诉求，严格按 **Wave P0 → Wave P1 → Wave P2 → Wave P3** 顺序收敛推进：
 
 ### Wave P0（第 1–2 周）：内核止血、双脑归一与主循环合龙（零新概念）
 
@@ -90,6 +90,27 @@ Sugent 按「外环私人幕僚（[`docs/PHILOSOPHY.md`](./PHILOSOPHY.md)）× �
     1. **工业现场 FDE 异常诊断与精益数智交付包（`industrial-fde-diagnostics`）**：端侧安全信封密封 MES/ERP 导表批次 + 确定性停机帕累托、SLA 超期与重复热点工位校验 + `CoworkPendingDraftPayload` 待审本体三元组与手机 Staging 审批卡。
     2. **一人公司 / 外贸工作室合同与报价防漏审校包（`opc-contract-quote-guard`）**：对照本地私密历史报价子图与证伪墓碑核验底价、账期及否定式保护条款消歧，生成红线差异卡推送主理人拍板。
   - 配套 `WeaponSoakTelemetryLedger` 持久化追踪连续 14 天常驻实盘压测指标（活跃天数、节省看护工时、模型路由省钱比例、拦截红线数与零越权一票否决门禁）。
+
+---
+
+### Wave P3（第 9–10 周 · 当前活跃阶段）：云端唯一主脑 × 双微信号「前店后厂」社交幕僚网络
+
+**战役目标**：完成从“单机客户端”向**「云端常驻唯一大脑 + 多端零折损触手 + 双微信号前店后厂社交代理」**的架构跃迁——主理人私人微信经官方 `iLink` 零风险担任后台指挥室与耳麦，独立手机号绑定的助理微信号经外置 Rust 原生 `agent-wechat`（`wx serve`）边车担任前台接待与项目群纪要员，实现对外沟通、群聊纪要、公域访客与跨节点研发派单的全闭环协同。详细实施方案见 [`docs/plans/2026-11-26-p3-dual-wechat-concierge-and-envoy-network.md`](./plans/2026-11-26-p3-dual-wechat-concierge-and-envoy-network.md)。
+
+- [x] **P3.1 云端唯一主脑、跨天全渠道记忆召回与多节点边缘触手舰队合龙**
+  - 落地 [`edge-tentacle-hub.ts`](../src/sugent/edge-tentacle-hub.ts)、[`chat-transcript-recall.ts`](../src/sugent/chat-transcript-recall.ts) 与 `sugent.metamirror.club` HTTPS 反代常驻中枢，打通跨天对话记忆召回（`recall_chat_history`）、边缘 Antigravity 派单（`dispatch_edge_antigravity`），并与 `agy-fleet-config` `/ops` 看板 2.0 纳管白名单、双语法路线图及六态分栏实现 1:1 对齐。
+- [x] **P3.2 主号私域「合并转发聊天秒参谋」入账与公域访客（Public Envoy）直推拍板**
+  - 扩展微信 `iLink` 入站解析器支持展开合并转发聊天记录与多层引用消息，将 [`weixin-quota-and-briefing.ts`](../src/sugent/weixin-quota-and-briefing.ts) 正式挂载为 `StewardLlmAgent` 原生工具 `analyze_forwarded_chat`，实现转发即密封、核验底价/账期/禁忌红线、生成双版本回复话术并可选落账双向承诺与人脉备注。
+  - 在 [`ops-bridge-client.ts`](../src/sugent/ops-bridge-client.ts) 与宿主脉冲中打通 `andylyu.com` 公域数字分身 `publicConciergeQueue` 拉取与 `conciergeDecisions` 回传，公域高意向访客实时直推主号微信拍板回复。
+- [x] **P3.3 外置 `agent-wechat` 独立助理微信号边车桥接器与「双号耳麦协同」**
+  - 新增外置 Loopback HTTP 边车适配器（[`src/sugent/wechat-envoy-sidecar.ts`](../src/sugent/wechat-envoy-sidecar.ts)，默认静默关闭，核心仓零非官方协议二进制），对接 GCE 独立受限容器（`mem_limit: 384m`，`127.0.0.1:6174`）运行的原生 Rust 版 `agent-wechat`（`wx serve`）。
+  - 严格执行公私域物理隔离：助理微信号收到的外部私聊与白名单群 `@提及` 消息强制经 [`security-envelope.ts`](../src/sugent/security-envelope.ts) 密封为 `0o400` 只读上下文，零权限访问 `owner_private` 私密账本，自动防自发回环（`selfWxid` 过滤）与单会话限频；经 [`concierge-channel-bridge.ts`](../src/sugent/concierge-channel-bridge.ts) 向主理人主号微信推送耳麦请示卡（含稳健 A / 积极 B 拟稿），主理人拍板后经 15 秒反悔冷静期与金额二次确认由助理微信号原路代回。
+- [x] **P3.4 白名单项目群静默纪要员（`GroupChatScribe`）与五维人脉账本沉淀**
+  - 新增 [`src/sugent/group-chat-scribe.ts`](../src/sugent/group-chat-scribe.ts)：助理微信号在授权白名单项目群中默认遵守“非 `@` 绝对禁言、静默旁听记录”铁律，滚动脱敏缓存群聊上下文，自动提炼**「对方承诺（`waiting_for`）/ 我方待办（`i_owe`）/ 干系人沟通偏好与忌讳」**生成待确认纪要卡推送主理人主号，经一键确认后正式写入五维生命账本。
+- [ ] **P3.5 [我] 主号先行上线与新助理号实名养号**：推送升级云端 `sugent-gce-hub` 容器，备用机新手机号注册助理微信号并走移动流量日常养号。
+- [ ] **P3.6 [我·2026-12-02] GCE 原生无头边车扫码合龙**：养号满 5–7 天后在 GCE 启动 `compose.wechat-envoy.yml` 扫码绑号并配置首批项目群白名单。
+
+**Wave P3 验收门禁（Exit / Profit Gate）**：主号微信转发记录 3 秒出红线参谋与双拟稿；公域访客与助理微信号入站 100% 经 `0o400` 安全信封物理隔离且零 `owner_private` 泄露；群聊非 `@` 消息 100% 零误发外溢；`npm run typecheck`、全量 Vitest 单测与 `npm run verify:sugent`（第 1–29 节 + `docs:check`）全绿。
 
 ---
 

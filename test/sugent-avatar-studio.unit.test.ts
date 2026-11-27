@@ -7,7 +7,7 @@ import { App } from "../src/app.js";
 import { normalizeSettings } from "../src/agent/settings.js";
 import { loadConfig } from "../src/config.js";
 import { decodePngToRgba, encodeRgbaToPng, rigAvatarImageBuffer } from "../src/sugent/avatar-rig.js";
-import { POSE_KEYS, rigPoseSheetImageBuffer } from "../src/sugent/avatar-pose-rig.js";
+import { inferPoseSheetLayout, POSE_KEYS, POSE_KEYS_3X3, rigPoseSheetImageBuffer } from "../src/sugent/avatar-pose-rig.js";
 import { ALL_BUILTIN_AVATARS, SugentAvatarStudio } from "../src/sugent/avatar-studio.js";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -69,18 +69,24 @@ describe("Sugent Avatar Rig & Gemini Studio", () => {
     expect(centerLuma).toBeLessThan(80);
   });
 
-  it("rigs v2 3x2 pose sheets, suppresses divider lines, and handles single full-body layout", () => {
+  it("rigs v2 3x3 multi-yaw and legacy 3x2 pose sheets, suppresses divider lines, and detects eye spots", () => {
     const corePoses = decodePngToRgba(fs.readFileSync(CORE_V2_POSES_PATH));
     const corePort = decodePngToRgba(fs.readFileSync(CORE_V2_PORTRAIT_PATH));
     const clayPoses = decodePngToRgba(fs.readFileSync(CLAY_V2_POSES_PATH));
     const clayPort = decodePngToRgba(fs.readFileSync(CLAY_V2_PORTRAIT_PATH));
     expect(corePoses.width).toBe(1152);
-    expect(corePoses.height).toBe(768);
+    expect(corePoses.height).toBe(1152);
     expect(corePort.width).toBe(256);
     expect(corePort.height).toBe(256);
     expect(clayPoses.width).toBe(1152);
+    expect(clayPoses.height).toBe(1152);
     expect(clayPort.height).toBe(256);
     expect(clayPoses.rgba[3]).toBe(0);
+
+    const coreRigCheck = rigPoseSheetImageBuffer(fs.readFileSync(CORE_V2_POSES_PATH), { layout: "grid_3x3" });
+    expect(coreRigCheck.poseMeta.grid).toEqual([3, 3]);
+    expect(coreRigCheck.poseMeta.cells.idle.eyeSpots).toBeDefined();
+    expect(inferPoseSheetLayout(fs.readFileSync(MANNEQUIN_V2_PATH))).toBe("grid_3x3");
 
     const manBuf = fs.readFileSync(MANNEQUIN_V2_PATH);
     const man = decodePngToRgba(manBuf);
@@ -91,17 +97,27 @@ describe("Sugent Avatar Rig & Gemini Studio", () => {
         withGrid[idx] = 48; withGrid[idx + 1] = 52; withGrid[idx + 2] = 60; withGrid[idx + 3] = 255;
       }
     }
-    const midY = Math.round(man.height / 2);
-    for (let x = 0; x < man.width; x++) {
-      const idx = (midY * man.width + x) * 4;
-      withGrid[idx] = 48; withGrid[idx + 1] = 52; withGrid[idx + 2] = 60; withGrid[idx + 3] = 255;
+    for (const gy of [Math.round(man.height / 3), Math.round((man.height * 2) / 3)]) {
+      for (let x = 0; x < man.width; x++) {
+        const idx = (gy * man.width + x) * 4;
+        withGrid[idx] = 48; withGrid[idx + 1] = 52; withGrid[idx + 2] = 60; withGrid[idx + 3] = 255;
+      }
     }
-    const gridRig = rigPoseSheetImageBuffer(encodeRgbaToPng(man.width, man.height, withGrid), { layout: "grid_3x2" });
-    expect(gridRig.warnings).toEqual([]);
-    const outSheet = decodePngToRgba(gridRig.poseSheetPng);
-    expect(outSheet.width).toBe(1152);
-    expect(outSheet.height).toBe(768);
-    for (const k of POSE_KEYS) expect(gridRig.poseMeta.cells[k].baselineY).toBe(0.88);
+    const gridRig3x3 = rigPoseSheetImageBuffer(encodeRgbaToPng(man.width, man.height, withGrid), { layout: "grid_3x3" });
+    expect(gridRig3x3.warnings).toEqual([]);
+    const outSheet3x3 = decodePngToRgba(gridRig3x3.poseSheetPng);
+    expect(outSheet3x3.width).toBe(1152);
+    expect(outSheet3x3.height).toBe(1152);
+    for (const k of POSE_KEYS_3X3) expect(gridRig3x3.poseMeta.cells[k]?.baselineY).toBe(0.88);
+    expect(Math.abs(gridRig3x3.poseMeta.cells.idle_left!.bbox[3] - gridRig3x3.poseMeta.cells.idle_right!.bbox[3])).toBeLessThan(0.03);
+
+    // Backward compatibility: 3x2 rectangular sheet & single full-body layout
+    const legacy3x2Rgba = clayPoses.rgba.subarray(0, 1152 * 768 * 4);
+    const legacy3x2Buf = encodeRgbaToPng(1152, 768, legacy3x2Rgba);
+    expect(inferPoseSheetLayout(legacy3x2Buf)).toBe("grid_3x2");
+    const gridRig3x2 = rigPoseSheetImageBuffer(legacy3x2Buf, { layout: "grid_3x2" });
+    expect(gridRig3x2.poseMeta.grid).toEqual([3, 2]);
+    for (const k of POSE_KEYS) expect(gridRig3x2.poseMeta.cells[k].baselineY).toBe(0.88);
 
     const singleRig = rigPoseSheetImageBuffer(fs.readFileSync(BLANK_PNG_PATH), { layout: "single" });
     expect(singleRig.poseMeta.layoutMode).toBe("single");

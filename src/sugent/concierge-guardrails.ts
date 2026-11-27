@@ -31,6 +31,7 @@ export interface OutboundGuardrailInput {
   ownerDisplayName: string;
   body: string;
   crossPeerCanaryTokens: readonly string[];
+  allowApprovedGroupReply?: boolean;
 }
 
 export interface OutboundGuardrailVerdict {
@@ -131,7 +132,9 @@ function _baseInspectInboundRedLines(
 }
 
 export function enforceOutboundGuardrails(input: OutboundGuardrailInput): OutboundGuardrailVerdict {
-  if (input.chatType === "group") {
+  const approvedGroupMentionReply =
+    input.allowApprovedGroupReply === true && input.mode === "owner_approved_proxy";
+  if (input.chatType === "group" && !approvedGroupMentionReply) {
     return {
       allowed: false,
       violatedGuardrail: "G2_GROUP_SILENCE_LOCK",

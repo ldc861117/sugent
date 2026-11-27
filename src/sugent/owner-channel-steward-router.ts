@@ -45,6 +45,26 @@ export interface OwnerStewardPort {
       }
   >;
   approveOpsInbox?(approvalId?: string): Promise<{ ok: boolean; handled: boolean; reply?: string }>;
+  completeCommitmentByRef?(refText: string): Promise<{ ok: boolean; handled: boolean; reply?: string }>;
+  decideGroupScribeDigest?(input: {
+    digestId: string;
+    decision: "approve" | "dismiss";
+  }): { ok: boolean; message: string };
+  replyPublicConcierge?(input: {
+    sessionId: string;
+    action: "approve_reply" | "unlock" | "merge" | "decline" | "block";
+    ownerReply?: string;
+  }): Promise<{ ok: boolean; message: string }>;
+  ingestForwardedWeixinChat?(input: {
+    rawForwardedText: string;
+  }): {
+    briefing: {
+      threeLineSummary: [string, string, string];
+      copyableDrafts: { firmBoundary: string; collaborativeTradeoff: string };
+    };
+    recordedCommitments: Array<{ summary: string }>;
+  };
+  handleAirTokenShortcut?(text: string): Promise<{ handled: boolean; reply?: string }>;
 }
 
 export interface OwnerStewardRouteResult {
@@ -56,6 +76,11 @@ export interface OwnerStewardRouteResult {
 
 const RETRY_STRONGER_RE = /^(?:\/retry-stronger|换更强模型重试|重试更强模型|用更强模型重答|换个强模型重来)$/i;
 const OPS_OK_CMD_RE = /^(?:\/ok(?:\s+([a-zA-Z0-9._-]+))?|同意(?:\s+([a-zA-Z0-9._-]+))?)[\s。.！!~～]*$/i;
+const DONE_CMD_RE = /^\/done\s+(.+?)\s*$/i;
+const DONE_NL_RE = /^(?:已完成|办完了|搞定了|已办完)\s*[:：]?\s*(.+?)\s*[。！!~～]*$/;
+const DONE_ROADMAP_NL_RE = /^([A-Za-z]{1,3}\d+(?:\.\d+)+)\s*(?:已?办完|已完成|搞定了|弄好了|养号完成)[了啦。！!~～\s]*$/;
+const GROUP_DIGEST_CMD_RE = /^\/gdig\s+(ok|approve|no|dismiss)\s+([a-zA-Z0-9._-]+)\s*$/i;
+const PUBLIC_CONCIERGE_CMD_RE = /^\/pub\s+([a-zA-Z0-9._-]+)\s+([\s\S]+)$/i;
 const MAX_HISTORY_MESSAGES = 20; // 10 user+assistant turns
 
 function normalizeDropzoneChannel(raw: string): DropzoneChannel {
@@ -128,12 +153,59 @@ export class OwnerChannelStewardRouter {
 
     await priorTail;
     try {
+      if (this.opts.steward.handleAirTokenShortcut) {
+        const atRes = await this.opts.steward.handleAirTokenShortcut(text);
+        if (atRes.handled && atRes.reply) {
+          return { handled: true, reply: atRes.reply };
+        }
+      }
+
+      const gdigMatch = GROUP_DIGEST_CMD_RE.exec(text);
+      if (gdigMatch && this.opts.steward.decideGroupScribeDigest) {
+        const act = gdigMatch[1]!.toLowerCase();
+        const digestId = gdigMatch[2]!.trim();
+        try {
+          const decided = this.opts.steward.decideGroupScribeDigest({
+            digestId,
+            decision: act === "ok" || act === "approve" ? "approve" : "dismiss",
+          });
+          return { handled: true, reply: decided.message };
+        } catch (err) {
+          return { handled: true, reply: `群纪要处理失败：${(err as Error).message}` };
+        }
+      }
+
+      const pubMatch = PUBLIC_CONCIERGE_CMD_RE.exec(text);
+      if (pubMatch && this.opts.steward.replyPublicConcierge) {
+        const firstTok = pubMatch[1]!.trim();
+        const restText = pubMatch[2]!.trim();
+        const isDecline = /^(?:decline|ignore|block)$/i.test(firstTok);
+        const sessionId = isDecline ? restText.split(/\s+/)[0] || "" : firstTok;
+        const decided = await this.opts.steward.replyPublicConcierge(
+          isDecline
+            ? { sessionId, action: firstTok.toLowerCase() === "block" ? "block" : "decline" }
+            : { sessionId, action: "approve_reply", ownerReply: restText },
+        );
+        return { handled: true, reply: decided.message };
+      }
+
       const okMatch = OPS_OK_CMD_RE.exec(text);
       if (okMatch && this.opts.steward.approveOpsInbox) {
         const targetId = (okMatch[1] || okMatch[2] || "").trim().replace(/\.+$/, "") || undefined;
         const approved = await this.opts.steward.approveOpsInbox(targetId);
         if (approved.handled && approved.reply) {
           return { handled: true, reply: approved.reply };
+        }
+      }
+
+      const doneMatch = DONE_CMD_RE.exec(text) || DONE_NL_RE.exec(text) || DONE_ROADMAP_NL_RE.exec(text);
+      if (doneMatch && this.opts.steward.completeCommitmentByRef) {
+        const refText = String(doneMatch[1] || "").trim();
+        if (refText) {
+          const closed = await this.opts.steward.completeCommitmentByRef(refText);
+          if (closed.handled && closed.reply) {
+            return { handled: true, reply: closed.reply };
+          }
         }
       }
 
@@ -153,6 +225,17 @@ export class OwnerChannelStewardRouter {
         };
       }
 
+      let preIngestedForward:
+        | ReturnType<NonNullable<OwnerStewardPort["ingestForwardedWeixinChat"]>>
+        | undefined;
+      if (text.includes("[合并转发的聊天记录]") && this.opts.steward.ingestForwardedWeixinChat) {
+        try {
+          preIngestedForward = this.opts.steward.ingestForwardedWeixinChat({ rawForwardedText: text });
+        } catch {
+          // non-blocking pre-ingestion
+        }
+      }
+
       const prior = [...this.ensurePeerHistory(ev.channel, ev.peerId, maxMessages)];
       const channel = normalizeDropzoneChannel(ev.channel);
       const out = await this.opts.steward.converse({
@@ -163,6 +246,17 @@ export class OwnerChannelStewardRouter {
       });
 
       if (!out.ok || !String(out.reply ?? "").trim()) {
+        if (preIngestedForward) {
+          const b = preIngestedForward.briefing;
+          const fallbackReply = [
+            "【转发记录 3 秒参谋简报】",
+            ...b.threeLineSummary,
+            `已归档待办：${preIngestedForward.recordedCommitments.length} 项`,
+            `话术A（守底线）：${b.copyableDrafts.firmBoundary}`,
+            `话术B（谈折中）：${b.copyableDrafts.collaborativeTradeoff}`,
+          ].join("\n");
+          return { handled: true, reply: fallbackReply };
+        }
         return { handled: false };
       }
 

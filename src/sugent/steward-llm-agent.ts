@@ -37,6 +37,7 @@ import type {
 } from "./routing-experience-store.js";
 import type { ChatHistoryRecallResult, RecallChatHistoryInput } from "./chat-transcript-recall.js";
 import type { EdgeNodeStatus, EdgeQueuedCommand } from "./edge-tentacle-hub.js";
+import type { AirTokenOpsToolInput } from "./airtoken-ops-bridge.js";
 
 export interface StewardLlmEndpoint {
   baseUrl: string;
@@ -75,7 +76,7 @@ export interface StewardLlmToolsPort<TWorkbench extends StewardWorkbenchLike = S
     dueAt?: string;
     status?: CommitmentItem["status"];
     callerDomain?: CallerAccessDomain;
-  }): { ok: true; commitment: CommitmentItem; workbench: TWorkbench };
+  }): { ok: true; commitment: CommitmentItem; workbench: TWorkbench; roadmapItemId?: string; nextAiHint?: string };
   mutateGoal(input: {
     action: "upsert" | "status";
     id?: string;
@@ -162,6 +163,33 @@ export interface StewardLlmToolsPort<TWorkbench extends StewardWorkbenchLike = S
     conversationId?: string;
     workspaceHint?: string;
   }): Promise<{ ok: boolean; command?: EdgeQueuedCommand; nodes?: EdgeNodeStatus[]; errorCode?: string; message?: string }> | { ok: boolean; command?: EdgeQueuedCommand; nodes?: EdgeNodeStatus[]; errorCode?: string; message?: string };
+  analyzeForwardedChat?(input: {
+    rawForwardedText: string;
+    ownerName?: string;
+    autoRecordToLedger?: boolean;
+  }): unknown;
+  manageWeChatEnvoy?(input: {
+    action:
+      | "status"
+      | "poll_now"
+      | "distill_group"
+      | "approve_digest"
+      | "dismiss_digest"
+      | "update_allowlist"
+      | "reply_public_visitor";
+    groupId?: string;
+    groupName?: string;
+    projectKey?: string;
+    digestId?: string;
+    addGroupId?: string;
+    removeGroupId?: string;
+    addDmPeerId?: string;
+    removeDmPeerId?: string;
+    sessionId?: string;
+    publicAction?: "approve_reply" | "unlock" | "merge" | "decline" | "block";
+    ownerReply?: string;
+  }): Promise<Record<string, unknown>>;
+  manageAirTokenOps?(input: AirTokenOpsToolInput): Promise<Record<string, unknown>>;
 }
 
 export interface LocalTaskDelegationInput {
@@ -196,6 +224,9 @@ export const STEWARD_CAPABILITY_DESCRIPTORS: readonly CapabilityDescriptor[] = [
   { toolName: "delegate_local_execution", title: "本机终端/文件/桌面操控异步下沉执行", summary: "将耗时终端命令、本地文件整理或原生桌面软件操控委托给后台 DSH 执行引擎异步推进", whenToUse: ["执行本机命令/整理本地文件夹/操控桌面软件/导出本地报表"] },
   { toolName: "recall_chat_history", title: "全渠道跨天对话记忆召回", summary: "检索微信、网页端与飞书跨天原始聊天记录（支持昨天/前天/上周或按项目关键词检索）", whenToUse: ["昨天我们聊了什么/回忆之前对话/查找某天聊过的决定"] },
   { toolName: "dispatch_edge_antigravity", title: "边缘触手 Antigravity 远程派单", summary: "作为顶层管家将具体编码开发与验证任务下发给本机 local-mac 或云端 gce-remote 的 Antigravity 触手执行", whenToUse: ["让本机或云端 Antigravity 改代码/给某项目派开发任务/唤醒远端会话"] },
+  { toolName: "analyze_forwarded_chat", title: "微信合并转发记录 3 秒参谋与落账", summary: "对转发的聊天记录执行安全信封隔离、历史底价/红线核验、生成双版本回复话术并幂等写入五维待办与档案", whenToUse: ["主人转发聊天记录/粘贴客户对话请参谋怎么回/提取对方承诺记账"] },
+  { toolName: "manage_wechat_envoy", title: "双微信号助理边车、项目群纪要与官网访客管理", summary: "管理独立手机号助理微信边车、提炼或审批白名单项目群纪要入账、以及代回官网数字分身访客咨询", whenToUse: ["助理微信号状态/提炼或批准群聊纪要/更新群白名单/回复官网来客"] },
+  { toolName: "manage_airtoken_ops", title: "AirToken 双链金库与实盘运维管控", summary: "免密查询 AirToken 运行状态与 Solana 战绩、续期 IPC 会话、切换执行模式、退租回收、锁库及获取安全解锁链接", whenToUse: ["查AirToken状态或战绩/续期会话/切回纸盘或Canary/退租/锁库/获取解锁链接"] },
 ];
 const LLM_TOOLS = [
   {
@@ -458,6 +489,69 @@ const LLM_TOOLS = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "analyze_forwarded_chat",
+      description: "解析主人合并转发或粘贴的外部沟通聊天记录（如 [合并转发的聊天记录]），3 秒内对比五维账本历史底价、账期红线与客户忌讳，输出守底线/折中双版本可复制话术，并自动将双方承诺事项与沟通档案幂等写入五维账本。",
+      parameters: {
+        type: "object",
+        properties: {
+          rawForwardedText: { type: "string", description: "完整的合并转发文本或对话摘录" },
+          ownerName: { type: "string", description: "可选，主人在对话中的显示昵称以便区分我方承诺" },
+          autoRecordToLedger: { type: "boolean", description: "是否自动幂等记入五维待办与档案，默认 true" },
+        },
+        required: ["rawForwardedText"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "manage_wechat_envoy",
+      description: "管理独立手机号助理微信号无头边车、白名单项目群静默纪要提炼与审批入账、以及官网数字分身公域访客代回。",
+      parameters: {
+        type: "object",
+        properties: {
+          action: {
+            type: "string",
+            enum: ["status", "poll_now", "distill_group", "approve_digest", "dismiss_digest", "update_allowlist", "reply_public_visitor"],
+          },
+          groupId: { type: "string", description: "项目群 ID（如 xxx@chatroom）" },
+          groupName: { type: "string", description: "可选项目群名称" },
+          projectKey: { type: "string", description: "可选关联项目标识" },
+          digestId: { type: "string", description: "群纪要卡片 ID（如 gdig-...）" },
+          addGroupId: { type: "string", description: "新增白名单群 ID" },
+          removeGroupId: { type: "string", description: "移除白名单群 ID" },
+          addDmPeerId: { type: "string", description: "新增白名单私聊 wxid" },
+          removeDmPeerId: { type: "string", description: "移除白名单私聊 wxid" },
+          sessionId: { type: "string", description: "官网公域访客会话 ID" },
+          publicAction: { type: "string", enum: ["approve_reply", "unlock", "merge", "decline", "block"] },
+          ownerReply: { type: "string", description: "给官网访客的正式回复正文" },
+        },
+        required: ["action"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "manage_airtoken_ops",
+      description: "免密管控 AirToken 实盘与金库会话：查状态(status)、查Solana战绩(epoch)、续期会话(extend)、切换模式(mode)、紧急锁库(lock)、空ATA退租(reclaim)、维护审批(maintenance)、智能解锁引导(unlock)。严禁向工具传入主密码或私钥。",
+      parameters: {
+        type: "object",
+        properties: {
+          action: { type: "string", enum: ["status", "epoch", "extend", "mode", "lock", "reclaim", "maintenance", "unlock"] },
+          preset: { type: "string", enum: ["30m", "4h", "8h", "12h"], description: "action=extend 时使用的续期时长，默认 8h" },
+          targetMode: { type: "string", enum: ["paper", "dry_run", "canary"], description: "action=mode 时的目标执行模式" },
+          burnDust: { type: "boolean", description: "action=reclaim 时是否顺带销毁已平仓粉尘" },
+          dryRun: { type: "boolean", description: "action=reclaim 时是否仅预览不发交易" },
+          maintenanceAction: { type: "string", enum: ["status", "approve_window", "approve_now", "defer_24h", "cancel"] },
+        },
+        required: ["action"],
+      },
+    },
+  },
 ];
 const shortProj = (k: string): string => k.replace(/^repo:[^/]+\//, "").replace(/^local:[^:]+:/, "");
 const tierLabel = (t: 0 | 1 | 2): string => (t === 0 ? "私密（仅本机）" : t === 1 ? "脱敏摘要" : "深度协同");
@@ -553,6 +647,12 @@ function buildSystemPrompt(wb: StewardWorkbenchLike): string {
             .map((i) => `${i.id}「${i.title}」(${i.targetNodeId || "默认节点"})`)
             .join(" | ")}`,
         ]
+      : []),
+    ...(wb.groupDigests?.length
+      ? [`待拍板项目群纪要(${wb.groupDigests.length}张)：${wb.groupDigests.slice(0, 3).map((d) => `${d.digestId}「${d.groupName}」`).join(" | ")}`]
+      : []),
+    ...(wb.opsFleet?.publicConciergeQueue?.length
+      ? [`官网数字分身待批来客(${wb.opsFleet.publicConciergeQueue.length}位)：${wb.opsFleet.publicConciergeQueue.slice(0, 3).map((v) => `${v.sessionId}「${v.actorLabel || v.actorName || "访客"}」(${v.intentSummary || v.summary || "待审咨询"})`).join(" | ")}`]
       : []),
     `价值红线与墓碑：${guards.length ? guards.join("；") : "暂无"}`,
     `重要联系人：${contacts.length ? contacts.join("；") : "暂无"}`,
@@ -653,11 +753,18 @@ export class StewardLlmAgent<TWorkbench extends StewardWorkbenchLike = StewardWo
       return res.ok ? { ok: true, goal: res.goal } : { ok: false, errorCode: res.errorCode, activeGoals: (res.activeGoals ?? active).map((g, i) => ({ index: i + 1, title: g.title, criterion: g.northStarCriterion })) };
     }
     if (name === "complete_todo") {
-      const open = p.getWorkbench("owner_private").ledger.commitments.filter((c) => c.status === "open" || c.status === "waiting_review");
-      const target = matchItem(open, String(args.todoQuery ?? ""), (c) => `${c.summary} ${c.counterpartyOrRef}`);
+      const open = p
+        .getWorkbench("owner_private")
+        .ledger.commitments.filter((c) => c.status === "open" || c.status === "snoozed" || c.status === "waiting_review");
+      const target = matchItem(open, String(args.todoQuery ?? ""), (c) => `${c.id} ${c.summary} ${c.counterpartyOrRef}`);
       if (!target) return { ok: false, errorCode: "TODO_NOT_FOUND", openTodos: open.map((c, i) => ({ index: i + 1, summary: c.summary })) };
       const res = p.mutateCommitment({ action: "status", id: target.id, status: "closed", callerDomain: domain });
-      return { ok: true, closedSummary: res.commitment.summary };
+      return {
+        ok: true,
+        closedSummary: res.commitment.summary,
+        ...(res.roadmapItemId ? { roadmapItemId: res.roadmapItemId } : {}),
+        ...(res.nextAiHint ? { nextAiHint: res.nextAiHint } : {}),
+      };
     }
     if (name === "prepare_offline_errand") {
       const res = await p.submitDropzone({ text: String(args.taskDescription ?? ""), channel, callerDomain: domain, partition: part });
@@ -724,6 +831,9 @@ export class StewardLlmAgent<TWorkbench extends StewardWorkbenchLike = StewardWo
     if (name === "manage_ops_fleet") return this.executeOpsFleetTool(args, wb);
     if (name === "recall_chat_history") return this.executeRecallChatHistoryTool(args, domain);
     if (name === "dispatch_edge_antigravity") return this.executeDispatchEdgeAntigravityTool(args, domain);
+    if (name === "analyze_forwarded_chat") return this.executeAnalyzeForwardedChatTool(args, domain);
+    if (name === "manage_wechat_envoy") return this.executeManageWeChatEnvoyTool(args, domain);
+    if (name === "manage_airtoken_ops") return this.executeManageAirTokenOpsTool(args, domain);
     return this.executePrefsTool(args, wb, domain);
   }
 
@@ -1038,6 +1148,62 @@ export class StewardLlmAgent<TWorkbench extends StewardWorkbenchLike = StewardWo
       ...(typeof args.workspaceHint === "string" && args.workspaceHint.trim() ? { workspaceHint: args.workspaceHint.trim() } : {}),
     });
     return { ...out };
+  }
+
+  private executeAnalyzeForwardedChatTool(args: Record<string, unknown>, domain: CallerAccessDomain): Record<string, unknown> {
+    if (domain !== "owner_private") {
+      return { ok: false, errorCode: "OWNER_ONLY_TOOL", reason: "五维红线简报与转发归档仅对主理人私域开放" };
+    }
+    const fn = this.opts.toolsPort.analyzeForwardedChat;
+    if (!fn) return { ok: false, errorCode: "FORWARDED_BRIEFING_UNAVAILABLE" };
+    const rawForwardedText = String(args.rawForwardedText ?? "").trim();
+    if (!rawForwardedText) return { ok: false, errorCode: "EMPTY_FORWARDED_TEXT" };
+    const res = fn({
+      rawForwardedText,
+      ...(typeof args.ownerName === "string" && args.ownerName.trim() ? { ownerName: args.ownerName.trim() } : {}),
+      ...(typeof args.autoRecordToLedger === "boolean" ? { autoRecordToLedger: args.autoRecordToLedger } : {}),
+    });
+    return { ok: true, ...(res as Record<string, unknown>) };
+  }
+
+  private async executeManageWeChatEnvoyTool(args: Record<string, unknown>, domain: CallerAccessDomain): Promise<Record<string, unknown>> {
+    if (domain !== "owner_private") {
+      return { ok: false, errorCode: "OWNER_ONLY_TOOL", reason: "助理微信号与项目群纪要管理仅对主理人私域开放" };
+    }
+    const fn = this.opts.toolsPort.manageWeChatEnvoy;
+    if (!fn) return { ok: false, errorCode: "WECHAT_ENVOY_UNAVAILABLE" };
+    const action = String(args.action ?? "status") as Parameters<NonNullable<StewardLlmToolsPort["manageWeChatEnvoy"]>>[0]["action"];
+    return fn({
+      action,
+      ...(typeof args.groupId === "string" ? { groupId: args.groupId } : {}),
+      ...(typeof args.groupName === "string" ? { groupName: args.groupName } : {}),
+      ...(typeof args.projectKey === "string" ? { projectKey: args.projectKey } : {}),
+      ...(typeof args.digestId === "string" ? { digestId: args.digestId } : {}),
+      ...(typeof args.addGroupId === "string" ? { addGroupId: args.addGroupId } : {}),
+      ...(typeof args.removeGroupId === "string" ? { removeGroupId: args.removeGroupId } : {}),
+      ...(typeof args.addDmPeerId === "string" ? { addDmPeerId: args.addDmPeerId } : {}),
+      ...(typeof args.removeDmPeerId === "string" ? { removeDmPeerId: args.removeDmPeerId } : {}),
+      ...(typeof args.sessionId === "string" ? { sessionId: args.sessionId } : {}),
+      ...(typeof args.publicAction === "string" ? { publicAction: args.publicAction as "approve_reply" | "unlock" | "merge" | "decline" | "block" } : {}),
+      ...(typeof args.ownerReply === "string" ? { ownerReply: args.ownerReply } : {}),
+    });
+  }
+
+  private async executeManageAirTokenOpsTool(args: Record<string, unknown>, domain: CallerAccessDomain): Promise<Record<string, unknown>> {
+    if (domain !== "owner_private") {
+      return { ok: false, errorCode: "OWNER_ONLY_TOOL", reason: "AirToken 实盘与金库运维工具仅对主理人私域开放" };
+    }
+    const fn = this.opts.toolsPort.manageAirTokenOps;
+    if (!fn) return { ok: false, errorCode: "AIRTOKEN_OPS_UNAVAILABLE" };
+    const action = String(args.action ?? "status") as AirTokenOpsToolInput["action"];
+    return fn({
+      action,
+      ...(typeof args.preset === "string" ? { preset: args.preset as AirTokenOpsToolInput["preset"] } : {}),
+      ...(typeof args.targetMode === "string" ? { targetMode: args.targetMode as AirTokenOpsToolInput["targetMode"] } : {}),
+      ...(typeof args.burnDust === "boolean" ? { burnDust: args.burnDust } : {}),
+      ...(typeof args.dryRun === "boolean" ? { dryRun: args.dryRun } : {}),
+      ...(typeof args.maintenanceAction === "string" ? { maintenanceAction: args.maintenanceAction as AirTokenOpsToolInput["maintenanceAction"] } : {}),
+    });
   }
 
   private async invokeChat(ep: ResolvedRouteEndpoint, messages: Array<Record<string, unknown>>) {

@@ -50,6 +50,7 @@ export interface RegisteredEarpieceCard {
   riskLevel?: "normal" | "group_locked" | "red_line" | undefined;
   matchedRedLines?: readonly string[] | undefined;
   createdAtMs?: number | undefined;
+  allowApprovedGroupReply?: boolean | undefined;
   crossPeerCanaryTokens: readonly string[];
   draftA: { body: string; confirmHash: string };
   draftB: { body: string; confirmHash: string };
@@ -268,6 +269,7 @@ export class ConciergeDispatcher {
     cardId: string;
     channel: ConciergeChannelKind;
     chatType?: "direct" | "group" | undefined;
+    allowApprovedGroupReply?: boolean | undefined;
     peerId: string;
     peerDisplayName: string;
     mode: OutboundIdentityMode;
@@ -283,6 +285,7 @@ export class ConciergeDispatcher {
       ownerDisplayName: this.ownerDisplayName,
       body: params.body,
       crossPeerCanaryTokens: params.crossPeerCanaryTokens,
+      ...(params.allowApprovedGroupReply ? { allowApprovedGroupReply: true } : {}),
     });
 
     if (!verdict.allowed) {
@@ -425,6 +428,7 @@ export class ConciergeDispatcher {
         cardId: card.cardId,
         channel: card.channel,
         chatType: card.chatType,
+        allowApprovedGroupReply: card.allowApprovedGroupReply,
         peerId: card.peerId,
         peerDisplayName: card.peerDisplayName,
         mode: "owner_approved_proxy",
@@ -440,6 +444,7 @@ export class ConciergeDispatcher {
         cardId: card.cardId,
         channel: card.channel,
         chatType: card.chatType,
+        allowApprovedGroupReply: card.allowApprovedGroupReply,
         peerId: card.peerId,
         peerDisplayName: card.peerDisplayName,
         mode: "owner_approved_proxy",
@@ -461,6 +466,7 @@ export class ConciergeDispatcher {
       cardId: card.cardId,
       channel: card.channel,
       chatType: card.chatType,
+      allowApprovedGroupReply: card.allowApprovedGroupReply,
       peerId: card.peerId,
       peerDisplayName: card.peerDisplayName,
       mode: "owner_approved_proxy",

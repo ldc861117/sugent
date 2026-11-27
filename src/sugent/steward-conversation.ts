@@ -50,6 +50,7 @@ export type StewardConversationIntent =
   | "vibe_decide"
   | "file_read"
   | "capability_status"
+  | "airtoken_ops"
   | "dropzone"
   | "llm_agent";
 
@@ -120,6 +121,13 @@ export interface StewardWorkbenchLike {
   vibeCoding?: { bindings: RepoBindingRecord[]; pipelines: VibePipelineRecord[] };
   capabilities?: CapabilityAwarenessSnapshot;
   opsFleet?: OpsStewardPendingSnapshot;
+  groupDigests?: Array<{
+    digestId: string;
+    groupId: string;
+    groupName: string;
+    status: string;
+    threeLineSummary: [string, string, string];
+  }>;
 }
 export interface StewardConversationHostPort<TWorkbench extends StewardWorkbenchLike = StewardWorkbenchLike> {
   getWorkbench(callerDomain?: CallerAccessDomain): TWorkbench;
@@ -174,6 +182,7 @@ export interface StewardConversationHostPort<TWorkbench extends StewardWorkbench
   decideVibeTask?(input: { pipelineId?: string; rawReplyText?: string; action?: "approve" | "revise" | "cancel" | "verify_now" | "relaunch_now"; feedback?: string; callerDomain?: CallerAccessDomain }): Promise<{ ok: boolean; message: string; pipeline?: VibePipelineRecord; workbench: TWorkbench }>;
   searchAuthorizedFiles?(input: { query?: string; projectQuery?: string; conversationId?: string; callerDomain?: CallerAccessDomain; limit?: number }): AuthorizedFileMatch[];
   readAuthorizedFile?(input: { filePath?: string; fileQuery?: string; projectQuery?: string; conversationId?: string; offsetChars?: number; maxChars?: number; callerDomain?: CallerAccessDomain }): ReadAuthorizedFileResult;
+  handleAirTokenShortcut?(text: string, callerDomain?: CallerAccessDomain): Promise<{ handled: boolean; reply?: string }>;
 }
 
 const stripQuotes = (s: string): string => s.trim().replace(/^[「『"“'【\[]+|[」』"”'】\]]+$/g, "").trim();
@@ -643,6 +652,13 @@ export class StewardConversationEngine<TWorkbench extends StewardWorkbenchLike =
     if (pendingRes) return pendingRes;
 
     const wb = this.host.getWorkbench(domain);
+    if (domain === "owner_private" && this.host.handleAirTokenShortcut) {
+      const atRes = await this.host.handleAirTokenShortcut(text, domain);
+      if (atRes.handled && atRes.reply) {
+        return { ok: true, intent: "airtoken_ops", reply: atRes.reply, workbench: wb };
+      }
+    }
+
     const cgRes = await this.handleConcierge(text, wb, domain);
     if (cgRes) return cgRes;
 

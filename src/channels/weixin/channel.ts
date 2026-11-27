@@ -40,20 +40,159 @@ function mediaPart(it: MessageItem, got: InboundMedia | Error | undefined, quote
   return part;
 }
 
+const FORWARDED_RECORD_HEADER = "[合并转发的聊天记录]";
+const MAX_FORWARDED_RECORD_CHARS = 8000;
+
+function stripForwardedControlChars(input: string): string {
+  return input
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
+}
+
+function unescapeXmlEntitiesOnce(input: string): string {
+  const withoutCdata = input.replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1");
+  return withoutCdata.replace(/&(lt|gt|amp|quot|apos|#39|#x27);/gi, (full, ent: string) => {
+    switch (ent.toLowerCase()) {
+      case "lt":
+        return "<";
+      case "gt":
+        return ">";
+      case "amp":
+        return "&";
+      case "quot":
+        return '"';
+      case "apos":
+      case "#39":
+      case "#x27":
+        return "'";
+      default:
+        return full;
+    }
+  });
+}
+
+function extractXmlTagText(xmlBlock: string, tagName: string): string | undefined {
+  const m = new RegExp(`<${tagName}\\b[^>]*>([\\s\\S]*?)<\\/${tagName}>`, "i").exec(xmlBlock);
+  if (!m?.[1]) return undefined;
+  const cleaned = stripForwardedControlChars(unescapeXmlEntitiesOnce(m[1])).trim();
+  return cleaned || undefined;
+}
+
+function parseDataItemsFromRecordXml(rawXml: string): string[] {
+  const cleanedRaw = stripForwardedControlChars(rawXml).trim();
+  if (!cleanedRaw) return [];
+  const recMatch = /<recorditem\b[^>]*>([\s\S]*?)<\/recorditem>/i.exec(cleanedRaw);
+  let candidateXml = recMatch?.[1] !== undefined ? recMatch[1] : cleanedRaw;
+  if (!/<dataitem\b/i.test(candidateXml) && /&lt;dataitem\b/i.test(candidateXml)) {
+    candidateXml = unescapeXmlEntitiesOnce(candidateXml);
+  }
+  const lines: string[] = [];
+  const itemRe = /<dataitem\b[^>]*>([\s\S]*?)<\/dataitem>/gi;
+  let match: RegExpExecArray | null = itemRe.exec(candidateXml);
+  while (match !== null) {
+    const block = match[1] ?? "";
+    const sender = extractXmlTagText(block, "sourcename");
+    const desc =
+      extractXmlTagText(block, "datadesc") ??
+      extractXmlTagText(block, "content") ??
+      extractXmlTagText(block, "datatitle");
+    if (desc) lines.push(sender ? `${sender}: ${desc}` : desc);
+    match = itemRe.exec(candidateXml);
+  }
+  return lines;
+}
+
+function normalizeForwardedDescLines(rawDesc: string): string[] {
+  const cleaned = stripForwardedControlChars(unescapeXmlEntitiesOnce(rawDesc)).trim();
+  if (!cleaned) return [];
+  return cleaned
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !/^\[(?:合并转发的聊天记录|聊天记录|群聊的聊天记录)\]$/.test(line));
+}
+
+function formatForwardedLines(lines: readonly string[]): string | undefined {
+  const cleaned = lines.map((l) => stripForwardedControlChars(l).trim()).filter(Boolean);
+  if (!cleaned.length) return undefined;
+  const full = `${FORWARDED_RECORD_HEADER}\n${cleaned.join("\n")}`;
+  return full.length <= MAX_FORWARDED_RECORD_CHARS ? full : `${full.slice(0, MAX_FORWARDED_RECORD_CHARS - 1)}…`;
+}
+
+export function extractForwardedRecordText(it: MessageItem | undefined, depth = 0): string | undefined {
+  if (!it || depth > 3) return undefined;
+
+  if (it.record_item) {
+    const structured: string[] = [];
+    for (const entry of it.record_item.items ?? []) {
+      const sender = entry.sender_name ? stripForwardedControlChars(entry.sender_name).trim() : "";
+      const body = stripForwardedControlChars(unescapeXmlEntitiesOnce(entry.content ?? entry.data_desc ?? "")).trim();
+      if (body) structured.push(sender ? `${sender}: ${body}` : body);
+    }
+    if (structured.length) return formatForwardedLines(structured);
+    if (it.record_item.record_xml) {
+      const xmlLines = parseDataItemsFromRecordXml(it.record_item.record_xml);
+      if (xmlLines.length) return formatForwardedLines(xmlLines);
+    }
+    if (it.record_item.desc) {
+      const descLines = normalizeForwardedDescLines(it.record_item.desc);
+      if (descLines.length) return formatForwardedLines(descLines);
+    }
+  }
+
+  if (it.appmsg_item) {
+    if (it.appmsg_item.record_item) {
+      const recLines = parseDataItemsFromRecordXml(it.appmsg_item.record_item);
+      if (recLines.length) return formatForwardedLines(recLines);
+    }
+    if (it.appmsg_item.xml) {
+      const xmlLines = parseDataItemsFromRecordXml(it.appmsg_item.xml);
+      if (xmlLines.length) return formatForwardedLines(xmlLines);
+    }
+    const appTitle = stripForwardedControlChars(it.appmsg_item.title ?? "");
+    if (appTitle.includes("聊天记录") && it.appmsg_item.desc) {
+      const descLines = normalizeForwardedDescLines(it.appmsg_item.desc);
+      if (descLines.length) return formatForwardedLines(descLines);
+    }
+  }
+
+  if (it.ref_msg) {
+    if (it.ref_msg.message_item) {
+      const nested = extractForwardedRecordText(it.ref_msg.message_item, depth + 1);
+      if (nested) return nested;
+    }
+    const refTitle = stripForwardedControlChars(it.ref_msg.title ?? "");
+    if (refTitle.includes("聊天记录")) {
+      const rawRefBody =
+        it.ref_msg.content ??
+        it.ref_msg.message_item?.text_item?.text ??
+        it.ref_msg.message_item?.record_item?.desc ??
+        it.ref_msg.message_item?.appmsg_item?.desc ??
+        "";
+      const refLines = normalizeForwardedDescLines(rawRefBody);
+      if (refLines.length) return formatForwardedLines(refLines);
+    }
+  }
+
+  return undefined;
+}
+
 export function weixinParts(items: MessageItem[] | undefined, media?: WeixinMediaResults): Part[] {
   const parts: Part[] = [];
   for (const it of items ?? []) {
+    const forwarded = extractForwardedRecordText(it);
     switch (it.type) {
       case MessageItemType.TEXT: {
         const t = it.text_item?.text ?? "";
         const quoted = it.ref_msg?.message_item;
         // 引用了一张图片/一个文件：把它本身交给运行时，而不是只给标题
         if (quoted && hasDownloadableMedia(quoted)) parts.push(mediaPart(quoted, media?.get(quoted), true));
+        else if (forwarded) parts.push({ type: "text", text: forwarded });
         else {
           const ref = quoted?.text_item?.text || it.ref_msg?.title;
           if (ref) parts.push({ type: "quote", text: ref });
         }
-        if (t) parts.push({ type: "text", text: t });
+        if (t && t.trim() !== forwarded?.trim()) parts.push({ type: "text", text: t });
         break;
       }
       case MessageItemType.VOICE:
@@ -63,6 +202,9 @@ export function weixinParts(items: MessageItem[] | undefined, media?: WeixinMedi
       case MessageItemType.FILE:
       case MessageItemType.VIDEO:
         parts.push(mediaPart(it, media?.get(it), false));
+        break;
+      default:
+        if (forwarded) parts.push({ type: "text", text: forwarded });
         break;
     }
   }

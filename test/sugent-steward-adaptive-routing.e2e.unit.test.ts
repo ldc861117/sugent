@@ -265,7 +265,19 @@ describe("Vibe Gate Feedback & Offline Startup Sync Tolerance", () => {
     try {
       const reg = new ProviderRegistry(tmp);
       reg.upsertProvider({ id: "cp", preset: "custom-openai", baseUrl: "http://127.0.0.1:9/v1", apiKey: "k", enabled: true, setDefault: true, models: ["claude-sonnet-4-6"] });
-      const svc = new SugentStewardHostService({ dataDir: tmp, homeDir: tmp, knowledgeGraph: new SugentKnowledgeGraph(path.join(tmp, "kg")), localBudgets: new LocalBudgetLedger(tmp), providerRegistry: reg, vibeCommandRunner: async () => ({ exitCode: 0, outputTail: "ok" }) });
+      const svc = new SugentStewardHostService({
+        dataDir: tmp,
+        homeDir: tmp,
+        knowledgeGraph: new SugentKnowledgeGraph(path.join(tmp, "kg")),
+        localBudgets: new LocalBudgetLedger(tmp),
+        providerRegistry: reg,
+        vibeCommandRunner: async () => ({ exitCode: 0, outputTail: "ok" }),
+        agentApiRunner: {
+          async getConversationMetadata() { return { exists: true, nestingDepth: 0 }; },
+          async sendMessage() { return { ok: true, exitCode: 0 }; },
+          async newConversation() { return { conversationId: "00000000-0000-4000-8000-000000000001", exitCode: 0 }; },
+        },
+      });
       svc.adaptiveRouter.planRoute({ role: "executor", text: "修复 TypeScript 编译错误" });
       const repoDir = path.join(tmp, "repo");
       fs.mkdirSync(repoDir, { recursive: true });

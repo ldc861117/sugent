@@ -370,7 +370,7 @@ function detectCellEyeSpots(
   sheetRgba: Uint8Array, sheetW: number, ox: number, oy: number, cellSize: number,
   outMinX: number, outMinY: number, outMaxX: number, headEndPx: number,
 ): PoseEyeSpots | undefined {
-  const y0 = Math.max(4, outMinY + 6), y1 = Math.min(cellSize - 5, headEndPx - 4);
+  const y0 = Math.max(4, outMinY + 6), y1 = Math.min(cellSize - 5, headEndPx - Math.max(8, Math.round(cellSize * 0.042)));
   const x0 = Math.max(4, outMinX + 6), x1 = Math.min(cellSize - 5, outMaxX - 6);
   if (y1 - y0 < 16 || x1 - x0 < 16) return undefined;
   const rs: number[] = [], gs: number[] = [], bs: number[] = [];
@@ -384,40 +384,50 @@ function detectCellEyeSpots(
   if (bgLuma > 135) return undefined;
   const cw = x1 - x0 + 1, ch = y1 - y0 + 1;
   const seen = new Uint8Array(cw * ch), q = new Int32Array(cw * ch);
-  const spots: Array<{ cx: number; cy: number; area: number; r: number; g: number; b: number }> = [];
-  const maxArea = Math.max(14, Math.round(cellSize * cellSize * 0.0028));
+  const spots: Array<{ cx: number; cy: number; area: number; bw: number; bh: number; r: number; g: number; b: number }> = [];
+  const maxArea = Math.max(16, Math.round(cellSize * cellSize * 0.0035));
   const isEyePx = (dx: number, dy: number) => {
     const p = ((oy + dy) * sheetW + ox + dx) * 4;
-    if (sheetRgba[p + 3]! < 225) return false;
-    for (const [nx, ny] of [[dx - 4, dy], [dx + 4, dy], [dx, dy - 4], [dx, dy + 4]] as const) {
+    if (sheetRgba[p + 3]! < 220) return false;
+    for (const [nx, ny] of [[dx - 3, dy], [dx + 3, dy], [dx, dy - 3], [dx, dy + 3]] as const) {
       if (nx < 0 || nx >= cellSize || ny < 0 || ny >= cellSize) return false;
-      if (sheetRgba[((oy + ny) * sheetW + ox + nx) * 4 + 3]! < 210) return false;
+      if (sheetRgba[((oy + ny) * sheetW + ox + nx) * 4 + 3]! < 200) return false;
     }
     const l = 0.299 * sheetRgba[p]! + 0.587 * sheetRgba[p + 1]! + 0.114 * sheetRgba[p + 2]!;
-    return l - bgLuma > 52;
+    return l - bgLuma > 92;
   };
   for (let ly = 0; ly < ch; ly++) for (let lx = 0; lx < cw; lx++) {
     const li = ly * cw + lx;
     if (seen[li] || !isEyePx(x0 + lx, y0 + ly)) continue;
-    let hd = 0, tl = 0, sx = 0, sy = 0, sr = 0, sg = 0, sb = 0;
+    let hd = 0, tl = 0, sx = 0, sy = 0, sr = 0, sg = 0, sb = 0, bx0 = x1, bx1 = x0, by0 = y1, by1 = y0;
     q[tl++] = li; seen[li] = 1;
     while (hd < tl) {
       const c = q[hd++]!, cx = x0 + (c % cw), cy = y0 + ((c / cw) | 0);
       const p = ((oy + cy) * sheetW + ox + cx) * 4;
       sx += cx; sy += cy; sr += sheetRgba[p]!; sg += sheetRgba[p + 1]!; sb += sheetRgba[p + 2]!;
+      if (cx < bx0) bx0 = cx; if (cx > bx1) bx1 = cx; if (cy < by0) by0 = cy; if (cy > by1) by1 = cy;
       for (const [nx, ny] of [[cx - 1, cy], [cx + 1, cy], [cx, cy - 1], [cx, cy + 1]] as const) {
         if (nx < x0 || nx > x1 || ny < y0 || ny > y1) continue;
         const ni = (ny - y0) * cw + (nx - x0);
         if (!seen[ni] && isEyePx(nx, ny)) { seen[ni] = 1; q[tl++] = ni; }
       }
     }
-    if (tl >= 2 && tl <= maxArea) spots.push({ cx: sx / tl, cy: sy / tl, area: tl, r: sr / tl, g: sg / tl, b: sb / tl });
+    const bw = bx1 - bx0 + 1, bh = by1 - by0 + 1;
+    if (tl >= 3 && tl <= maxArea && bw <= bh * 2.2 && bh <= bw * 2.2) {
+      spots.push({ cx: sx / tl, cy: sy / tl, area: tl, bw, bh, r: sr / tl, g: sg / tl, b: sb / tl });
+    }
   }
-  if (spots.length !== 2) return undefined;
+  if (spots.length < 2) return undefined;
   spots.sort((a, b) => a.cx - b.cx);
-  const [sL, sR] = [spots[0]!, spots[1]!];
-  const sep = sR.cx - sL.cx;
-  if (Math.abs(sL.cy - sR.cy) > cellSize * 0.048 || sep < cellSize * 0.05 || sep > cellSize * 0.36) return undefined;
+  let pair: [typeof spots[number], typeof spots[number]] | undefined;
+  for (let i = 0; i < spots.length; i++) for (let j = i + 1; j < spots.length; j++) {
+    const a = spots[i]!, b = spots[j]!, sep = b.cx - a.cx;
+    if (Math.abs(a.cy - b.cy) <= cellSize * 0.045 && sep >= cellSize * 0.05 && sep <= cellSize * 0.36 && Math.max(a.area, b.area) <= Math.min(a.area, b.area) * 2.6) {
+      pair = [a, b]; break;
+    }
+  }
+  if (!pair) return undefined;
+  const [sL, sR] = pair;
   const radPx = Math.max(2.2, Math.sqrt((sL.area + sR.area) / (2 * Math.PI)));
   return {
     left: [Number((sL.cx / cellSize).toFixed(4)), Number((sL.cy / cellSize).toFixed(4))],

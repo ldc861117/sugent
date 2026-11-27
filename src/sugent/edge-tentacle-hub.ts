@@ -63,13 +63,29 @@ export interface ParsedRepoRoadmap {
     code?: string;
     title: string;
     status: string;
-    progress: { done: number; total: number; pct: number };
+    progress: {
+      done: number;
+      total: number;
+      pct: number;
+      codeDone?: number;
+      codeTotal?: number;
+      realDone?: number;
+      realTotal?: number;
+    };
     inProgressCount?: number;
     todoCount?: number;
     blockedCount?: number;
     hasExitGate?: boolean;
   };
-  totals: { done: number; total: number; pct: number };
+  totals: {
+    done: number;
+    total: number;
+    pct: number;
+    codeDone?: number;
+    codeTotal?: number;
+    realDone?: number;
+    realTotal?: number;
+  };
 }
 
 export interface ScanLocalProjectsForEdgeOptions {
@@ -338,6 +354,10 @@ interface EvaluatedRoadmapStage {
   inProgress: number;
   todo: number;
   blocked: number;
+  codeDone: number;
+  codeTotal: number;
+  realDone: number;
+  realTotal: number;
   status: string;
 }
 
@@ -426,12 +446,20 @@ function evaluateSectionLines(lines: readonly string[]): {
   inProgress: number;
   todo: number;
   blocked: number;
+  codeDone: number;
+  codeTotal: number;
+  realDone: number;
+  realTotal: number;
   hasExitGate: boolean;
 } {
   let done = 0;
   let inProgress = 0;
   let todo = 0;
   let blocked = 0;
+  let codeDone = 0;
+  let codeTotal = 0;
+  let realDone = 0;
+  let realTotal = 0;
   let hasExitGate = false;
 
   const listItemRe = /^(\s*)(?:[-*+]|\d+[.)])\s+(.*)$/;
@@ -491,13 +519,23 @@ function evaluateSectionLines(lines: readonly string[]): {
     if (!hasDelivHeader && (indent > topIndent + 1 || META_BULLET_RE.test(body))) continue;
 
     const st = classifyRoadmapBulletItem(body);
+    if (st) {
+      const isReal = /\[(?:我|等外部|观察窗)(?:[·:\s]+[^\]\n]+)?\]/.test(body);
+      if (isReal) {
+        realTotal += 1;
+        if (st === "done") realDone += 1;
+      } else {
+        codeTotal += 1;
+        if (st === "done") codeDone += 1;
+      }
+    }
     if (st === "done") done += 1;
     else if (st === "in_progress") inProgress += 1;
     else if (st === "blocked") blocked += 1;
     else if (st === "todo") todo += 1;
   }
 
-  return { done, inProgress, todo, blocked, hasExitGate };
+  return { done, inProgress, todo, blocked, codeDone, codeTotal, realDone, realTotal, hasExitGate };
 }
 
 export function parseRepoRoadmapMarkdown(markdown: string): ParsedRepoRoadmap {
@@ -548,6 +586,8 @@ export function parseRepoRoadmapMarkdown(markdown: string): ParsedRepoRoadmap {
     let status = "planned";
     if (counts.blocked > 0) {
       status = "blocked";
+    } else if (counts.codeTotal > 0 && counts.codeDone === counts.codeTotal && counts.realTotal > 0 && counts.realDone < counts.realTotal) {
+      status = "monitoring";
     } else if (explicitActive) {
       status = secTotal > 0 && counts.done === secTotal && counts.hasExitGate ? "monitoring" : "in_progress";
     } else if (secTotal > 0 && counts.done === secTotal) {
@@ -566,16 +606,25 @@ export function parseRepoRoadmapMarkdown(markdown: string): ParsedRepoRoadmap {
       inProgress: counts.inProgress,
       todo: counts.todo,
       blocked: counts.blocked,
+      codeDone: counts.codeDone,
+      codeTotal: counts.codeTotal,
+      realDone: counts.realDone,
+      realTotal: counts.realTotal,
       status,
     });
   }
 
   const totalDone = stages.reduce((acc, s) => acc + s.done, 0);
   const grandTotal = stages.reduce((acc, s) => acc + s.done + s.inProgress + s.todo + s.blocked, 0);
+  const totalCodeDone = stages.reduce((acc, s) => acc + s.codeDone, 0);
+  const totalCodeTotal = stages.reduce((acc, s) => acc + s.codeTotal, 0);
+  const totalRealDone = stages.reduce((acc, s) => acc + s.realDone, 0);
+  const totalRealTotal = stages.reduce((acc, s) => acc + s.realTotal, 0);
   const totals = {
     done: totalDone,
     total: grandTotal,
     pct: grandTotal > 0 ? Math.round((totalDone / grandTotal) * 100) : 0,
+    ...(totalRealTotal > 0 ? { codeDone: totalCodeDone, codeTotal: totalCodeTotal, realDone: totalRealDone, realTotal: totalRealTotal } : {}),
   };
 
   const nonEmptyStages = stages.filter((s) => s.done + s.inProgress + s.todo + s.blocked > 0);
@@ -606,6 +655,9 @@ export function parseRepoRoadmapMarkdown(markdown: string): ParsedRepoRoadmap {
         done: chosen.done,
         total: chosenTotal,
         pct: chosenTotal > 0 ? Math.round((chosen.done / chosenTotal) * 100) : 0,
+        ...(chosen.realTotal > 0
+          ? { codeDone: chosen.codeDone, codeTotal: chosen.codeTotal, realDone: chosen.realDone, realTotal: chosen.realTotal }
+          : {}),
       },
       ...(chosen.inProgress > 0 ? { inProgressCount: chosen.inProgress } : {}),
       ...(chosen.todo > 0 ? { todoCount: chosen.todo } : {}),

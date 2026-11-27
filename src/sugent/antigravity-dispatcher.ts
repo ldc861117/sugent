@@ -50,12 +50,28 @@ function runExecFile(
   });
 }
 
+export function isTestRuntimeEnv(env: NodeJS.ProcessEnv = process.env): boolean {
+  if (env.SUGENT_ALLOW_LIVE_AGENTAPI_IN_TEST === "1") return false;
+  return Boolean(
+    env.VITEST ||
+      env.VITEST_WORKER_ID ||
+      env.NODE_ENV === "test" ||
+      process.execArgv.some((arg) => arg === "--test" || arg.startsWith("--test-")),
+  );
+}
+
 export function createExecFileAgentApiRunner(
-  binPath = path.join(os.homedir(), ".gemini", "antigravity", "bin", "agentapi"),
+  binPath?: string,
 ): AgentApiRunner {
+  const defaultHostBin = path.join(os.homedir(), ".gemini", "antigravity", "bin", "agentapi");
+  const resolvedBin = binPath?.trim() ? binPath.trim() : defaultHostBin;
+  const isLiveHostDefault = path.resolve(resolvedBin) === path.resolve(defaultHostBin);
+  const blockLiveHostInTest = (): boolean => isLiveHostDefault && isTestRuntimeEnv();
+
   return {
     async getConversationMetadata(conversationId: string): Promise<AgentApiMetadataResult> {
-      const res = await runExecFile(binPath, ["get-conversation-metadata", conversationId]);
+      if (blockLiveHostInTest()) return { exists: false };
+      const res = await runExecFile(resolvedBin, ["get-conversation-metadata", conversationId]);
       if (res.exitCode !== 0 || !res.stdout.trim()) return { exists: false };
       try {
         const parsed = JSON.parse(res.stdout) as {
@@ -75,11 +91,13 @@ export function createExecFileAgentApiRunner(
       }
     },
     async sendMessage(params): Promise<{ ok: boolean; exitCode: number }> {
+      if (blockLiveHostInTest()) return { ok: false, exitCode: 64 };
       const args = ["send-message", ...(params.title ? [`--title=${params.title}`] : []), params.recipientId, params.content];
-      const res = await runExecFile(binPath, args);
+      const res = await runExecFile(resolvedBin, args);
       return { ok: res.exitCode === 0, exitCode: res.exitCode };
     },
     async newConversation(params): Promise<{ conversationId?: string; exitCode: number }> {
+      if (blockLiveHostInTest()) return { exitCode: 64 };
       const args = [
         "new-conversation",
         ...(params.model ? [`--model=${params.model}`] : []),
@@ -88,7 +106,7 @@ export function createExecFileAgentApiRunner(
         "--",
         params.prompt,
       ];
-      const res = await runExecFile(binPath, args, 20_000, params.cwd);
+      const res = await runExecFile(resolvedBin, args, 20_000, params.cwd);
       const idMatch = res.stdout.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
       return { ...(idMatch?.[0] ? { conversationId: idMatch[0] } : {}), exitCode: res.exitCode };
     },

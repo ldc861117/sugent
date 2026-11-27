@@ -557,15 +557,30 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
       }
       if (sub === "simulate" && m === "POST") {
         const b = await readJson(req);
-        const channel = b.channel === "feishu" ? "feishu" : "weixin";
         const kind = b.chatType === "group" ? "group" : "dm";
         const peerId = String(b.peerId || (kind === "group" ? "oc_sim_group" : "wx_sim_peer")).trim();
         const senderId = String(b.senderId || (kind === "group" ? "ou_sim_member" : peerId)).trim();
         const senderName = String(b.senderName || peerId).trim();
         const text = String(b.text || "").trim();
         if (!text) throw new HttpError(400, "empty simulation text");
+        const simId = `sim_${Date.now()}_${crypto.randomBytes(2).toString("hex")}`;
+        if (b.channel === "wechat_envoy") {
+          const outcome = await app.conciergeBridge.ingestWeChatEnvoyEvent({
+            message: {
+              messageId: simId,
+              chatId: peerId,
+              isGroup: kind === "group",
+              senderId,
+              senderName,
+              text,
+              timestampMs: Date.now(),
+            },
+          });
+          return send(res, 200, { ok: true, outcome, workbench: app.conciergeBridge.getWorkbench() });
+        }
+        const channel = b.channel === "feishu" ? "feishu" : "weixin";
         const ev: InboundEvent = {
-          id: `sim_${Date.now()}_${crypto.randomBytes(2).toString("hex")}`,
+          id: simId,
           channel,
           botId: "default",
           account: "default",
@@ -586,7 +601,7 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
         const b = await readJson(req);
         const outcome = await app.conciergeBridge.executeOwnerCommand(
           String(b.commandText ?? ""),
-          b.channel === "feishu" ? "feishu" : "weixin",
+          b.channel === "feishu" ? "feishu" : b.channel === "wechat_envoy" ? "wechat_envoy" : "weixin",
         );
         return send(res, 200, { ok: true, outcome, workbench: app.conciergeBridge.getWorkbench() });
       }
@@ -664,6 +679,69 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
           snapshot: app.stewardService.getMergedOpsFleetSnapshot() ?? app.stewardService.edgeHub.toOpsStewardSnapshot(),
           recentCommands: app.stewardService.edgeHub.listCommands({ limit: 20 }),
         });
+      }
+      if (sub === "wechat-envoy/status" && m === "GET") {
+        const live = url.searchParams.get("live") === "1" && app.stewardService.wechatEnvoyClient.isConfigured()
+          ? await app.stewardService.wechatEnvoyClient.getStatus()
+          : undefined;
+        return send(res, 200, { ok: true, ...app.stewardService.getWeChatEnvoyOverview(), ...(live ? { sidecarStatus: live } : {}) });
+      }
+      if (sub === "wechat-envoy/poll" && m === "POST") {
+        await readJson(req);
+        return send(res, 200, { ok: true, cycle: await app.stewardService.pollWeChatEnvoyOnce() });
+      }
+      if (sub === "wechat-envoy/allowlist" && m === "POST") {
+        const b = await readJson(req);
+        return send(res, 200, { ok: true, ...app.stewardService.updateWeChatEnvoyAllowlist(b ?? {}) });
+      }
+      if (sub === "group-scribe/digests" && m === "GET") {
+        const st = url.searchParams.get("status");
+        const statusFilter = st === "pending_approval" || st === "approved" || st === "dismissed" ? st : undefined;
+        return send(res, 200, {
+          ok: true,
+          outboundGroupMessagesSent: app.stewardService.groupScribe.outboundGroupMessagesSent,
+          digests: app.stewardService.groupScribe.listDigests(statusFilter ? { status: statusFilter } : {}),
+        });
+      }
+      if (sub === "group-scribe/distill" && m === "POST") {
+        const b = await readJson(req);
+        const groupId = typeof b?.groupId === "string" ? b.groupId.trim() : "";
+        if (!groupId) throw new HttpError(400, "groupId is required");
+        return send(res, 200, {
+          ok: true,
+          digest: await app.stewardService.distillGroupScribeDigest({
+            groupId,
+            ...(typeof b.groupName === "string" ? { groupName: b.groupName } : {}),
+            ...(typeof b.projectKey === "string" ? { projectKey: b.projectKey } : {}),
+            ...(Array.isArray(b.ownerAliases) ? { ownerAliases: b.ownerAliases.map(String) } : {}),
+          }),
+        });
+      }
+      if (sub === "group-scribe/decide" && m === "POST") {
+        const b = await readJson(req);
+        const digestId = typeof b?.digestId === "string" ? b.digestId.trim() : "";
+        if (!digestId) throw new HttpError(400, "digestId is required");
+        if (b?.decision !== "approve" && b?.decision !== "dismiss") {
+          throw new HttpError(400, "decision must be approve or dismiss");
+        }
+        return send(res, 200, app.stewardService.decideGroupScribeDigest({ digestId, decision: b.decision }));
+      }
+      if (sub === "public-concierge/decide" && m === "POST") {
+        const b = await readJson(req);
+        const sessionId = typeof b?.sessionId === "string" ? b.sessionId.trim() : "";
+        if (!sessionId) throw new HttpError(400, "sessionId is required");
+        const validActions = new Set(["approve_reply", "unlock", "merge", "decline", "block"]);
+        const action = typeof b?.action === "string" && validActions.has(b.action) ? b.action : "approve_reply";
+        return send(
+          res,
+          200,
+          await app.stewardService.replyPublicConcierge({
+            sessionId,
+            action,
+            ...(typeof b.ownerReply === "string" ? { ownerReply: b.ownerReply } : {}),
+            ...(typeof b.branchDraft === "string" ? { branchDraft: b.branchDraft } : {}),
+          }),
+        );
       }
       if (sub === "preferences" && m === "POST") {
         const b = await readJson(req);

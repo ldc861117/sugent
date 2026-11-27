@@ -151,8 +151,16 @@ import {
   scanLocalProjectsForEdge,
   ChatTranscriptRecallService,
   redactTranscriptSecrets,
+  ingestForwardedBriefingToLedger,
+  WeChatEnvoySidecarClient,
+  WeChatEnvoyPoller,
+  resolveWeChatEnvoyConfig,
+  assertSafeEnvoyTransportUrl,
+  GroupChatScribe,
+  sanitizeGroupMessageText,
 } from "../dist/src/sugent/index.js";
 import { normalizeSettings } from "../dist/src/agent/settings.js";
+import { extractForwardedRecordText, weixinParts } from "../dist/src/channels/weixin/channel.js";
 
 // 1. 默认网关模式与角色路由验证
 {
@@ -1401,6 +1409,267 @@ import { normalizeSettings } from "../dist/src/agent/settings.js";
   }
 }
 
+// 28. Wave P3 双微信号前店后厂、合并转发落账、助理无头边车、项目群静默纪要与官网访客桥接契约
+{
+  const s28Dir = fs.mkdtempSync(path.join(os.tmpdir(), "sugent-verify-p3-"));
+  try {
+    // 28.1 微信合并转发展开与 3 秒参谋幂等落账
+    const recItem = {
+      type: 1,
+      record_item: {
+        title: "聊天记录",
+        record_xml: "<recorditem><datalist><dataitem><sourcename>林总</sourcename><datadesc>周五前我把场地确认单发你，我明天前补齐报价表</datadesc></dataitem></datalist></recorditem>",
+      },
+    };
+    const expanded = extractForwardedRecordText(recItem);
+    assert.equal(Boolean(expanded?.startsWith("[合并转发的聊天记录]")), true);
+    const parts = weixinParts([recItem]);
+    assert.equal(parts.some((p) => p.type === "text" && p.text.includes("林总:")), true);
+
+    const mockOpsOrigin = ["https:", "", "ops.sugent.internal"].join("/");
+    const capturedDecisions = [];
+    const opsBridge = new OpsBridgeClient({
+      baseUrl: mockOpsOrigin,
+      nodeToken: "tok-p3",
+      nodeId: "gce-hub",
+      stewardHubNodeId: "gce-hub",
+      fetchImpl: async (input, init) => {
+        const u = String(input);
+        if (u.endsWith("/api/ops/node/auth")) {
+          return new Response(JSON.stringify({ token: "jwt-p3", expiresInSec: 3600 }), { status: 200 });
+        }
+        if ((u.includes("/api/ops/bridge/steward-sync") || u.includes("/api/ops/node/pulse")) && init?.body) {
+          const body = JSON.parse(String(init.body));
+          if (Array.isArray(body.conciergeDecisions)) capturedDecisions.push(...body.conciergeDecisions);
+        }
+        return new Response(JSON.stringify({ ok: true, projects: [], pendingInbox: [] }), { status: 200 });
+      },
+    });
+
+    const host = new SugentStewardHostService({
+      dataDir: s28Dir,
+      knowledgeGraph: new SugentKnowledgeGraph(path.join(s28Dir, "kg")),
+      localBudgets: new LocalBudgetLedger(path.join(s28Dir, "budgets")),
+      opsBridge,
+      nowIso: () => "2026-11-26T10:00:00.000Z",
+    });
+
+    const ing1 = host.ingestForwardedWeixinChat({
+      rawForwardedText: expanded,
+      autoRecordToLedger: true,
+    });
+    const ing2 = ingestForwardedBriefingToLedger({
+      workspaceDir: path.join(s28Dir, "sugent-stewardship", "weixin-briefings"),
+      ledger: host.ledger,
+      rawForwardedText: expanded,
+      nowIso: "2026-11-26T10:00:00.000Z",
+    });
+    assert.equal(ing1.deduplicated, false);
+    assert.equal(ing1.recordedCommitments.length >= 1, true);
+    assert.equal(ing2.deduplicated, true);
+
+    const pubDec = await host.replyPublicConcierge({
+      sessionId: "pub_gate_1",
+      action: "approve_reply",
+      ownerReply: "本周四下午 3 点可线上对齐。",
+    });
+    assert.equal(pubDec.ok && pubDec.synced, true);
+    assert.equal(capturedDecisions.length, 1);
+
+    // 28.2 外置 agent-wechat 边车安全边界、双号耳麦与白名单群 @提及 代回
+    const loopbackEnvoyUrl = ["http:", "", "127.0.0.1:6174"].join("/");
+    const unsafeRemoteHttp = ["http:", "", "203.0.113.99:6174"].join("/");
+    assert.equal(assertSafeEnvoyTransportUrl(loopbackEnvoyUrl), loopbackEnvoyUrl);
+    assert.throws(() => assertSafeEnvoyTransportUrl(unsafeRemoteHttp));
+    assert.equal(resolveWeChatEnvoyConfig({}).enabled, false);
+
+    const sentEnvoy = [];
+    const ownerCards = [];
+    const concierge = new ConciergeChannelBridge({
+      dataDir: path.join(s28Dir, "concierge"),
+      knowledgeGraph: new SugentKnowledgeGraph(path.join(s28Dir, "ckg")),
+      resolveActorRole: () => "external_peer",
+      defaultTransport: {
+        notifyOwner: async (_ch, text) => { ownerCards.push(text); },
+        sendPeerDirectMessage: async (_ch, peerId, text) => { sentEnvoy.push({ peerId, text }); },
+      },
+    });
+    concierge.updateConfig({ enabled: true, coolingWindowMs: 10 });
+
+    const envoyCfg = {
+      enabled: true,
+      baseUrl: loopbackEnvoyUrl,
+      apiToken: "envoy-tok-p3",
+      selfWxid: "wxid_bot_p3",
+      selfAliases: ["Sugent助理"],
+      dmPolicy: "allowlist",
+      allowedDmPeerIds: ["wxid_client_1"],
+      groupPolicy: "allowlist",
+      allowedGroupIds: ["grp_p3@chatroom"],
+      allowRemoteHttps: false,
+    };
+
+    const envoyClient = new WeChatEnvoySidecarClient(envoyCfg, {
+      fetchFn: async (input, init) => {
+        const u = String(input);
+        if (u.includes("/api/events")) {
+          return new Response(
+            JSON.stringify({
+              events: [
+                {
+                  id: "m_unmen",
+                  chatId: "grp_p3@chatroom",
+                  isGroup: true,
+                  senderId: "wxid_zhao",
+                  senderName: "赵总",
+                  text: "周五前我把排期表发群里，最忌讳直接催财务盖章",
+                  timestamp: 1764150001000,
+                  cwd: "./override",
+                },
+                {
+                  id: "m_men",
+                  chatId: "grp_p3@chatroom",
+                  isGroup: true,
+                  senderId: "wxid_zhao",
+                  senderName: "赵总",
+                  text: "@Sugent助理 麻烦确认下周二评审时间",
+                  timestamp: 1764150002000,
+                },
+              ],
+              nextCursor: "cur_p3_1",
+            }),
+            { status: 200 },
+          );
+        }
+        if (u.endsWith("/api/messages/send") && init?.body) {
+          const b = JSON.parse(String(init.body));
+          sentEnvoy.push({ peerId: b.chatId, text: b.text });
+          return new Response(JSON.stringify({ ok: true, messageId: "out_1" }), { status: 200 });
+        }
+        return new Response(JSON.stringify({ online: true, loggedIn: true, selfWxid: "wxid_bot_p3" }), { status: 200 });
+      },
+    });
+
+    const scribe = new GroupChatScribe({
+      dataDir: path.join(s28Dir, "scribe"),
+      whitelistedGroupIds: ["grp_p3@chatroom"],
+      nowIso: () => "2026-11-26T10:05:00.000Z",
+    });
+    const poller = new WeChatEnvoyPoller({
+      config: envoyCfg,
+      client: envoyClient,
+      dataDir: path.join(s28Dir, "envoy-poller"),
+      onGroupSilentMessage: (m) => {
+        scribe.recordGroupMessage({
+          groupId: m.chatId,
+          groupName: "P3项目群",
+          messageId: m.messageId,
+          senderId: m.senderId,
+          senderName: m.senderName,
+          content: m.text,
+          createdAtMs: m.timestampMs,
+        });
+      },
+      onActionableInbound: async (ev) => {
+        assert.equal((fs.statSync(ev.envelope.absoluteFilePath).mode & 0o777) === 0o400, true);
+        await concierge.ingestWeChatEnvoyEvent(ev);
+      },
+    });
+
+    const cycle = await poller.runCycleOnce();
+    assert.equal(cycle.routedGroupSilent, 1);
+    assert.equal(cycle.routedConcierge, 1);
+    assert.equal(scribe.outboundGroupMessagesSent, 0);
+    assert.equal(ownerCards.length, 1);
+
+    const mentionCard = concierge.getWorkbench().cards[0];
+    assert.equal(Boolean(mentionCard?.cardId), true);
+    assert.equal(mentionCard.channel, "wechat_envoy");
+    const cmdRes = await concierge.executeOwnerCommand(
+      `/send A ${mentionCard.cardId}${mentionCard.draftA.confirmHash ? ` ${mentionCard.draftA.confirmHash}` : ""}`,
+      "wechat_envoy",
+    );
+    assert.equal(cmdRes.status, "cooling_off_scheduled");
+    await new Promise((r) => setTimeout(r, 45));
+    assert.equal(sentEnvoy.some((s) => s.peerId === "grp_p3@chatroom"), true);
+
+    // 28.3 群聊静默纪要脱敏、待确认零污染与幂等拍板落账
+    assert.equal(sanitizeGroupMessageText(["sk", "secret1234567890"].join("-")).includes("secret1234567890"), false);
+    const gDigest = await scribe.distillGroupDigest({ groupId: "grp_p3@chatroom", groupName: "P3项目群" });
+    assert.equal(gDigest.status, "pending_approval");
+    assert.equal(scribe.outboundGroupMessagesSent, 0);
+    const ap1 = scribe.approveDigest(gDigest.digestId, host.ledger, "2026-11-26T10:06:00.000Z");
+    const ap2 = scribe.approveDigest(gDigest.digestId, host.ledger, "2026-11-26T10:06:05.000Z");
+    assert.equal(ap1.ok && ap1.writtenCommitments >= 1, true);
+    assert.equal(ap2.idempotent, true);
+  } finally {
+    fs.rmSync(s28Dir, { recursive: true, force: true });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 29. 人机混合项目规划、延时待办唤醒与 /done 双端销账闭环契约
+// ---------------------------------------------------------------------------
+{
+  const s29Dir = fs.mkdtempSync(path.join(os.tmpdir(), "verify-sugent-s29-"));
+  let nowIso = "2026-11-26T22:00:00+08:00";
+  try {
+    const kg = new SugentKnowledgeGraph(path.join(s29Dir, "kg"));
+    const budgets = new LocalBudgetLedger(s29Dir);
+    const host = new SugentStewardHostService({
+      dataDir: s29Dir,
+      knowledgeGraph: kg,
+      localBudgets: budgets,
+      homeDir: s29Dir,
+      nowIso: () => nowIso,
+    });
+    host.setRemoteOpsSnapshot({
+      projects: [],
+      pendingInbox: [],
+      humanCommitments: [
+        {
+          id: "todo:repo:ldc/sugent:p35",
+          projectKey: "repo:ldc/sugent",
+          projectName: "sugent",
+          title: "推送代码升级云端主脑",
+          stage: "needs_you",
+          actor: "human",
+          direction: "i_owe",
+          roadmapItemId: "P3.5",
+          updatedAt: "2026-11-26T22:00:00+08:00",
+        },
+        {
+          id: "todo:repo:ldc/sugent:p36",
+          projectKey: "repo:ldc/sugent",
+          projectName: "sugent",
+          title: "养号期满后 GCE 扫码绑号",
+          stage: "running",
+          actor: "human",
+          direction: "i_owe",
+          snoozeUntil: "2026-12-02",
+          dueAt: "2026-12-02",
+          roadmapItemId: "P3.6",
+          updatedAt: "2026-11-26T22:00:00+08:00",
+        },
+      ],
+    });
+    const before = host.ledger.snapshotForCaller("owner_private").commitments;
+    assert.equal(before.find((c) => c.id === "todo:repo:ldc/sugent:p36")?.status, "snoozed");
+
+    nowIso = "2026-12-02T08:30:00+08:00";
+    const pulse = host.runScheduledPulse({ nowMs: Date.parse(nowIso), forceMorningDrain: true });
+    assert.equal(Boolean(pulse.unsnoozedWakeups?.some((w) => w.id === "todo:repo:ldc/sugent:p36")), true);
+    assert.equal(Boolean(pulse.morningDrain?.emitNow.some((c) => c.targetRefId === "todo:repo:ldc/sugent:p36")), true);
+
+    const doneRes = await host.completeCommitmentByRef("P3.5");
+    assert.equal(doneRes.ok && doneRes.handled, true);
+    const updates = host.drainPendingOpsCommitmentUpdates();
+    assert.equal(updates.some((u) => u.id === "todo:repo:ldc/sugent:p35" && u.status === "closed"), true);
+  } finally {
+    fs.rmSync(s29Dir, { recursive: true, force: true });
+  }
+}
+
 console.log(
-  "verify:sugent — 全部核心契约断言通过 (M1.1–M1.6 / M2.1 / Cowork 联邦 / P0 Broker + P1 幕僚耳麦 + P2 BYOK 诊断与零知识加密同步 / Sprint 1–3 / M1–M4 Vibe Coding 闭环 / 能力自感知与全文读取 / 形象工坊与桌宠契约 / M-Auto 1–4 双环自治与 SIM 演进 / M1–M3 全量模型同步与经验驱动自适应路由 / L0–L3 分层热启动与热更新 / Wave P0 双脑归一与宿主主循环合龙 / GCE 常驻中枢与微信单持有者舰队桥接 / Wave P1 零填表冷启动、ACP 编码军团与隐藏快照防呆 / Wave P2 合盖离线韧性、微信 3 秒转发参谋与端-边联邦标杆武器包 / 云端唯一大脑、跨天全渠道对话记忆与多节点边缘触手中枢)",
+  "verify:sugent — 全部核心契约断言通过 (M1.1–M1.6 / M2.1 / Cowork 联邦 / P0 Broker + P1 幕僚耳麦 + P2 BYOK 诊断与零知识加密同步 / Sprint 1–3 / M1–M4 Vibe Coding 闭环 / 能力自感知与全文读取 / 形象工坊与桌宠契约 / M-Auto 1–4 双环自治与 SIM 演进 / M1–M3 全量模型同步与经验驱动自适应路由 / L0–L3 分层热启动与热更新 / Wave P0 双脑归一与宿主主循环合龙 / GCE 常驻中枢与微信单持有者舰队桥接 / Wave P1 零填表冷启动、ACP 编码军团与隐藏快照防呆 / Wave P2 合盖离线韧性、微信 3 秒转发参谋与端-边联邦标杆武器包 / 云端唯一大脑、跨天全渠道对话记忆与多节点边缘触手中枢 / Wave P3 双微信号前店后厂、助理无头边车与项目群静默纪要 / 人机混合项目规划与现实待办闭环)",
 );

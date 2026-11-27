@@ -68,4 +68,7 @@ export * from "./weixin-quota-and-briefing.js";
 export * from "./weapon-packages.js";
 export * from "./edge-tentacle-hub.js";
 export * from "./chat-transcript-recall.js";
+export * from "./wechat-envoy-sidecar.js";
+export * from "./group-chat-scribe.js";
+export * from "./airtoken-ops-bridge.js";
 

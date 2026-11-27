@@ -25,7 +25,7 @@ export function AvatarStudioScreen() {
   const [stageCue, setStageCue] = useState(null);
   const [facing, setFacing] = useState("left");
   const [swingDemo, setSwingDemo] = useState({ dragging: false, vx: 0 });
-  const [importLayout, setImportLayout] = useState("grid_3x2");
+  const [importLayout, setImportLayout] = useState("grid_3x3");
   const [name, setName] = useState("");
   const [prompt, setPrompt] = useState("");
   const [busy, setBusy] = useState(false);
@@ -187,7 +187,7 @@ export function AvatarStudioScreen() {
           <div class="sg-actions">
             <${Button} variant="primary" loading=${busy} disabled=${!prompt.trim() || !studio?.imageModelReady} onClick=${generate}>${busy ? t("steward.studio.generatingBtn") : t("steward.studio.generateBtn")}<//>
             <${Seg} label=${t("steward.studio.importBtn")} value=${importLayout} onChange=${setImportLayout}
-              options=${[["grid_3x2", t("steward.studio.layoutGrid")], ["single", t("steward.studio.layoutSingle")]]} />
+              options=${[["grid_3x3", t("steward.studio.layoutGrid3x3")], ["grid_3x2", t("steward.studio.layoutGrid")], ["single", t("steward.studio.layoutSingle")]]} />
             <input ref=${fileRef} class="sg-file-hidden" type="file" accept="image/*" onChange=${onFilePick} />
             <button type="button" class="btn" disabled=${busy} onClick=${() => fileRef.current?.click()}>${t("steward.studio.importBtn")}</button>
           </div>

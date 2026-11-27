@@ -134,10 +134,55 @@ export interface OpsStewardProjectItem {
   };
 }
 
+export interface OpsPublicConciergeItem {
+  sessionId: string;
+  id?: string;
+  actorLabel?: string;
+  actorName?: string;
+  species?: string;
+  axiomSlug?: string;
+  intentSummary?: string;
+  summary?: string;
+  contactEmail?: string;
+  matchedDomains?: string[];
+  createdAt?: string;
+}
+
+export interface OpsPublicConciergeDecision {
+  sessionId: string;
+  action: "approve_reply" | "unlock" | "merge" | "decline" | "block";
+  ownerReply?: string;
+  branchDraft?: string;
+}
+
+export interface OpsHumanCommitmentSyncItem {
+  id: string;
+  projectKey?: string;
+  projectName?: string;
+  title: string;
+  stage: string;
+  actor?: string;
+  direction?: "i_owe" | "waiting_for" | "expiring" | string;
+  snoozeUntil?: string;
+  dueAt?: string;
+  roadmapItemId?: string;
+  nextAiHint?: string;
+  updatedAt: string;
+}
+
+export interface OpsCommitmentStatusUpdate {
+  id: string;
+  status: "open" | "snoozed" | "closed";
+  updatedAt: string;
+}
+
 export interface OpsStewardPendingSnapshot {
   fetchedAtIso?: string;
   projects: OpsStewardProjectItem[];
   pendingInbox: OpsInboxItem[];
+  humanCommitments?: OpsHumanCommitmentSyncItem[];
+  publicConciergeQueue?: OpsPublicConciergeItem[];
+  publicTopicDigest?: string;
   weeklyFocus?: string[];
   stageGoals?: string[];
 }
@@ -148,6 +193,8 @@ export interface OpsStewardSyncInput {
   inboxItems?: OpsInboxItem[];
   approvedInboxIds?: string[];
   commands?: OpsRemoteCommand[];
+  conciergeDecisions?: OpsPublicConciergeDecision[];
+  commitmentUpdates?: OpsCommitmentStatusUpdate[];
 }
 
 const JWT_RENEW_LEAD_MS = 5 * 60_000;
@@ -510,10 +557,63 @@ export class OpsBridgeClient {
           : Array.isArray(raw.items)
             ? raw.items
             : [];
+    const publicConciergeQueue: OpsPublicConciergeItem[] | undefined = Array.isArray(raw.publicConciergeQueue)
+      ? raw.publicConciergeQueue
+          .map((entry): OpsPublicConciergeItem | null => {
+            if (!entry || typeof entry !== "object") return null;
+            const rec = entry as Record<string, unknown>;
+            const sessionId = String(rec.sessionId ?? rec.id ?? "").trim();
+            if (!sessionId) return null;
+            return {
+              sessionId,
+              ...(typeof rec.id === "string" ? { id: rec.id } : {}),
+              ...(typeof rec.actorLabel === "string" ? { actorLabel: rec.actorLabel } : {}),
+              ...(typeof rec.actorName === "string" ? { actorName: rec.actorName } : {}),
+              ...(typeof rec.species === "string" ? { species: rec.species } : {}),
+              ...(typeof rec.axiomSlug === "string" ? { axiomSlug: rec.axiomSlug } : {}),
+              ...(typeof rec.intentSummary === "string" ? { intentSummary: rec.intentSummary } : {}),
+              ...(typeof rec.summary === "string" ? { summary: rec.summary } : {}),
+              ...(typeof rec.contactEmail === "string" ? { contactEmail: rec.contactEmail } : {}),
+              ...(Array.isArray(rec.matchedDomains)
+                ? { matchedDomains: rec.matchedDomains.filter((d): d is string => typeof d === "string") }
+                : {}),
+              ...(typeof rec.createdAt === "string" ? { createdAt: rec.createdAt } : {}),
+            };
+          })
+          .filter((entry): entry is OpsPublicConciergeItem => entry !== null)
+      : undefined;
+    const humanCommitments: OpsHumanCommitmentSyncItem[] | undefined = Array.isArray(raw.humanCommitments)
+      ? raw.humanCommitments
+          .map((entry): OpsHumanCommitmentSyncItem | null => {
+            if (!entry || typeof entry !== "object") return null;
+            const rec = entry as Record<string, unknown>;
+            const id = String(rec.id ?? "").trim();
+            const title = String(rec.title ?? "").trim();
+            if (!id || !title) return null;
+            return {
+              id,
+              title,
+              stage: String(rec.stage ?? "needs_you"),
+              updatedAt: String(rec.updatedAt ?? new Date(this.nowMsFn()).toISOString()),
+              ...(typeof rec.projectKey === "string" ? { projectKey: rec.projectKey } : {}),
+              ...(typeof rec.projectName === "string" ? { projectName: rec.projectName } : {}),
+              ...(typeof rec.actor === "string" ? { actor: rec.actor } : {}),
+              ...(typeof rec.direction === "string" ? { direction: rec.direction } : {}),
+              ...(typeof rec.snoozeUntil === "string" ? { snoozeUntil: rec.snoozeUntil } : {}),
+              ...(typeof rec.dueAt === "string" ? { dueAt: rec.dueAt } : {}),
+              ...(typeof rec.roadmapItemId === "string" ? { roadmapItemId: rec.roadmapItemId } : {}),
+              ...(typeof rec.nextAiHint === "string" ? { nextAiHint: rec.nextAiHint } : {}),
+            };
+          })
+          .filter((entry): entry is OpsHumanCommitmentSyncItem => entry !== null)
+      : undefined;
     const snapshot: OpsStewardPendingSnapshot = {
       fetchedAtIso: new Date(this.nowMsFn()).toISOString(),
       projects: Array.isArray(raw.projects) ? (raw.projects as OpsStewardProjectItem[]) : [],
       pendingInbox: rawInbox as OpsInboxItem[],
+      ...(humanCommitments !== undefined ? { humanCommitments } : {}),
+      ...(publicConciergeQueue !== undefined ? { publicConciergeQueue } : {}),
+      ...(typeof raw.publicTopicDigest === "string" ? { publicTopicDigest: raw.publicTopicDigest } : {}),
       ...(Array.isArray(raw.weeklyFocus) ? { weeklyFocus: raw.weeklyFocus.map(String) } : {}),
       ...(Array.isArray(raw.stageGoals) ? { stageGoals: raw.stageGoals.map(String) } : {}),
     };

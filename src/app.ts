@@ -166,6 +166,7 @@ export interface AppOptions {
   stewardFleetStatePath?: string;
   enableOwnerStewardRouter?: boolean;
   enableStewardPulseTimer?: boolean;
+  enableWeChatEnvoyPoller?: boolean;
   stewardPulseIntervalMs?: number;
   opsEnv?: Record<string, string | undefined>;
 }
@@ -215,6 +216,7 @@ export class App {
   private readonly opsEnv: Record<string, string | undefined>;
   private readonly executedOpsCommandIds = new Set<string>();
   private readonly notifiedOpsInboxIds = new Set<string>();
+  private readonly notifiedPublicConciergeIds = new Set<string>();
   private lastOpsInboxPush?: { sig: string; atMs: number };
   private notices: Array<{ at: number; level: "info" | "warn"; text: string }> = [];
   private offPwsh: (() => void) | undefined;
@@ -279,6 +281,10 @@ export class App {
           await this.pushToOwner(text);
         },
         sendPeerDirectMessage: async (channel, peerId, text) => {
+          if (channel === "wechat_envoy") {
+            await this.stewardService.wechatEnvoyClient.sendMessage({ chatId: peerId, text });
+            return;
+          }
           for (const [, ch] of this.channels) {
             if (channel === "weixin" && ch.weixin && (await ch.weixin.notify(peerId, text))) return;
             if (channel === "feishu" && ch.feishu && ch.feishu.notify(peerId, text)) return;
@@ -311,8 +317,10 @@ export class App {
     this.opsEnv = opts.opsEnv ?? process.env;
     const opsCfg = resolveOpsBridgeConfig(this.opsEnv);
     const edgeToken = String(this.opsEnv.SUGENT_EDGE_TOKEN ?? "").trim();
+    const envoyToken = String(this.opsEnv.SUGENT_WECHAT_ENVOY_TOKEN ?? "").trim();
     if (opsCfg.nodeToken) registerSecret(opsCfg.nodeToken);
     if (edgeToken) registerSecret(edgeToken);
+    if (envoyToken) registerSecret(envoyToken);
     this.opsBridge = new OpsBridgeClient({
       baseUrl: opsCfg.baseUrl,
       nodeToken: opsCfg.nodeToken,
@@ -331,6 +339,7 @@ export class App {
       opsBridge: this.opsBridge,
       chatRecall,
       edgeTokens: [edgeToken, opsCfg.nodeToken].filter(Boolean),
+      wechatEnvoyEnv: this.opsEnv,
       knowledgeGraph: this.knowledgeGraph,
       localBudgets: this.localBudgets,
       providerRegistry: this.providers,
@@ -697,6 +706,27 @@ export class App {
             await this.pushToOwner(text).catch(() => false);
           }
         }
+        const freshVisitors = (pending.snapshot.publicConciergeQueue ?? []).filter(
+          (v) => v?.sessionId && !this.notifiedPublicConciergeIds.has(v.sessionId),
+        );
+        if (freshVisitors.length > 0 && !this.stewardService.getWorkbench("owner_private").quietHoursActive) {
+          const vLines = [
+            `【官网数字分身来客 · ${freshVisitors.length} 位】`,
+            ...freshVisitors.slice(0, 4).map(
+              (v) =>
+                `- ${v.sessionId}「${v.actorLabel || v.actorName || "匿名访客"}」：${v.intentSummary || v.summary || "来访咨询"}\n  快捷代回：/pub ${v.sessionId} <您的回复>（忽略回 /pub decline ${v.sessionId}）`,
+            ),
+          ];
+          for (const v of freshVisitors) this.notifiedPublicConciergeIds.add(v.sessionId);
+          await this.pushToOwner(vLines.join("\n")).catch(() => false);
+        }
+      }
+      const pendingCommitmentUpdates = this.stewardService.peekPendingOpsCommitmentUpdates();
+      if (pendingCommitmentUpdates.length > 0) {
+        const syncRes = await this.opsBridge.stewardSync({ commitmentUpdates: pendingCommitmentUpdates });
+        if (syncRes.ok) {
+          this.stewardService.ackOpsCommitmentUpdates(pendingCommitmentUpdates.map((u) => u.id));
+        }
       }
       if (localPulses.length > 0) {
         await this.opsBridge.pushPulse(localPulses);
@@ -726,6 +756,17 @@ export class App {
         ...res.morningDrain.emitNow.slice(0, 5).map((c, idx) => `${idx + 1}. ${c.title} — ${c.threeLineBody[0]}`),
       ];
       await this.pushToOwner(lines.join("\n")).catch(() => false);
+    }
+    if (res.unsnoozedWakeups && res.unsnoozedWakeups.length > 0 && !this.stewardService.getWorkbench("owner_private").quietHoursActive) {
+      const morningRefs = new Set((res.morningDrain?.emitNow ?? []).map((c) => c.targetRefId).filter(Boolean));
+      const uncovered = res.unsnoozedWakeups.filter((w) => !morningRefs.has(w.id));
+      if (uncovered.length > 0) {
+        const wLines = [
+          `【今日到期亲办唤醒 · ${uncovered.length} 项】`,
+          ...uncovered.slice(0, 5).map((w) => `- ${w.summary}（${w.counterpartyOrRef}）\n  办完可回：/done ${w.id.split(":").pop()}`),
+        ];
+        await this.pushToOwner(wLines.join("\n")).catch(() => false);
+      }
     }
     if (res.boundaryDrain && res.boundaryDrain.emitNow.length > 0) {
       const lines = [
@@ -1284,6 +1325,11 @@ export class App {
       void this.syncProviderModels(undefined, false).catch(() => {});
     }, 10 * 60_000);
     this.modelPoolSyncTimer.unref();
+    const enableEnvoyPoller =
+      this.opts.enableWeChatEnvoyPoller ?? (!process.env.VITEST && !this.opts.noWeb);
+    if (enableEnvoyPoller && this.stewardService.wechatEnvoyClient.isConfigured()) {
+      this.stewardService.wechatEnvoyPoller.start();
+    }
     const enablePulse = this.opts.enableStewardPulseTimer ?? (!process.env.VITEST && !this.opts.noWeb);
     if (enablePulse) {
       if (this.opsBridge.isConfigured()) {
@@ -1350,6 +1396,7 @@ export class App {
       clearInterval(this.modelPoolSyncTimer);
       this.modelPoolSyncTimer = undefined;
     }
+    await this.stewardService.wechatEnvoyPoller.stop();
     if (this.stewardPulseTimer) {
       clearInterval(this.stewardPulseTimer);
       this.stewardPulseTimer = undefined;

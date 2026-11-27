@@ -454,3 +454,118 @@ export function buildThreeSecondForwardedBriefing(
     threeLineSummary,
   };
 }
+
+export interface IngestForwardedBriefingInput {
+  workspaceDir: string;
+  ledger: Pick<StewardshipLedger, "queryContext" | "snapshotForCaller" | "upsertCommitment" | "upsertResource">;
+  rawForwardedText: string;
+  ownerName?: string;
+  autoRecordToLedger?: boolean;
+  nowIso?: string;
+}
+
+export interface IngestForwardedBriefingResult {
+  briefing: ThreeSecondForwardedBriefingResult;
+  recordedCommitments: ReturnType<StewardshipLedger["upsertCommitment"]>[];
+  recordedResource?: ReturnType<StewardshipLedger["upsertResource"]>;
+  deduplicated: boolean;
+}
+
+const FORWARDED_COMMITMENT_CUE_RE =
+  /(?:明天|明日|后天|下周|本周|这周|周[一二三四五六日天末]|星期[一二三四五六日天]|月底|今天内|下班前|尽快|\d+\s*(?:天|工作日)|答应|承诺|安排|发给|发你|发您|同步|提交|补齐|确认|核对|对齐|盖章|打款|付款)/;
+
+export function ingestForwardedBriefingToLedger(
+  input: IngestForwardedBriefingInput,
+): IngestForwardedBriefingResult {
+  const nowIso = input.nowIso ?? new Date().toISOString();
+  const parsedNowMs = Date.parse(nowIso);
+  const nowMs = Number.isFinite(parsedNowMs) ? parsedNowMs : Date.now();
+
+  const briefing = buildThreeSecondForwardedBriefing({
+    workspaceDir: input.workspaceDir,
+    ledger: input.ledger,
+    rawForwardedText: input.rawForwardedText,
+    ...(input.ownerName ? { ownerName: input.ownerName } : {}),
+    nowMs,
+  });
+
+  if (input.autoRecordToLedger === false) {
+    return {
+      briefing,
+      recordedCommitments: [],
+      deduplicated: false,
+    };
+  }
+
+  const ownerSet = new Set(DEFAULT_OWNER_ALIASES);
+  if (input.ownerName?.trim()) ownerSet.add(input.ownerName.trim().toLowerCase());
+  const parsed = parseForwardedChatTranscript(
+    input.rawForwardedText,
+    input.ownerName ? [input.ownerName] : undefined,
+  );
+  const canonicalTranscript = parsed.cleanedLines.join("\n");
+  const hash12 = crypto.createHash("sha256").update(canonicalTranscript, "utf8").digest("hex").slice(0, 12);
+  const archiveId = `res-fwd-${hash12}`;
+
+  const existing = input.ledger
+    .snapshotForCaller("owner_private")
+    .resources.find((r) => r.id === archiveId || r.metadata.fingerprint === hash12);
+  if (existing) {
+    return {
+      briefing,
+      recordedCommitments: [],
+      recordedResource: existing,
+      deduplicated: true,
+    };
+  }
+
+  const recordedCommitments: ReturnType<StewardshipLedger["upsertCommitment"]>[] = [];
+  parsed.cleanedLines.forEach((line, idx) => {
+    const spMatch = /^([A-Za-z0-9\u4e00-\u9fa5·_-]{1,16})\s*[:：]\s*(.+)$/.exec(line);
+    const speaker = spMatch?.[1]?.trim() ?? "";
+    const body = (spMatch?.[2] ?? line).trim();
+    if (!body || !FORWARDED_COMMITMENT_CUE_RE.test(body)) return;
+
+    const isOwner = speaker
+      ? ownerSet.has(speaker.toLowerCase())
+      : /^(?:我(?:们|这边)?|本人)/.test(body);
+    const direction: "i_owe" | "waiting_for" = isOwner ? "i_owe" : "waiting_for";
+    const actorLabel = isOwner ? "我方跟进" : `${speaker || briefing.counterparty}承诺`;
+    const cmt = input.ledger.upsertCommitment(
+      {
+        id: `cmt-fwd-${hash12}-${direction}-${idx}`,
+        partition: "work_project",
+        direction,
+        status: "open",
+        summary: compactSingleLine(`${actorLabel}：${body}`, 140),
+        counterpartyOrRef: briefing.counterparty,
+      },
+      nowIso,
+    );
+    recordedCommitments.push(cmt);
+  });
+
+  const recordedResource = input.ledger.upsertResource(
+    {
+      id: archiveId,
+      partition: "work_project",
+      kind: "personal_archive",
+      title: `微信转发沟通记录 · ${briefing.counterparty}`,
+      localUriOrPath: briefing.envelopePath,
+      metadata: {
+        source: "weixin_forwarded",
+        counterparty: briefing.counterparty,
+        extractedTerms: parsed.extractedNumbersAndTerms.join(", ").slice(0, 200),
+        fingerprint: hash12,
+      },
+    },
+    nowIso,
+  );
+
+  return {
+    briefing,
+    recordedCommitments,
+    recordedResource,
+    deduplicated: false,
+  };
+}

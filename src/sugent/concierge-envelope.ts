@@ -6,7 +6,7 @@ import {
   isPrivilegedEventField,
 } from "./security-envelope.js";
 
-export type ConciergeChannelKind = "weixin" | "feishu";
+export type ConciergeChannelKind = "weixin" | "feishu" | "wechat_envoy";
 export type ConciergeChatType = "direct" | "group";
 export type ConciergeActorRole = "owner" | "external_peer";
 export type ScalarValue = string | number | boolean;

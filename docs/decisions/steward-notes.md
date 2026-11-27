@@ -51,3 +51,20 @@
 3. **反向代理鉴权安全细节（`Secure` Cookie + `no-referrer` + 最小权限边缘令牌）**：
    - 经 HTTPS 反向代理首次通过 `/?token=<ui-token>` 换取长效 `amb_token` Cookie 时，根据 `X-Forwarded-Proto: https` 自动追加 `; Secure` 与 `Referrer-Policy: no-referrer` 响应头，杜绝令牌经 `Referer` 外泄；`SUGENT_EDGE_TOKEN` 采用 SHA-256 摘要 `crypto.timingSafeEqual` 恒定时间比对，且仅放行 `/amb/api/steward/edge/*` 路由，与浏览器全权管理令牌严格隔离。
 
+
+## 2026-11-26 · Wave P3：原生无头 Rust 边车选型、双微信号物理隔离与群静默纪要不变量
+
+1. **淘汰 Xvfb 桌面容器，采用原生无头 Rust 边车（`P3.3`）**：
+   - 旧版 `@agent-wechat/wechat` 依赖 Xvfb 虚拟桌面常驻消耗 700 MiB–1.1 GiB 内存，与同机 `airtoken-micro`（3.8 GiB RAM）冲突。改用 `thisnick/agent-wechat` 原生无头守护 `wx serve`（`deploy/gce-hub/compose.wechat-envoy.yml`，硬限 `mem_limit: 384m`、`cap_drop: ALL`），主号继续走腾讯官方 `iLink` 担任零封号风险后台耳麦，新手机号注册的独立助理号经 Loopback/内网 HTTP 边车接入，核心仓保持 `SUGENT_WECHAT_ENVOY_ENABLED=false` 默认静默。
+2. **公私域隔离与群静默不变量（`P3.3` / `P3.4`）**：
+   - 助理号所有入站与白名单群 `@提及` 强制经 `0o400` 只读安全信封隔离且零权限读取 `owner_private`；`GroupChatScribe` 硬编码 `outboundGroupMessagesSent === 0`，非 `@` 群消息绝不外发，脱敏后生成待审纪要卡经 `/gdig ok <id>` 拍板落账。
+
+## 2026-11-27 · 人机混合项目规划、跨语言同构指纹与早报唤醒时序铁律
+
+1. **复用 `STATUS.md` 签批闸门而非新建 `TODOS.md`**：
+   - 单文件真相源避免 Gemini App 与 Antigravity 多文件写冲突；通过 `[AI]` / `[我]` / `[我·N天后|YYYY-MM-DD]` / `[等外部]` / `[观察窗·N天]` 前缀区分责任主体，只有用户在 `/ops` 点确认或口头确认状态后才幂等派生现实待办。
+2. **跨语言同构 FNV-1a 指纹与相对天数一次性折算**：
+   - `Andy-web/src/shared/opsSchema.js` 被浏览器 Vite 与 Node 共享，严禁引入 `node:crypto`。Python（`status_md.py`）与 JS 统一使用 UTF-8 32 位 FNV-1a 8 位十六进制摘要生成 `todo:<projectKey>:<hash8>`；`[我·5-7天后]` 基于 `statusCard.updatedAt`（或本地当前日期）一次性折算下界 `YYYY-MM-DD`，防止重扫漂移。
+3. **早报唤醒时序与 `snoozed` 提前核销**：
+   - `StewardHostService.runScheduledPulse` 必须严格保持 **「`unsnoozeDueCommitments` → `drainMorning` → `drainFlowBoundary` → `scanCadence` → 再将刚解冻唤醒的候选合并进 `morningDrain.emitNow`」**；若把 `scanCadence` 提前到 `drainMorning` 之前，会把夜间 `morningDigestQueue` 提前消费滤除。
+   - `StewardLlmAgent` 的 `complete_todo` 工具必须覆盖 `snoozed` 状态的待办，并通过 `mutateCommitment` 同步回传 `commitmentUpdates` 至 `/ops`。

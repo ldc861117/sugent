@@ -440,6 +440,39 @@ export class ConciergeChannelBridge {
     return this.orchestrator.handleInboundMessage(raw);
   }
 
+  async ingestWeChatEnvoyEvent(input: {
+    message: {
+      messageId: string;
+      chatId: string;
+      isGroup: boolean;
+      senderId: string;
+      senderName: string;
+      text: string;
+      timestampMs: number;
+    };
+  }): Promise<ConciergeRouteOutcome> {
+    const m = input.message;
+    const text = m.text.trim();
+    if (!text) {
+      return { routeTaken: "owner_chat_passthrough" };
+    }
+    const raw: RawChannelMessage = {
+      eventId: sanitizeEventId(`wxenv_${m.messageId}`),
+      channel: "wechat_envoy",
+      chatType: m.isGroup ? "group" : "direct",
+      senderId: m.senderId,
+      senderDisplayName: m.senderName || m.senderId,
+      ...(m.isGroup ? { groupId: m.chatId } : {}),
+      text,
+      timestampMs: m.timestampMs || Date.now(),
+      metadata: {
+        mentionedSelf: m.isGroup,
+        chatId: m.chatId,
+      },
+    };
+    return this.orchestrator.handleInboundMessage(raw);
+  }
+
   async executeOwnerCommand(
     commandText: string,
     channel: ConciergeChannelKind = "weixin",

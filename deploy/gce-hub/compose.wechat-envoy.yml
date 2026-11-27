@@ -1,0 +1,33 @@
+# Sugent Wave P3.3 — Optional External `agent-wechat` Native Sidecar Overlay
+# Usage alongside default compose.yml (zero intrusion when omitted):
+#   docker compose -f compose.yml -f compose.wechat-envoy.yml up -d
+#
+# Security & Resource Contract (GCE e2-medium / 4 GiB co-tenancy with airtoken):
+#   - Headless Rust native `wx serve` (no X11/Xvfb, no SYS_PTRACE, cap_drop: ALL)
+#   - Strict memory cap: 384m RAM / 512m RAM+Swap
+#   - Host loopback-only port binding: 127.0.0.1:6174:6174
+
+services:
+  agent-wechat:
+    image: ${AGENT_WECHAT_IMAGE:-ghcr.io/thisnick/agent-wechat-native:latest}
+    container_name: agent-wechat-native
+    restart: unless-stopped
+    mem_limit: 384m
+    memswap_limit: 512m
+    ports:
+      - "127.0.0.1:6174:6174"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      AGENT_WECHAT_TOKEN: ${SUGENT_WECHAT_ENVOY_TOKEN:-}
+      PROXY: ${AGENT_WECHAT_PROXY:-}
+    volumes:
+      - agent-wechat-data:/var/lib/agent-wechat
+      - agent-wechat-cache:/var/cache/agent-wechat
+
+volumes:
+  agent-wechat-data:
+  agent-wechat-cache:

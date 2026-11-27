@@ -166,7 +166,19 @@ export interface MessageItem {
   /** aeskey：入站图片的原始密钥（十六进制），优先于 media.aes_key */
   image_item?: { media?: CdnMedia; aeskey?: string; mid_size?: number };
   video_item?: { media?: CdnMedia; video_size?: number };
-  ref_msg?: { title?: string; message_item?: MessageItem };
+  ref_msg?: { title?: string; content?: string; message_item?: MessageItem };
+  record_item?: {
+    title?: string;
+    desc?: string;
+    record_xml?: string;
+    items?: Array<{ sender_name?: string; content?: string; data_desc?: string }>;
+  };
+  appmsg_item?: {
+    title?: string;
+    desc?: string;
+    xml?: string;
+    record_item?: string;
+  };
 }
 
 export interface WeixinMessage {
