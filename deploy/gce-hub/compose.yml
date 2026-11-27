@@ -53,6 +53,7 @@ services:
       - no-new-privileges:true
     environment:
       TZ: ${TZ:-Asia/Shanghai}
+      DOCKER_API_VERSION: ${WATCHTOWER_DOCKER_API_VERSION:-1.44}
       # 严格仅监控带 watchtower.enable=true 标签的容器，物理隔离同机 airtoken 等服务
       WATCHTOWER_LABEL_ENABLE: "true"
       WATCHTOWER_CLEANUP: "true"
