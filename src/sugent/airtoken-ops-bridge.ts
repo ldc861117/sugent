@@ -227,7 +227,7 @@ export class AirTokenOpsBridgeClient {
   constructor(private readonly opts: AirTokenOpsClientOptions = {}) {
     this.cfg = resolveAirTokenOpsConfig(opts);
     this.fetchFn = opts.fetchFn ?? fetch;
-    this.timeoutMs = opts.timeoutMs ?? 8_000;
+    this.timeoutMs = opts.timeoutMs ?? 20_000;
   }
 
   getConfig(): AirTokenOpsConfig {

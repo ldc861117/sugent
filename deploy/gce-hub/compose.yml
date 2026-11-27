@@ -7,8 +7,12 @@ services:
     image: ${SUGENT_IMAGE:-ghcr.io/ldc861117/sugent:latest}
     container_name: sugent-gce-hub
     restart: always
+    stop_grace_period: 15s
     mem_limit: 1536m
     memswap_limit: 2048m
+    extra_hosts:
+      - "airtoken.metamirror.club:host-gateway"
+      - "host.docker.internal:host-gateway"
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
     ports:

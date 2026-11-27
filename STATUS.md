@@ -2,8 +2,8 @@
 status_version: 1
 project: sugent
 review_state: pending_review
-updated_by: antigravity@cloud-vm
-updated_at: "2026-11-27T12:55:00+08:00"
+updated_by: agent@local-mac
+updated_at: "2026-11-27T17:44:00+08:00"
 confirmed_by: ""
 confirmed_at: ""
 ---
@@ -14,9 +14,9 @@ confirmed_at: ""
 
 ## 最近完成
 
+- 修复 `AirTokenOpsBridgeClient` 在 GCE 容器内的公网回环 NAT 丢包问题（`deploy/gce-hub/compose.yml` 补充 `host-gateway` 映射与 `stop_grace_period: 15s`，并将默认超时放宽至 20s）。
 - 对齐 `WeChatEnvoySidecarClient` 至 `agent-wechat-native` `/v1` 真实接口（`serverId` 重建保护、SSE 游标与 `live` 6 分钟防刷屏过滤、`Idempotency-Key` 幂等外发回执恢复）及共享容器环回网络。
-- 在 `deploy/gce-hub/compose.yml` 新增标签限定的 `sugent-updater` 自动滚动升级守护（物理隔离同机 `airtoken`），并将 `App.pushToOwner` 接入 `WeixinAdaptiveQuotaGuard` 低配额合卡与飞书降级。
-- 归档主理人已完成的备用机新号注册（`P3.5`），将数字运维工作全量收归 AI 自动执行。
+- 在 `deploy/gce-hub/compose.yml` 新增标签限定的 `sugent-updater` 自动滚动升级守护（物理隔离同机 `airtoken`），并将 `App.pushToOwner` 接入 `WeixinAdaptiveQuotaGuard` 低配额合卡与飞书降级；归档 `P3.5` 备用机新号注册。
 
 ## 在途
 
