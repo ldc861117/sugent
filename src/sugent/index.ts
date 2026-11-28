@@ -76,5 +76,6 @@ export * from "./post-turn-digester.js";
 export * from "./stereoscopic-atlas.js";
 export * from "./silicon-identity-core.js";
 export * from "./cognitive-membrane.js";
+export * from "./memory-capability-eval.js";
 
 

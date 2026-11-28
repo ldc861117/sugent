@@ -238,6 +238,10 @@ export function detectLoyalDissentSignal(params: {
 
 const TURN_JUDGMENT_CUE_RE =
   /(?:我判断|建议优先|我的建议是|核心取舍是|风险在于|关键判断)[：:，,\s]*([^。\n！？!?]{8,140})/;
+const FEEDBACK_CONFIRM_RE =
+  /(?:(?:刚才|上次|之前|那条)?(?:你的|那个)?(?:判断|建议|方案|思路|结论).*(?:是对的|说对了|很准|有效|跑通了|管用|验证通过|确实如此|有用))|(?:(?:刚才|上次)那个建议(?:很准|有效|管用|跑通了))/;
+const FEEDBACK_FALSIFY_RE =
+  /(?:(?:刚才|上次|之前|那条)?(?:你的|那个)?(?:判断|建议|方案|思路|结论).*(?:错了|不对|有问题|翻车|踩坑|行不通|被拒|失败了|无效))|(?:按你说的.*(?:没成|失败了|被拒|行不通|踩坑))/;
 
 export class EpistemicDigestionLoop {
   private readonly stewardDir: string;
@@ -481,6 +485,42 @@ export class EpistemicDigestionLoop {
     return { entry: { ...entry, evidenceNotes: [...entry.evidenceNotes] }, tombstoneLesson };
   }
 
+  digestUserFeedbackTurn(
+    input: { userText: string; surface: SiliconSurfaceId },
+    nowIso?: string,
+  ): { entry: EpistemicJudgmentEntry; outcome: "confirmed" | "falsified"; tombstoneLesson?: string } | null {
+    const clean = input.userText.trim();
+    if (!clean || looksSecret(clean)) return null;
+    const outcome: "confirmed" | "falsified" | null = FEEDBACK_FALSIFY_RE.test(clean)
+      ? "falsified"
+      : FEEDBACK_CONFIRM_RE.test(clean)
+        ? "confirmed"
+        : null;
+    if (!outcome) return null;
+
+    const candidates = this.entries.filter((e) => e.status === "sandbox");
+    if (candidates.length === 0) return null;
+    let target = candidates[candidates.length - 1]!;
+    for (let i = candidates.length - 1; i >= 0; i--) {
+      const cand = candidates[i]!;
+      const keys = [cand.topicKey, ...cand.hypothesis.split(/[：:，,。；;\s]+/).filter((w) => w.length >= 2)];
+      if (keys.some((k) => clean.includes(k))) {
+        target = cand;
+        break;
+      }
+    }
+    const res = this.reconcileOutcome(
+      {
+        idOrTopic: target.id,
+        outcome,
+        evidenceNote: `${input.surface} 用户反馈: ${clean.slice(0, 80)}`,
+        ownerEndorsed: outcome === "falsified" || input.surface === "im_owner" || input.surface === "steward_hub",
+      },
+      nowIso,
+    );
+    return res ? { entry: res.entry, outcome, ...(res.tombstoneLesson ? { tombstoneLesson: res.tombstoneLesson } : {}) } : null;
+  }
+
   extractTurnJudgmentDeterministically(
     turn: { userText: string; assistantReply: string; surface: SiliconSurfaceId },
     nowIso?: string,
@@ -514,10 +554,12 @@ export class EpistemicDigestionLoop {
     return rows.map((e) => ({ ...e, evidenceNotes: [...e.evidenceNotes] }));
   }
 
-  getCalibratedLessons(limit = 6): string[] {
+  getCalibratedLessons(limit = 6, opts?: { surfaces?: readonly SiliconSurfaceId[] }): string[] {
+    const allowed = opts?.surfaces?.length ? new Set<SiliconSurfaceId>(opts.surfaces) : null;
     const out: string[] = [];
     for (let i = this.entries.length - 1; i >= 0 && out.length < limit; i--) {
       const e = this.entries[i]!;
+      if (allowed && !allowed.has(e.surface)) continue;
       if (e.status === "falsified") {
         const lastNote = e.evidenceNotes[e.evidenceNotes.length - 1];
         out.push(

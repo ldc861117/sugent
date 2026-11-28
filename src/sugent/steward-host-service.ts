@@ -776,10 +776,26 @@ export class SugentStewardHostService {
         queryLedger: (q, d) => this.ledger.queryContext(q, d),
         findArchiveResources: (q, d) => this.ledger.findArchiveResources(q, d),
         recallKnowledgeSubgraph: (q) => {
-          const sub = this.opts.knowledgeGraph.recallSubgraph(q, 2);
+          this.syncAtlasFromKnowledgeGraph();
+          const res = this.atlas.recallStereoscopic(q, {
+            callerPrincipals: ["sugent_self", "owner:M"],
+            maxHops: 2,
+            maxNodes: 15,
+          });
+          const edgeStrs = Array.from(
+            new Set(
+              [...res.edges, ...res.crossPlaneBridges].map(
+                (e) => `${e.from} -[${e.relation}${e.isMembraneEdge ? ":membrane" : ""}]-> ${e.to}`,
+              ),
+            ),
+          );
           return {
-            nodes: sub.matchedNodes,
-            edges: sub.activeEdges.map((e) => `${e.from} -[${e.relation}]-> ${e.to}`),
+            nodes: res.nodes.map((n) => ({
+              name: `[${n.plane}|${n.stratum}] ${n.name}`,
+              kind: n.kind,
+              summary: n.summary,
+            })),
+            edges: edgeStrs,
           };
         },
         upsertArchiveResource: (i) => {
@@ -894,11 +910,46 @@ export class SugentStewardHostService {
     return this.resolveLiveRoleEndpoint("steward");
   }
 
+  private ingestDomainWorkNode(input: {
+    id: string;
+    projectKey: string;
+    kind: AtlasNode["kind"];
+    stratum: "verified_fact" | "digested_state" | "crystallized_wisdom";
+    name: string;
+    summary: string;
+    tags: string[];
+  }): void {
+    const cleanKey = canonicalizeProjectKey({ explicitKey: input.projectKey }).replace(/[^a-z0-9_.-]+/gi, "-").slice(0, 40) || "default";
+    try {
+      this.atlas.applyDelta(
+        {
+          nodes: [
+            {
+              id: input.id,
+              plane: `domain_work:${cleanKey}`,
+              stratum: input.stratum,
+              kind: input.kind,
+              name: input.name,
+              summary: input.summary,
+              tags: Array.from(new Set(["domain_work", cleanKey, ...input.tags])),
+              principalAcl: ["sugent_self", "owner:M"],
+              sourceTrust: "deterministic_gate",
+              reinforcements: 1,
+            },
+          ],
+        },
+        this.nowIsoFn(),
+      );
+    } catch {
+      /* ignore secret-like content or raw_episodic membrane violations */
+    }
+  }
+
   async comprehendSession(input: ArtifactComprehensionInput): Promise<ArtifactComprehensionResult> {
     const { scan } = this.scanAntigravity();
     const sess = scan.sessions.find((s) => s.conversationId === input.conversationId) ??
       scan.sessions.find((s) => s.projectKey === input.projectKey);
-    return this.artifacts.comprehendSession({
+    const res = await this.artifacts.comprehendSession({
       ...input,
       projectDisplayName: input.projectDisplayName ?? sess?.projectDisplayName,
       workspaceRoot: input.workspaceRoot ?? sess?.workspaceRoot,
@@ -912,6 +963,18 @@ export class SugentStewardHostService {
       activeChildConversationIds: input.activeChildConversationIds ?? sess?.activeChildConversationIds,
       nowIso: input.nowIso ?? this.nowIsoFn(),
     });
+    if (res.allowed && res.ok) {
+      this.ingestDomainWorkNode({
+        id: `agy:session:${res.conversationId}`,
+        projectKey: res.projectKey,
+        kind: "concept",
+        stratum: "verified_fact",
+        name: `${res.projectDisplayName || res.projectKey} 会话解读`,
+        summary: res.threeLineCard.join("；"),
+        tags: ["antigravity", res.runState],
+      });
+    }
+    return res;
   }
 
   async dispatchAntigravity(input: {
@@ -1007,6 +1070,17 @@ export class SugentStewardHostService {
       this.adaptiveRouter.recordAttemptOutcome({ decisionId: this.lastRouteTurn.decisionId, targetId: this.lastRouteTurn.targetId, archetype: this.lastRouteTurn.archetype, ok: false, signalSource: "user_correction" });
     }
     if (callerDomain === "owner_private") {
+      try {
+        this.mindLoop.digestUserFeedbackTurn(
+          {
+            userText: input.text,
+            surface: input.channel === "weixin" || input.channel === "feishu" ? "im_owner" : "steward_hub",
+          },
+          this.nowIsoFn(),
+        );
+      } catch {
+        /* ignore secret-like content */
+      }
       const snap = this.ledger.snapshotForCaller("owner_private");
       this.lastLoyalDissent = detectLoyalDissentSignal({
         userText: input.text,
@@ -1091,6 +1165,9 @@ export class SugentStewardHostService {
     return new UniversalDropzone({
       ledger: this.ledger,
       knowledgeGraph: this.opts.knowledgeGraph,
+      atlasRecall: (q) => ({
+        nodes: this.queryAtlas({ q, maxNodes: 12 }).recall?.nodes ?? [],
+      }),
       gatewayConfig: this.opts.getGatewayConfig?.() ?? resolveSugentGatewayConfig(undefined, {}),
       ...(live
         ? {
@@ -1682,6 +1759,17 @@ export class SugentStewardHostService {
     if (input.action === "verify_now" && res.pipeline) {
       this.adaptiveRouter.recordVibeGateFeedback(res.pipeline.stage !== "failed" && res.pipeline.lastVerification?.passed !== false);
       this.recordVibeSimOutcome(res.pipeline);
+      if (res.pipeline.stage === "completed" || res.pipeline.stage === "awaiting_restart_approval" || res.pipeline.stage === "failed") {
+        this.ingestDomainWorkNode({
+          id: `vibe:pipe:${res.pipeline.pipelineId}`,
+          projectKey: res.pipeline.repoAlias || res.pipeline.projectKey,
+          kind: res.pipeline.stage === "failed" ? "tombstone" : "decision",
+          stratum: res.pipeline.stage === "failed" ? "crystallized_wisdom" : "verified_fact",
+          name: `Vibe ${res.pipeline.repoAlias} (${res.pipeline.stage})`,
+          summary: res.pipeline.requirementText.slice(0, 140),
+          tags: ["vibe_coding", res.pipeline.stage],
+        });
+      }
     }
     return { ...res, workbench: this.getWorkbench(input.callerDomain ?? "owner_private") };
   }
@@ -1706,6 +1794,15 @@ export class SugentStewardHostService {
       if (updated && (updated.stage === "completed" || updated.stage === "awaiting_restart_approval" || updated.stage === "failed" || updated.lastVerification)) {
         this.adaptiveRouter.recordVibeGateFeedback(updated.stage !== "failed" && updated.lastVerification?.passed !== false);
         this.recordVibeSimOutcome(updated);
+        this.ingestDomainWorkNode({
+          id: `vibe:pipe:${updated.pipelineId}`,
+          projectKey: updated.repoAlias || updated.projectKey,
+          kind: updated.stage === "failed" ? "tombstone" : "decision",
+          stratum: updated.stage === "failed" ? "crystallized_wisdom" : "verified_fact",
+          name: `Vibe ${updated.repoAlias} (${updated.stage})`,
+          summary: updated.requirementText.slice(0, 140),
+          tags: ["vibe_coding", updated.stage],
+        });
       }
     } else {
       updated = target;
@@ -2917,7 +3014,7 @@ export class SugentStewardHostService {
     coworkWorkspaceId?: string;
     proposerId?: string;
   }): IndustrialFdeDiagnosticResult {
-    return runIndustrialFdeDiagnosticPack({
+    const out = runIndustrialFdeDiagnosticPack({
       workspaceDir: path.join(this.opts.dataDir, "sugent-weapons", "fde-batches"),
       batchId: input.batchId,
       records: input.records,
@@ -2925,6 +3022,16 @@ export class SugentStewardHostService {
       ...(input.proposerId ? { proposerId: input.proposerId } : {}),
       nowIso: this.nowIsoFn(),
     });
+    this.ingestDomainWorkNode({
+      id: `fde:batch:${out.batchId}`,
+      projectKey: "industrial-fde",
+      kind: "decision",
+      stratum: "verified_fact",
+      name: `FDE 批次 ${out.batchId} (${out.severity})`,
+      summary: `热点工位: ${out.summary.hotspotStations.join("、") || "无"}；总停机 ${out.summary.totalDowntimeMinutes} 分钟；SLA 超期 ${out.summary.slaBreachCount} 项`,
+      tags: ["weapon_pack", "fde", out.severity],
+    });
+    return out;
   }
 
   runContractGuardPack(input: {
@@ -2934,7 +3041,7 @@ export class SugentStewardHostService {
     quotedUnitPrice?: number;
     requestedPaymentDays?: number;
   }): RedlineDiffCard {
-    return runContractQuoteGuardPack({
+    const card = runContractQuoteGuardPack({
       workspaceDir: path.join(this.opts.dataDir, "sugent-weapons", "contract-reviews"),
       inquiryId: input.inquiryId,
       counterparty: input.counterparty,
@@ -2944,6 +3051,16 @@ export class SugentStewardHostService {
       ledger: this.ledger,
       nowIso: this.nowIsoFn(),
     });
+    this.ingestDomainWorkNode({
+      id: `contract:review:${card.inquiryId}`,
+      projectKey: "contract-guard",
+      kind: card.verdict === "block" ? "tombstone" : "decision",
+      stratum: "crystallized_wisdom",
+      name: `合同审校 ${card.counterparty} (${card.verdict})`,
+      summary: `触发护栏: ${card.triggeredGuardrails.join("；") || "无"}${card.paymentTermBreach ? `；账期超限 ${card.paymentTermBreach.requestedDays}天` : ""}`,
+      tags: ["weapon_pack", "contract_guard", card.verdict],
+    });
+    return card;
   }
 
   getWeaponSoakProof(targetSoakDays = 14): CommercialProofSummary {
@@ -3090,9 +3207,11 @@ export class SugentStewardHostService {
     }
     if (input.action === "supersede_node") {
       const ok = this.atlas.supersedeNode(nodeId, undefined, nowIso);
+      this.opts.knowledgeGraph.archiveNode(nodeId, nowIso);
       return { ok, ...(this.atlas.getNode(nodeId) ? { node: this.atlas.getNode(nodeId) } : {}), summary: this.atlas.getPlaneSummary() };
     }
     this.atlas.supersedeNode(nodeId, undefined, nowIso);
+    this.opts.knowledgeGraph.archiveNode(nodeId, nowIso);
     const reason = String(input.reason ?? "").trim();
     const stmt = reason ? `${existing.name}（${reason}）` : `已证伪旧认知「${existing.name}」`;
     try {
@@ -3181,12 +3300,16 @@ export class SugentStewardHostService {
   private buildDuoContextInjections(spaceId: string | undefined, partnerLabels?: { M: string; W: string }) {
     const labels = partnerLabels ?? { M: "Andy", W: "Gillna" };
     const weather = this.getDuoWeatherCapsule(spaceId);
-    const weatherCapsuleContext = renderWeatherCapsuleForDuoPrompt(weather, labels.M, this.collectConfidentialCanaryTokens());
+    const canaries = this.collectConfidentialCanaryTokens();
+    const weatherCapsuleContext = renderWeatherCapsuleForDuoPrompt(weather, labels.M, canaries);
     const anchors = this.getOwnerDuoAnchors(spaceId);
+    const duoLessons = this.mindLoop
+      .getCalibratedLessons(4, { surfaces: ["duo_mediator"] })
+      .filter((line) => !canaries.some((c) => line.toLowerCase().includes(c.toLowerCase())));
     const siliconCharterBlock = buildSiliconCharterPrompt({
       surface: "duo_mediator",
       duoProtectedWindows: anchors.map((a) => `${a.title}: ${a.detail}`),
-      calibratedLessons: this.mindLoop.getCalibratedLessons(4),
+      calibratedLessons: duoLessons,
     });
     return { weatherCapsuleContext, siliconCharterBlock };
   }
@@ -3220,6 +3343,13 @@ export class SugentStewardHostService {
       loyalDissentSignal: this.lastLoyalDissent,
     });
     const guards = snap.guardrails.filter((g) => g.kind === "hard_redline" || g.kind === "tombstone").slice(0, 5);
-    return guards.length ? `${charter}\n\n【红线与墓碑】\n${guards.map((g) => `- ${g.statement}`).join("\n")}` : charter;
+    const domainNodes = this.atlas
+      .allNodes()
+      .filter((n) => n.plane.startsWith("domain_work") && (n.stratum === "crystallized_wisdom" || n.stratum === "verified_fact"))
+      .slice(-4);
+    const parts = [charter];
+    if (guards.length) parts.push(`【红线与墓碑】\n${guards.map((g) => `- ${g.statement}`).join("\n")}`);
+    if (domainNodes.length) parts.push(`【工程与武器包沉淀 (domain_work)】\n${domainNodes.map((n) => `- [${n.plane}] ${n.name}：${n.summary}`).join("\n")}`);
+    return parts.join("\n\n");
   }
 }

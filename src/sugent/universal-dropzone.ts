@@ -152,6 +152,9 @@ export type DropzoneOutcome =
 export interface UniversalDropzoneOptions {
   ledger: DropzoneLedgerPort;
   knowledgeGraph?: SugentKnowledgeGraph;
+  atlasRecall?: (query: string) => {
+    nodes: Array<{ id: string; kind: string; name: string; summary: string; plane?: string; stratum?: string }>;
+  };
   gatewayConfig?: SugentGatewayConfig;
   ownerId?: string;
   automatedCapabilities?: ReadonlySet<string>;
@@ -414,6 +417,7 @@ function selectPrepTemplate(text: string): PrepDomainTemplate {
 export class UniversalDropzone {
   private readonly ledger: DropzoneLedgerPort;
   private readonly knowledgeGraph?: SugentKnowledgeGraph;
+  private readonly atlasRecall?: UniversalDropzoneOptions["atlasRecall"];
   private readonly gatewayConfig: SugentGatewayConfig;
   private readonly ownerId: string;
   private readonly automatedCapabilities: ReadonlySet<string>;
@@ -422,6 +426,7 @@ export class UniversalDropzone {
   constructor(options: UniversalDropzoneOptions) {
     this.ledger = options.ledger;
     this.knowledgeGraph = options.knowledgeGraph;
+    this.atlasRecall = options.atlasRecall;
     this.gatewayConfig = options.gatewayConfig ?? resolveSugentGatewayConfig();
     this.ownerId = options.ownerId ?? "owner";
     this.automatedCapabilities = options.automatedCapabilities ?? new Set<string>();
@@ -536,7 +541,11 @@ export class UniversalDropzone {
     const selectedModel = selectModelForRole(this.gatewayConfig, "assessor");
     const ctx = this.ledger.queryContext(input.text, callerDomain);
     const archives = this.ledger.findArchiveResources(input.text, callerDomain);
-    const kgSub = callerDomain === "owner_private" ? this.knowledgeGraph?.recallSubgraph(input.text, 2) : undefined;
+    const atlasRes = callerDomain === "owner_private" ? this.atlasRecall?.(input.text) : undefined;
+    const kgSub =
+      callerDomain === "owner_private" && (!atlasRes || atlasRes.nodes.length === 0)
+        ? this.knowledgeGraph?.recallSubgraph(input.text, 2)
+        : undefined;
 
     const refs = new Set<string>();
     const snippets: string[] = [];
@@ -574,7 +583,12 @@ export class UniversalDropzone {
       refs.add(gr.id);
       snippets.push(`[规则:${gr.kind}] ${gr.statement}`);
     }
-    if (kgSub && kgSub.matchedNodes.length > 0) {
+    if (atlasRes && atlasRes.nodes.length > 0) {
+      for (const n of atlasRes.nodes) {
+        refs.add(n.id);
+        snippets.push(`[图谱:${n.plane ? `${n.plane}|` : ""}${n.kind}] ${n.name}: ${n.summary}`);
+      }
+    } else if (kgSub && kgSub.matchedNodes.length > 0) {
       for (const n of kgSub.matchedNodes) {
         refs.add(n.id);
         snippets.push(`[图谱:${n.kind}] ${n.name}: ${n.summary}`);

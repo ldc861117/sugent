@@ -3,20 +3,20 @@ status_version: 1
 project: sugent
 review_state: pending_review
 updated_by: agent@local-mac
-updated_at: "2026-11-28T14:22:00+08:00"
+updated_at: "2026-11-28T14:48:00+08:00"
 confirmed_by: ""
 confirmed_at: ""
 ---
 
 ## 阶段目标
 
-Wave P4 全量合龙通过门禁，静待助理微信号养号满期扫码
+完成 Wave P4+ 扩大范围记忆能力定量验收与 6 处修复
 
 ## 最近完成
 
-- 完成 Wave P4 第二梯队三路并行研发与全链路宿主合龙：`P4.3 SiliconIdentityCore` 统一硅基个体宪章、`EpistemicDigestionLoop` 认知消化闭环与忠诚异议镜像检测。
-- 完成 `P4.4 CognitiveMembrane`（`M1` 去名词现实气候胶囊 × 金丝雀防泄、`M2` `M/W` 对称加密私密口袋、`M3/M4` 双向有界投影与 `duo/converse` SSE 流式联邦）。
-- 完成 `P4.5b` 前端零重依赖交互式立体星图（`#/atlas`）与原生 `<dialog closedby="any">` 心智日志抽屉。
+- 打通 `toolsPort.recallKnowledgeSubgraph` 与 `UniversalDropzone` 改走 `StereoscopicAtlas` 五维立体召回，并接入 `Antigravity`/`VibeCoding`/`FDE`/`ContractGuard` 实时沉淀至 `domain_work` 平面及主脑 `buildOwnerAgentBrief`。
+- 新增 `EpistemicDigestionLoop.digestUserFeedbackTurn` 实现“用户一句话指正 → 当轮即刻立碑/转正并注入上下文”，联动 `mutateAtlasNode` 防跨端复活，并按面隔离 `getCalibratedLessons` 封堵 `duo_mediator` 教训侧信道泄露。
+- 建成 `eval:memory`（40 场景定量评测基准，报告落盘 [`research/2026-11-28-memory-capability-evaluation-report.md`](./research/2026-11-28-memory-capability-evaluation-report.md)）与 5 日跨面 `App` 生命周期实战验证。
 
 ## 在途
 
@@ -25,7 +25,7 @@ Wave P4 全量合龙通过门禁，静待助理微信号养号满期扫码
 ## 下一步
 
 1. [我·2026-12-02] 养号满期当天拿备用手机扫一次二维码确认登录助理微信号（关联 P3.7）
-2. [AI] 主理人验收 `#/atlas` 立体星图与心智日志后，规划 `bigfive-duo-site` 站侧升级与下一阶段商业化武器包
+2. [AI] 如需继续，将本轮能力扩展升级封版推送并把 `bigfive-duo-site` 接上 `/amb/api/steward/duo/converse`
 
 ## 卡点
 
