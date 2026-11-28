@@ -140,6 +140,19 @@ Sugent 按「外环私人幕僚（[`docs/PHILOSOPHY.md`](./PHILOSOPHY.md)）× �
 
 ---
 
+### Wave P5（第 15–16 周 · 规划待启动）：立体记忆原生归一、全表面参谋倍增与校准评测飞轮
+
+**战役目标**：消灭 Wave P4+ 遗留的双图谱搬运税与 E2EE 同步失真，把语义/同义词混合重排、原话证据反查、园丁「睡眠重整」、微信 3s/Dropzone 全表面参谋与 `M5` 外事隔离全部闭环，并以 `TPR/TNR` 校准的二元 LLM Judge 建成可信持续评测飞轮。完整实施方案见 [`2026-11-28 Wave P5 方案`](./plans/2026-11-28-p5-holistic-memory-elevation-and-calibrated-evals.md)。
+
+- [ ] **P5.1 [AI] 原生单一图谱收口与全平面无损 E2EE 漫游**：`PostTurnDigester` 直写 `StereoscopicAtlas` 原生平面；升级 `e2ee-sync.ts` / `p2-host-service.ts` 支持 `SyncableAtlasSnapshot v2`（含五平面属性、`principalAcl`、桥边与 `mind-journal.json`）。
+- [ ] **P5.2 [AI] 混合语义-词法重排（RRF）与 `S0 -> S3` 原话溯源**：内置中英领域同义词扩召 + `atlas.db` 可选 BYOK 向量 RRF 融合 + 认知阶差异化时间半衰期；打通 `ChatTranscriptRecall` `derived_from_episode` 原话证据反查边。
+- [ ] **P5.3 [AI] 全表面参谋联动与 `M5` 外事接待半透膜**：打通 `Dropzone.handleAdvise` 与微信 3 秒转发参谋直读 `domain_work`/`self_core`；落地 `concierge_envoy` 外事脱敏品味注入与全金丝雀隔离门禁。
+- [ ] **P5.4 [AI] 双轨隐式认知消化与园丁「睡眠重整」引擎**：基于 `assessor` 角色增量捕获委婉/隐式反馈印证与证伪；升级 `MemoryGardener` 直连 `Atlas` 执行同主题自动结晶、互斥消歧卡推送与过期清理。
+- [ ] **P5.5 [AI] 双人自动晶化、`M3` 护窗与跨仓真实联调**：`duo/converse` 防抖自动提炼待点亮星晶；`proactive-cadence.ts` 在 `M3` 共处留白窗自动延后工作推送；补齐 `bigfive-duo-site` 联调契约校验。
+- [ ] **P5.6 [AI] 三层评测飞轮（65+ 场景 + Trace + 校准二元 Judge）**：扩充 `eval:memory` 至 65+ 场景并沉淀多日脱敏 Trace 黄金集；针对记忆忠实度、忠诚异议与双人中立度落地 `train/dev/test` 切分的二元 Judge（`TPR/TNR >= 0.85` + Rogan-Gladen 校正）。
+
+---
+
 ## 三、长期架构纪律（Permanent Guardrails）
 
 1. **不做低毛利算力二道贩子**：永久保留 `mode: "none"` 免登录离线主权模式与零门槛 BYOK 接入，商业化只向「跨端加密连续性、外出移动中继与高确定性垂直领域武器包」要溢价。
