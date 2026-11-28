@@ -1,7 +1,15 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { looksSecret } from "../agent/memory.js";
 import { eventText, type InboundEvent } from "../core/types.js";
+import {
+  MembraneError,
+  assertZeroCanaryLeak,
+  distillConciergeEnvoyCapsule,
+  guardConciergeOutboundText,
+  renderConciergeEnvoyPromptBlock,
+} from "./cognitive-membrane.js";
 import type {
   ConciergeCloudMode,
   ConciergeIntentCategory,
@@ -27,6 +35,8 @@ import {
 } from "./concierge-subgraph.js";
 import type { SugentKnowledgeGraph } from "./knowledge-graph.js";
 import { OpcConciergeOrchestrator, type ConciergeRouteOutcome } from "./opc-concierge.js";
+import type { EpistemicDigestionLoop } from "./silicon-identity-core.js";
+import type { StereoscopicAtlas } from "./stereoscopic-atlas.js";
 import type { StewardshipLedger } from "./stewardship-ledger.js";
 
 export interface ConciergeAssessorEndpoint {
@@ -65,6 +75,8 @@ export interface ConciergeChannelBridgeOptions {
   dataDir: string;
   knowledgeGraph: SugentKnowledgeGraph;
   ledger?: StewardshipLedger;
+  mindLoop?: Pick<EpistemicDigestionLoop, "getCalibratedLessons">;
+  atlas?: Pick<StereoscopicAtlas, "recallStereoscopic">;
   resolveAssessorEndpoint?: () => ConciergeAssessorEndpoint | undefined;
   fetchImpl?: typeof fetch;
   resolveActorRole: (params: {
@@ -160,11 +172,48 @@ function buildLocalDeterministicAssessor(ownerDisplayName: string): ConciergeMod
   };
 }
 
+const M5_LOCAL_FS_PATH_RE = /(?:\/Users\/[^\s"'，。；;)]+|\/home\/[^\s"'，。；;)]+|[A-Za-z]:\\[^\s"'，。；;)]+)/g;
+const M5_FS_PREFIX_RE = /(?:\/Users\/|\/home\/|[A-Za-z]:\\)/;
+
+function readSenderIdFromSealedFile(filePath: string): string | undefined {
+  try {
+    const sealedContent = fs.readFileSync(filePath, "utf8");
+    const senderMatch = /^>\s*sender_id:\s*(.+)$/m.exec(sealedContent);
+    return senderMatch?.[1]?.trim() || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function extractPeerHintsFromAtlasSummary(summary: string): { preferences: string[]; taboos: string[] } {
+  const preferences: string[] = [];
+  const taboos: string[] = [];
+  const tabooMatch = /(?:忌讳|禁忌|taboos?)\s*[:：]\s*([^；;\n]+?)(?=\s*[；;]?\s*(?:偏好|喜好|preferences?)\s*[:：]|$)/i.exec(
+    summary,
+  );
+  if (tabooMatch?.[1]) {
+    for (const item of tabooMatch[1].split(/[/、，,；;]+/)) {
+      if (item.trim()) taboos.push(item.trim());
+    }
+  }
+  const prefMatch = /(?:偏好|喜好|沟通风格|preferences?)\s*[:：]\s*([^；;\n]+)/i.exec(summary);
+  if (prefMatch?.[1]) {
+    for (const item of prefMatch[1].split(/[/、，,；;]+/)) {
+      if (item.trim()) preferences.push(item.trim());
+    }
+  } else if (!tabooMatch) {
+    preferences.push(summary);
+  }
+  return { preferences, taboos };
+}
+
 export class ConciergeChannelBridge {
   private readonly configPath: string;
   private readonly workspaceDir: string;
   private readonly knowledgeGraph: SugentKnowledgeGraph;
   private ledger?: StewardshipLedger;
+  private mindLoop?: Pick<EpistemicDigestionLoop, "getCalibratedLessons">;
+  private atlas?: Pick<StereoscopicAtlas, "recallStereoscopic">;
   private readonly resolveAssessorEndpoint?: () => ConciergeAssessorEndpoint | undefined;
   private readonly fetchImpl: typeof fetch;
   private readonly resolveActorRoleFn: ConciergeChannelBridgeOptions["resolveActorRole"];
@@ -183,6 +232,8 @@ export class ConciergeChannelBridge {
     this.workspaceDir = path.join(options.dataDir, "concierge-workspace");
     this.knowledgeGraph = options.knowledgeGraph;
     this.ledger = options.ledger;
+    this.mindLoop = options.mindLoop;
+    this.atlas = options.atlas;
     this.resolveAssessorEndpoint = options.resolveAssessorEndpoint;
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.resolveActorRoleFn = options.resolveActorRole;
@@ -237,6 +288,191 @@ export class ConciergeChannelBridge {
     fs.renameSync(tmp, this.configPath);
   }
 
+  collectOwnerPrivateCanaryTokens(excludePeerId?: string): string[] {
+    const tokens = new Set<string>();
+    const snap = this.ledger?.snapshotForCaller("owner_private");
+    const currentPeerRel = excludePeerId
+      ? snap?.relationships.find(
+          (r) => r.id === excludePeerId || r.id === `rel:${excludePeerId}` || r.name === excludePeerId,
+        )
+      : undefined;
+
+    const excludedLower = new Set<string>(
+      [
+        excludePeerId ?? "",
+        currentPeerRel?.name ?? "",
+        this.config.ownerDisplayName,
+        "sugent",
+        "default",
+        "weixin",
+        "feishu",
+        "owner",
+        "主理人",
+      ]
+        .map((s) => s.trim().toLowerCase())
+        .filter(Boolean),
+    );
+
+    const addCanary = (raw: string | undefined, minLen = 3) => {
+      const clean = String(raw ?? "").trim();
+      if (clean.length < minLen) return;
+      if (excludedLower.has(clean.toLowerCase())) return;
+      tokens.add(clean);
+    };
+
+    const addExtractedFromText = (text: string | undefined) => {
+      if (!text) return;
+      for (const tok of extractConfidentialTokens(text)) {
+        addCanary(tok, 4);
+      }
+      for (const p of text.match(M5_LOCAL_FS_PATH_RE) ?? []) {
+        addCanary(p, 4);
+      }
+      for (const qm of text.matchAll(/「([^」]{4,})」/g)) {
+        addCanary(qm[1], 4);
+      }
+    };
+
+    if (snap) {
+      for (const gr of snap.guardrails) {
+        addExtractedFromText(gr.statement);
+        addExtractedFromText(gr.evidenceSource);
+        if (gr.kind !== "soft_taste" || gr.partition === "personal_life") {
+          addCanary(gr.statement, 4);
+        }
+      }
+      for (const goal of snap.goals) {
+        addCanary(goal.title, 4);
+        addExtractedFromText(`${goal.title} ${goal.northStarCriterion}`);
+      }
+      for (const res of snap.resources) {
+        if (res.localUriOrPath) addCanary(res.localUriOrPath, 4);
+        if (res.partition === "personal_life") addCanary(res.title, 4);
+        addExtractedFromText(res.title);
+        for (const [k, v] of Object.entries(res.metadata ?? {})) {
+          if (typeof v === "string") {
+            addExtractedFromText(v);
+            if (/(?:canary|secret|private|floor|password|token)/i.test(k)) {
+              addCanary(v, 3);
+            }
+          } else if (typeof v === "number" && /floorprice/i.test(k) && Number.isFinite(v)) {
+            if (/wan/i.test(k)) {
+              addCanary(`${v}万`, 2);
+              addCanary(`${v} 万`, 3);
+            } else if (String(v).length >= 4) {
+              addCanary(String(v), 4);
+            }
+          }
+        }
+      }
+      for (const c of snap.commitments) {
+        if (c.partition === "cowork_shared") continue;
+        addCanary(c.summary, 4);
+        if (!/^(?:我|本人|owner|me)$/i.test(c.counterpartyOrRef.trim())) {
+          addCanary(c.counterpartyOrRef, 3);
+        }
+        addExtractedFromText(`${c.summary} ${c.counterpartyOrRef}`);
+      }
+      for (const rel of snap.relationships) {
+        const relJoined = [rel.name, ...rel.taboos, ...rel.preferences, ...rel.openFavors].join(" ");
+        if (currentPeerRel && rel.id === currentPeerRel.id) {
+          for (const tok of extractConfidentialTokens(relJoined)) {
+            if (/(?:canary|secret|floor|private|key|token)/i.test(tok)) {
+              addCanary(tok, 4);
+            }
+          }
+        } else {
+          addCanary(rel.name, 2);
+          addExtractedFromText(relJoined);
+        }
+      }
+    }
+
+    if (this.atlas) {
+      const ownerLifeRecall = this.atlas.recallStereoscopic("", {
+        planes: ["owner_life"],
+        callerPrincipals: ["sugent_self", "owner:M"],
+        maxNodes: 30,
+      });
+      for (const node of ownerLifeRecall.nodes) {
+        addCanary(node.name, 4);
+        addExtractedFromText(`${node.name} ${node.summary}`);
+      }
+    }
+
+    if (this.mindLoop) {
+      const privateSurfaceLessons = this.mindLoop.getCalibratedLessons(20, {
+        surfaces: ["im_owner", "duo_mediator", "steward_hub", "coding_orchestrator"],
+      });
+      for (const lesson of privateSurfaceLessons) {
+        addExtractedFromText(lesson);
+      }
+    }
+
+    return Array.from(tokens);
+  }
+
+  private assertOutboundPeerPayloadSafe(peerId: string, text: string): void {
+    const ownerCanaries = this.collectOwnerPrivateCanaryTokens(peerId);
+    const isExplicitAssistant = text.includes("的数字助理 Sugent 协办]");
+    if (isExplicitAssistant) {
+      guardConciergeOutboundText(text, ownerCanaries);
+      return;
+    }
+    const trimmed = String(text ?? "").trim();
+    if (looksSecret(trimmed)) {
+      throw new MembraneError("MEMBRANE_CANARY_LEAK", "Secret pattern detected in outbound concierge message");
+    }
+    if (M5_FS_PREFIX_RE.test(trimmed)) {
+      throw new MembraneError("MEMBRANE_CANARY_LEAK", "Local filesystem path detected in outbound concierge message");
+    }
+    const lower = trimmed.toLowerCase();
+    for (const rawTok of ownerCanaries) {
+      const clean = rawTok.trim();
+      if (clean.length >= 2 && lower.includes(clean.toLowerCase())) {
+        throw new MembraneError("MEMBRANE_CANARY_LEAK", "Owner private canary token detected in outbound concierge message");
+      }
+    }
+  }
+
+  private sanitizeAssessmentWithM5(
+    out: ModelAssessmentRawOutput,
+    senderId?: string,
+  ): ModelAssessmentRawOutput {
+    const ownerCanaries = this.collectOwnerPrivateCanaryTokens(senderId);
+    const checkDraftSafe = (draft: string, strictCurrency: boolean): boolean => {
+      try {
+        if (strictCurrency) {
+          guardConciergeOutboundText(draft, ownerCanaries);
+          return true;
+        }
+        if (looksSecret(draft) || M5_FS_PREFIX_RE.test(draft)) return false;
+        const lower = draft.toLowerCase();
+        return !ownerCanaries.some((c) => c.trim().length >= 2 && lower.includes(c.trim().toLowerCase()));
+      } catch {
+        return false;
+      }
+    };
+
+    const safeDraftA = checkDraftSafe(out.draftA, true)
+      ? out.draftA
+      : "收到您的消息，我先核对一下当前项目排期与具体范围，稍后详细回复您。";
+    const safeDraftB = checkDraftSafe(out.draftB, true)
+      ? out.draftB
+      : "您好，您的需求我已收到，今天内整理好相关流程与合作方式发您对齐。";
+    const safeAutoReply =
+      out.autoReplyDraft && checkDraftSafe(out.autoReplyDraft, true)
+        ? out.autoReplyDraft
+        : undefined;
+
+    return {
+      ...out,
+      draftA: safeDraftA,
+      draftB: safeDraftB,
+      ...(safeAutoReply ? { autoReplyDraft: safeAutoReply } : { autoReplyDraft: undefined }),
+    };
+  }
+
   private createTransportProxy(): OutboundChannelTransport {
     return {
       notifyOwner: async (channel, text, feishuCardPayload) => {
@@ -247,6 +483,7 @@ export class ConciergeChannelBridge {
         await this.defaultTransport.notifyOwner(channel, text, feishuCardPayload);
       },
       sendPeerDirectMessage: async (channel, peerId, text) => {
+        this.assertOutboundPeerPayloadSafe(peerId, text);
         const overridePeerFn =
           this.transportOverride?.sendPeerDirectMessage ?? this.transportOverride?.sendToPeer;
         if (overridePeerFn) {
@@ -291,7 +528,8 @@ export class ConciergeChannelBridge {
       getSuspendedRound: (cardId) => this.suspendedRounds.get(cardId),
     };
 
-    const graphPort = createSugentGraphRecallAdapter(this.knowledgeGraph, (graphInstance) => {
+    const graphPort = createSugentGraphRecallAdapter(this.knowledgeGraph, (graphInstance, anchorId) => {
+      const currentPeerId = anchorId.startsWith("peer:") ? anchorId.slice("peer:".length) : anchorId;
       const snap = graphInstance.recallSubgraph("", 2, 500);
       const nodes: KnowledgeGraphNodeLike[] = [];
       const seenNodeIds = new Set<string>();
@@ -314,7 +552,7 @@ export class ConciergeChannelBridge {
           const relNodeId = `rel:${rel.id}`;
           if (seenNodeIds.has(relNodeId)) continue;
           seenNodeIds.add(relNodeId);
-          const detail = [
+          const rawDetail = [
             rel.roleTag,
             ...(rel.taboos.length ? [`忌讳:${rel.taboos.join("/")}`] : []),
             ...(rel.preferences.length ? [`偏好:${rel.preferences.join("/")}`] : []),
@@ -326,10 +564,21 @@ export class ConciergeChannelBridge {
             label: rel.name,
             kind: "person",
             peerScope: rel.id,
-            summary: detail || rel.name,
-            confidentialTokens: extractConfidentialTokens(detail),
+            summary: rel.roleTag || rel.name,
+            confidentialTokens: extractConfidentialTokens(rawDetail),
           });
         }
+      }
+      const ownerCanaries = this.collectOwnerPrivateCanaryTokens(currentPeerId);
+      if (ownerCanaries.length > 0) {
+        nodes.push({
+          id: "membrane:m5:owner_private_vault",
+          label: "__m5_owner_private_vault__",
+          kind: "vault",
+          peerScope: "__owner_private_vault__",
+          summary: "M5 owner private canary vault",
+          confidentialTokens: ownerCanaries,
+        });
       }
       const edges: KnowledgeGraphEdgeLike[] = snap.activeEdges
         .filter((e) => seenNodeIds.has(e.from) && seenNodeIds.has(e.to))
@@ -344,15 +593,18 @@ export class ConciergeChannelBridge {
     const fallbackAssessor = buildLocalDeterministicAssessor(this.config.ownerDisplayName);
     const modelPort: ConciergeModelPort = {
       generateAssessment: async (req) => {
+        const senderId = readSenderIdFromSealedFile(req.untrustedContextFilePath);
         if (this.modelPortOverride) {
-          return this.modelPortOverride.generateAssessment(req);
+          const overridden = await this.modelPortOverride.generateAssessment(req);
+          return this.sanitizeAssessmentWithM5(overridden, senderId);
         }
         const endpoint = this.resolveAssessorEndpoint?.();
         if (endpoint?.baseUrl && endpoint?.model) {
           const live = await this.callAssessorEndpoint(endpoint, req);
           if (live) return live;
         }
-        return fallbackAssessor.generateAssessment(req);
+        const fallbackOut = await fallbackAssessor.generateAssessment(req);
+        return this.sanitizeAssessmentWithM5(fallbackOut, senderId);
       },
     };
 
@@ -378,27 +630,66 @@ export class ConciergeChannelBridge {
       const sealedContent = fs.readFileSync(req.untrustedContextFilePath, "utf8");
       const senderMatch = /^>\s*sender_id:\s*(.+)$/m.exec(sealedContent);
       const senderId = senderMatch?.[1]?.trim();
-      let ledgerHints = "";
+      const ownerCanaries = this.collectOwnerPrivateCanaryTokens(senderId);
+
+      const peerPreferences: string[] = [];
+      const peerTaboos: string[] = [];
       if (this.ledger && senderId) {
         const rel = this.ledger
           .snapshotForCaller("owner_private")
           .relationships.find((r) => r.id === senderId || r.id === `rel:${senderId}` || r.name === senderId);
-        if (rel && (rel.taboos.length > 0 || rel.preferences.length > 0)) {
-          ledgerHints = [
-            rel.taboos.length ? `联系人禁忌 (Taboos): ${rel.taboos.join("；")}` : "",
-            rel.preferences.length ? `沟通偏好 (Preferences): ${rel.preferences.join("；")}` : "",
-          ]
-            .filter(Boolean)
-            .join("\n");
+        if (rel) {
+          peerPreferences.push(...rel.preferences);
+          peerTaboos.push(...rel.taboos);
         }
       }
+      if (this.atlas && senderId) {
+        const recalled = this.atlas.recallStereoscopic(senderId, {
+          callerPrincipals: ["sugent_self", "owner:M", `peer:${senderId}`],
+          maxNodes: 8,
+        });
+        for (const node of recalled.nodes) {
+          if (
+            node.plane === `relational:peer:${senderId}` ||
+            (node.plane.startsWith("relational:peer:") &&
+              (node.id.includes(senderId) || node.name === senderId))
+          ) {
+            const extracted = extractPeerHintsFromAtlasSummary(node.summary);
+            peerPreferences.push(...extracted.preferences);
+            peerTaboos.push(...extracted.taboos);
+          }
+        }
+      }
+
+      const m5Capsule = distillConciergeEnvoyCapsule({
+        peerId: senderId || "external_peer",
+        peerPreferences,
+        peerTaboos,
+        ...(this.mindLoop ? { mindLoop: this.mindLoop } : {}),
+        forbiddenCanaryTokens: ownerCanaries,
+      });
+      const m5PromptBlock = renderConciergeEnvoyPromptBlock(m5Capsule, ownerCanaries);
+
+      let safePeerBrief = req.peerScopedBrief;
+      try {
+        assertZeroCanaryLeak(safePeerBrief, ownerCanaries);
+      } catch {
+        safePeerBrief = "已隔离对端基础身份（敏感字段由 M5 半透膜阻断）";
+      }
+
       const systemPrompt = [
-        req.systemInstruction,
+        req.systemInstruction.replace(req.untrustedContextFilePath, ".context/sealed-event.md"),
         '只输出一行合法 JSON: {"intentCategory":"appointment_scheduling|standard_brochure|ticket_intake|high_risk_escalation|general_inquiry","summary":"要点","draftA":"稳健拟稿","draftB":"积极拟稿","autoReplyDraft":"可选"}',
       ].join("\n");
+
+      const peerSafeCanaries = ownerCanaries.filter(
+        (tok) => tok.trim().toLowerCase() !== (senderId ?? "").toLowerCase(),
+      );
+      assertZeroCanaryLeak(`${systemPrompt}\n\n${safePeerBrief}\n\n${m5PromptBlock}`, peerSafeCanaries);
+
       const userPrompt = [
-        `隔离后客户背景: ${req.peerScopedBrief}`,
-        ...(ledgerHints ? [ledgerHints] : []),
+        `隔离后客户背景: ${safePeerBrief}`,
+        m5PromptBlock,
         "只读外部语料:",
         sealedContent,
       ].join("\n\n");
@@ -439,15 +730,18 @@ export class ConciergeChannelBridge {
       if (typeof parsed.summary !== "string" || typeof parsed.draftA !== "string" || typeof parsed.draftB !== "string") {
         return undefined;
       }
-      return {
-        intentCategory,
-        summary: parsed.summary.trim(),
-        draftA: parsed.draftA.trim(),
-        draftB: parsed.draftB.trim(),
-        ...(typeof parsed.autoReplyDraft === "string" && parsed.autoReplyDraft.trim()
-          ? { autoReplyDraft: parsed.autoReplyDraft.trim() }
-          : {}),
-      };
+      return this.sanitizeAssessmentWithM5(
+        {
+          intentCategory,
+          summary: parsed.summary.trim(),
+          draftA: parsed.draftA.trim(),
+          draftB: parsed.draftB.trim(),
+          ...(typeof parsed.autoReplyDraft === "string" && parsed.autoReplyDraft.trim()
+            ? { autoReplyDraft: parsed.autoReplyDraft.trim() }
+            : {}),
+        },
+        senderId,
+      );
     } catch {
       return undefined;
     }
@@ -463,6 +757,14 @@ export class ConciergeChannelBridge {
 
   attachLedger(ledger: StewardshipLedger): void {
     this.ledger = ledger;
+  }
+
+  attachMindLoop(mindLoop: Pick<EpistemicDigestionLoop, "getCalibratedLessons">): void {
+    this.mindLoop = mindLoop;
+  }
+
+  attachAtlas(atlas: Pick<StereoscopicAtlas, "recallStereoscopic">): void {
+    this.atlas = atlas;
   }
 
   isEnabled(): boolean {

@@ -44,26 +44,33 @@ describe("Wave P4 Quantitative Capability Benchmark & Multi-Day Host Lifecycle",
     }
   });
 
-  it("proves measurable RAG & security lift over Baseline across 40 controlled scenarios", async () => {
+  it("proves measurable RAG & security lift over Baseline across 65+ controlled scenarios", async () => {
     const report = await runMemoryCapabilityBenchmark();
 
-    expect(report.totalScenarios).toBe(40);
+    expect(report.totalScenarios).toBeGreaterThanOrEqual(65);
+    expect(report.suiteA.p4.recallAt5).toBeGreaterThanOrEqual(0.99);
     expect(report.suiteA.p4.mrr).toBeGreaterThan(report.suiteA.baseline.mrr);
     expect(report.suiteA.p4.ndcgAt5).toBeGreaterThan(report.suiteA.baseline.ndcgAt5);
-    expect(report.suiteA.p4.twoHopRecallAt5).toBeGreaterThanOrEqual(0.95);
+    expect(report.suiteA.p4.twoHopRecallAt5).toBe(1);
     expect(report.suiteA.p4.maxNodesRespected).toBe(true);
     expect(report.suiteA.baseline.maxNodesRespected).toBe(false);
 
     expect(report.suiteB.p4.zombieLeakRate).toBe(0);
     expect(report.suiteB.p4.latestFactTop1Rate).toBe(1);
+    expect(report.suiteB.p4.e2eeV2RetentionRate).toBe(1);
+    expect(report.p5Metrics.e2eeV2RetentionRate).toBe(1);
     expect(report.suiteB.baseline.zombieLeakRate).toBeGreaterThan(0.5);
 
     expect(report.suiteC.p4.selfCorrectionHitRate).toBe(1);
+    expect(report.suiteC.p4.implicitFeedbackHitRate).toBeGreaterThanOrEqual(0.9);
+    expect(report.p5Metrics.implicitFeedbackHitRate).toBeGreaterThanOrEqual(0.9);
     expect(report.suiteC.baseline.selfCorrectionHitRate).toBe(0);
     expect(report.suiteC.p4.dissentRecall).toBe(1);
     expect(report.suiteC.p4.dissentPrecision).toBe(1);
 
     expect(report.suiteD.p4.crossSurfaceHitRate).toBe(1);
+    expect(report.suiteD.p4.advisoryCrossPlaneHitRate).toBe(1);
+    expect(report.p5Metrics.advisoryCrossPlaneHitRate).toBe(1);
     expect(report.suiteD.p4.briefDomainWorkCount).toBeGreaterThan(0);
 
     expect(report.suiteE.p4Membrane.canaryLeakRate).toBe(0);

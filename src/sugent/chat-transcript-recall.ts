@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -35,6 +36,7 @@ export interface DirectStewardTurnRecordResult {
   recorded: boolean;
   deduplicated: boolean;
   filePath: string;
+  episodeId?: string;
 }
 
 export interface StoredWebTurnRecord {
@@ -43,6 +45,7 @@ export interface StoredWebTurnRecord {
   role: TranscriptRole;
   content: string;
   createdAtMs: number;
+  episodeId?: string;
 }
 
 export interface HydrateRecentPeerHistoryInput {
@@ -74,6 +77,7 @@ export interface ChatHistoryRecallItem {
   channel: string;
   role: TranscriptRole;
   snippet: string;
+  episodeId?: string;
 }
 
 export interface ChatHistoryRecallResult {
@@ -82,6 +86,20 @@ export interface ChatHistoryRecallResult {
   windowEndIso: string;
   totalMatched: number;
   channelsCovered: string[];
+  items: ChatHistoryRecallItem[];
+}
+
+export interface LookupEpisodeContextInput {
+  episodeId?: string;
+  atIso?: string;
+  channel?: RecallChannelFilter;
+  queryHint?: string;
+  windowMinutes?: number;
+  callerPrincipal?: string;
+}
+
+export interface LookupEpisodeContextResult {
+  allowed: boolean;
   items: ChatHistoryRecallItem[];
 }
 
@@ -94,6 +112,8 @@ interface InternalTurn {
   rawContent: string;
   createdAtMs: number;
   seq: number;
+  episodeId: string;
+  altEpisodeIds?: string[];
 }
 
 const API_KEY_PATTERN = /\b(?:sk|clikey|cpa-admin|tok|emp)-[A-Za-z0-9_-]{8,}\b/g;
@@ -194,6 +214,18 @@ export function redactTranscriptSecrets(text: string): string {
     .replace(API_KEY_PATTERN, "[REDACTED_KEY]")
     .replace(URL_TOKEN_PATTERN, "$1[REDACTED]")
     .replace(BEARER_TOKEN_PATTERN, "$1[REDACTED_KEY]");
+}
+
+export function buildEpisodeAnchorId(params: {
+  channel: string;
+  createdAtMs: number;
+  content: string;
+}): string {
+  const channel = String(params.channel ?? "web_ui").trim().toLowerCase() || "web_ui";
+  const createdAtMs = Math.trunc(Number(params.createdAtMs) || 0);
+  const content = String(params.content ?? "");
+  const hash8 = crypto.createHash("sha256").update(content, "utf8").digest("hex").slice(0, 8);
+  return `ep:${channel}:${createdAtMs}:${hash8}`;
 }
 
 function parseChineseCount(raw: string): number | undefined {
@@ -355,6 +387,34 @@ function selectTimeBrowseSlice(
   return mergedTurns.slice(-limit);
 }
 
+function expandPairedContextIndices(turns: readonly InternalTurn[], hitIndices: ReadonlySet<number>): number[] {
+  const expanded = new Set<number>(hitIndices);
+  for (const idx of hitIndices) {
+    const cur = turns[idx];
+    if (!cur) continue;
+    if (cur.role === "user" && idx + 1 < turns.length) {
+      const nxt = turns[idx + 1]!;
+      if (
+        nxt.conversationKey === cur.conversationKey &&
+        nxt.role === "assistant" &&
+        nxt.createdAtMs - cur.createdAtMs <= PAIR_CONTEXT_MAX_GAP_MS
+      ) {
+        expanded.add(idx + 1);
+      }
+    } else if (cur.role === "assistant" && idx - 1 >= 0) {
+      const prv = turns[idx - 1]!;
+      if (
+        prv.conversationKey === cur.conversationKey &&
+        prv.role === "user" &&
+        cur.createdAtMs - prv.createdAtMs <= PAIR_CONTEXT_MAX_GAP_MS
+      ) {
+        expanded.add(idx - 1);
+      }
+    }
+  }
+  return Array.from(expanded).sort((a, b) => a - b);
+}
+
 export class ChatTranscriptRecallService {
   private readonly dataDir: string;
   private readonly explicitDb: DatabaseSync | undefined;
@@ -376,23 +436,42 @@ export class ChatTranscriptRecallService {
     return this.explicitDb ?? this.getDbFn?.();
   }
 
-  private hasDuplicateInSqlite(channel: string, role: TranscriptRole, rawContent: string, createdAtMs: number): boolean {
+  private findDuplicateInSqlite(
+    channel: string,
+    role: TranscriptRole,
+    rawContent: string,
+    createdAtMs: number,
+  ): { duplicated: boolean; episodeId?: string } {
     const db = this.resolveDb();
-    if (!db) return false;
+    if (!db) return { duplicated: false };
     try {
       const dbChannel = channel === "web_ui" ? "web" : channel;
       const row = db
         .prepare(
-          `SELECT m.id FROM messages m
+          `SELECT m.id, m.created_at, c.channel FROM messages m
            JOIN conversations c ON c.id = m.conversation_id
            WHERE c.channel = ? AND m.role = ? AND m.content = ?
              AND ABS(m.created_at - ?) <= ?
            LIMIT 1`,
         )
-        .get(dbChannel, role, rawContent, createdAtMs, DEDUP_WINDOW_MS) as { id?: number } | undefined;
-      return Boolean(row?.id);
+        .get(dbChannel, role, rawContent, createdAtMs, DEDUP_WINDOW_MS) as
+        | { id?: number; created_at?: number; channel?: string }
+        | undefined;
+      if (row?.id) {
+        const resolvedCh = row.channel ?? dbChannel;
+        const resolvedTs = typeof row.created_at === "number" ? row.created_at : createdAtMs;
+        return {
+          duplicated: true,
+          episodeId: buildEpisodeAnchorId({
+            channel: resolvedCh,
+            createdAtMs: resolvedTs,
+            content: rawContent,
+          }),
+        };
+      }
+      return { duplicated: false };
     } catch {
-      return false;
+      return { duplicated: false };
     }
   }
 
@@ -405,9 +484,16 @@ export class ChatTranscriptRecallService {
     const createdAtMs = input.createdAtMs ?? this.nowMsFn();
     const channel = String(input.channel ?? "web_ui").trim().toLowerCase() || "web_ui";
     const peerId = String(input.peerId ?? "owner").trim() || "owner";
+    const episodeId = buildEpisodeAnchorId({ channel, createdAtMs, content: rawContent });
 
-    if (this.hasDuplicateInSqlite(channel, input.role, rawContent, createdAtMs)) {
-      return { recorded: false, deduplicated: true, filePath };
+    const dup = this.findDuplicateInSqlite(channel, input.role, rawContent, createdAtMs);
+    if (dup.duplicated) {
+      return {
+        recorded: false,
+        deduplicated: true,
+        filePath,
+        episodeId: dup.episodeId ?? episodeId,
+      };
     }
 
     const dir = path.dirname(filePath);
@@ -418,6 +504,7 @@ export class ChatTranscriptRecallService {
       role: input.role,
       content: redactTranscriptSecrets(rawContent),
       createdAtMs,
+      episodeId,
     };
     fs.appendFileSync(filePath, `${JSON.stringify(record)}\n`, { encoding: "utf8", mode: 0o600 });
     try {
@@ -425,7 +512,7 @@ export class ChatTranscriptRecallService {
     } catch {
       // ignore chmod on unsupported fs
     }
-    return { recorded: true, deduplicated: false, filePath };
+    return { recorded: true, deduplicated: false, filePath, episodeId };
   }
 
   private readDirectWebTurns(): StoredWebTurnRecord[] {
@@ -443,12 +530,23 @@ export class ChatTranscriptRecallService {
             typeof rec.content === "string" &&
             typeof rec.createdAtMs === "number"
           ) {
+            const channel = typeof rec.channel === "string" ? rec.channel : "web_ui";
+            const redacted = redactTranscriptSecrets(rec.content);
+            const episodeId =
+              typeof rec.episodeId === "string" && rec.episodeId.trim()
+                ? rec.episodeId.trim()
+                : buildEpisodeAnchorId({
+                    channel,
+                    createdAtMs: rec.createdAtMs,
+                    content: redacted,
+                  });
             out.push({
-              channel: typeof rec.channel === "string" ? rec.channel : "web_ui",
+              channel,
               peerId: typeof rec.peerId === "string" ? rec.peerId : "owner",
               role: rec.role,
-              content: redactTranscriptSecrets(rec.content),
+              content: redacted,
               createdAtMs: rec.createdAtMs,
+              episodeId,
             });
           }
         } catch {
@@ -558,30 +656,25 @@ export class ChatTranscriptRecallService {
     return { hasAnyOwnerConfig, allowedByChannel };
   }
 
-  recallChatHistory(input: RecallChatHistoryInput = {}): ChatHistoryRecallResult {
-    const nowMs = input.nowMs ?? this.nowMsFn();
-    const rawQuery = String(input.query ?? "").trim();
-    const ownerOnly = input.ownerOnly !== false;
-    const channelFilter: RecallChannelFilter = input.channel ?? "all";
-    const limit = Math.min(MAX_RECALL_LIMIT, Math.max(1, input.limit ?? DEFAULT_RECALL_LIMIT));
-
-    const daysBack = input.daysBack ?? resolveImplicitDaysBack(rawQuery);
-    const startMs =
-      input.sinceIso && Number.isFinite(Date.parse(input.sinceIso))
-        ? Date.parse(input.sinceIso)
-        : nowMs - Math.max(1, daysBack) * DAY_MS;
-    const endMs =
-      input.untilIso && Number.isFinite(Date.parse(input.untilIso))
-        ? Date.parse(input.untilIso)
-        : nowMs + 60_000;
-
+  private collectTurns(params: {
+    startMs: number;
+    endMs: number;
+    channelFilter: RecallChannelFilter;
+    ownerOnly: boolean;
+    allowWebChannelAlias?: boolean;
+  }): InternalTurn[] {
+    const { startMs, endMs, channelFilter, ownerOnly, allowWebChannelAlias } = params;
     const turns: InternalTurn[] = [];
     let seqCounter = 0;
 
     const db = this.resolveDb();
-    if (db && channelFilter !== "web_ui") {
+    const shouldQuerySqlite =
+      channelFilter !== "web_ui" || Boolean(allowWebChannelAlias);
+    if (db && shouldQuerySqlite) {
       try {
-        const ownerInfo = ownerOnly ? this.resolveOwnerPeers(db) : { hasAnyOwnerConfig: false, allowedByChannel: new Map<string, Set<string>>() };
+        const ownerInfo = ownerOnly
+          ? this.resolveOwnerPeers(db)
+          : { hasAnyOwnerConfig: false, allowedByChannel: new Map<string, Set<string>>() };
         const rows = db
           .prepare(
             `SELECT m.id, m.conversation_id, m.role, m.content, m.created_at, c.channel, c.peer_id, c.kind
@@ -604,7 +697,12 @@ export class ChatTranscriptRecallService {
         }>;
 
         for (const r of rows) {
-          if (channelFilter !== "all" && r.channel !== channelFilter) continue;
+          if (channelFilter !== "all") {
+            const channelMatches =
+              r.channel === channelFilter ||
+              (Boolean(allowWebChannelAlias) && channelFilter === "web_ui" && r.channel === "web");
+            if (!channelMatches) continue;
+          }
           if (ownerOnly && r.channel !== "web" && ownerInfo.hasAnyOwnerConfig) {
             const allowedPeers = ownerInfo.allowedByChannel.get(r.channel);
             if (!allowedPeers?.has(r.peer_id)) continue;
@@ -612,6 +710,37 @@ export class ChatTranscriptRecallService {
           const redacted = redactTranscriptSecrets(r.content);
           if (!redacted.trim()) continue;
           seqCounter += 1;
+          const rawTrimmed = r.content.trim();
+          const primaryEpId = buildEpisodeAnchorId({
+            channel: r.channel,
+            createdAtMs: r.created_at,
+            content: rawTrimmed,
+          });
+          const altSet = new Set<string>();
+          altSet.add(
+            buildEpisodeAnchorId({
+              channel: r.channel,
+              createdAtMs: r.created_at,
+              content: r.content,
+            }),
+          );
+          altSet.add(
+            buildEpisodeAnchorId({
+              channel: r.channel,
+              createdAtMs: r.created_at,
+              content: redacted,
+            }),
+          );
+          if (r.channel === "web") {
+            altSet.add(
+              buildEpisodeAnchorId({
+                channel: "web_ui",
+                createdAtMs: r.created_at,
+                content: rawTrimmed,
+              }),
+            );
+          }
+          altSet.delete(primaryEpId);
           turns.push({
             conversationKey: r.conversation_id,
             channel: r.channel,
@@ -621,6 +750,8 @@ export class ChatTranscriptRecallService {
             rawContent: r.content,
             createdAtMs: r.created_at,
             seq: seqCounter,
+            episodeId: primaryEpId,
+            ...(altSet.size > 0 ? { altEpisodeIds: Array.from(altSet) } : {}),
           });
         }
       } catch {
@@ -631,10 +762,40 @@ export class ChatTranscriptRecallService {
     if (channelFilter === "all" || channelFilter === "web" || channelFilter === "web_ui") {
       for (const wt of this.readDirectWebTurns()) {
         if (wt.createdAtMs < startMs || wt.createdAtMs > endMs) continue;
-        if (channelFilter !== "all" && wt.channel !== channelFilter && !(channelFilter === "web" && wt.channel === "web_ui")) {
+        if (
+          channelFilter !== "all" &&
+          wt.channel !== channelFilter &&
+          !(channelFilter === "web" && wt.channel === "web_ui") &&
+          !(Boolean(allowWebChannelAlias) && channelFilter === "web_ui" && wt.channel === "web")
+        ) {
           continue;
         }
         seqCounter += 1;
+        const primaryEpId =
+          wt.episodeId ??
+          buildEpisodeAnchorId({
+            channel: wt.channel,
+            createdAtMs: wt.createdAtMs,
+            content: wt.content,
+          });
+        const altSet = new Set<string>();
+        altSet.add(
+          buildEpisodeAnchorId({
+            channel: wt.channel,
+            createdAtMs: wt.createdAtMs,
+            content: wt.content,
+          }),
+        );
+        if (wt.channel === "web_ui") {
+          altSet.add(
+            buildEpisodeAnchorId({
+              channel: "web",
+              createdAtMs: wt.createdAtMs,
+              content: wt.content,
+            }),
+          );
+        }
+        altSet.delete(primaryEpId);
         turns.push({
           conversationKey: `${wt.channel}:${wt.peerId}`,
           channel: wt.channel,
@@ -644,11 +805,51 @@ export class ChatTranscriptRecallService {
           rawContent: wt.content,
           createdAtMs: wt.createdAtMs,
           seq: seqCounter,
+          episodeId: primaryEpId,
+          ...(altSet.size > 0 ? { altEpisodeIds: Array.from(altSet) } : {}),
         });
       }
     }
 
     turns.sort((a, b) => a.createdAtMs - b.createdAtMs || a.seq - b.seq);
+    return turns;
+  }
+
+  private turnToRecallItem(t: InternalTurn): ChatHistoryRecallItem {
+    const iso = new Date(t.createdAtMs).toISOString();
+    return {
+      atIso: iso,
+      dateKey: iso.slice(0, 10),
+      channel: t.channel,
+      role: t.role,
+      snippet: clipSnippet(t.content),
+      episodeId: t.episodeId,
+    };
+  }
+
+  recallChatHistory(input: RecallChatHistoryInput = {}): ChatHistoryRecallResult {
+    const nowMs = input.nowMs ?? this.nowMsFn();
+    const rawQuery = String(input.query ?? "").trim();
+    const ownerOnly = input.ownerOnly !== false;
+    const channelFilter: RecallChannelFilter = input.channel ?? "all";
+    const limit = Math.min(MAX_RECALL_LIMIT, Math.max(1, input.limit ?? DEFAULT_RECALL_LIMIT));
+
+    const daysBack = input.daysBack ?? resolveImplicitDaysBack(rawQuery);
+    const startMs =
+      input.sinceIso && Number.isFinite(Date.parse(input.sinceIso))
+        ? Date.parse(input.sinceIso)
+        : nowMs - Math.max(1, daysBack) * DAY_MS;
+    const endMs =
+      input.untilIso && Number.isFinite(Date.parse(input.untilIso))
+        ? Date.parse(input.untilIso)
+        : nowMs + 60_000;
+
+    const turns = this.collectTurns({
+      startMs,
+      endMs,
+      channelFilter,
+      ownerOnly,
+    });
     const keywords = extractRecallKeywords(rawQuery);
 
     let matchedTurns: InternalTurn[] = [];
@@ -660,23 +861,9 @@ export class ChatTranscriptRecallService {
         const score = scoreTurnAgainstKeywords(turns[i]!.content, keywords);
         if (score > 0) {
           hitIndices.add(i);
-          const cur = turns[i]!;
-          if (cur.role === "user" && i + 1 < turns.length) {
-            const nxt = turns[i + 1]!;
-            if (nxt.conversationKey === cur.conversationKey && nxt.role === "assistant" && nxt.createdAtMs - cur.createdAtMs <= PAIR_CONTEXT_MAX_GAP_MS) {
-              hitIndices.add(i + 1);
-            }
-          } else if (cur.role === "assistant" && i - 1 >= 0) {
-            const prv = turns[i - 1]!;
-            if (prv.conversationKey === cur.conversationKey && prv.role === "user" && cur.createdAtMs - prv.createdAtMs <= PAIR_CONTEXT_MAX_GAP_MS) {
-              hitIndices.add(i - 1);
-            }
-          }
         }
       }
-      matchedTurns = Array.from(hitIndices)
-        .sort((a, b) => a - b)
-        .map((idx) => turns[idx]!);
+      matchedTurns = expandPairedContextIndices(turns, hitIndices).map((idx) => turns[idx]!);
     }
 
     const totalMatched = matchedTurns.length;
@@ -686,16 +873,7 @@ export class ChatTranscriptRecallService {
         : matchedTurns.slice(-limit);
 
     const channelsCovered = Array.from(new Set(matchedTurns.map((t) => t.channel)));
-    const items: ChatHistoryRecallItem[] = sliced.map((t) => {
-      const iso = new Date(t.createdAtMs).toISOString();
-      return {
-        atIso: iso,
-        dateKey: iso.slice(0, 10),
-        channel: t.channel,
-        role: t.role,
-        snippet: clipSnippet(t.content),
-      };
-    });
+    const items: ChatHistoryRecallItem[] = sliced.map((t) => this.turnToRecallItem(t));
 
     return {
       ok: true,
@@ -704,6 +882,78 @@ export class ChatTranscriptRecallService {
       totalMatched,
       channelsCovered,
       items,
+    };
+  }
+
+  lookupEpisodeContext(input: LookupEpisodeContextInput): LookupEpisodeContextResult {
+    if (input.callerPrincipal !== undefined && input.callerPrincipal !== "owner:M") {
+      return { allowed: false, items: [] };
+    }
+
+    const targetEpId = input.episodeId?.trim() || undefined;
+    const epParts = targetEpId?.match(/^ep:([^:]+):(\d+):([0-9a-f]{6,64})$/i);
+    const epTimestampMs = epParts?.[2] ? Number(epParts[2]) : undefined;
+    const parsedAtMs =
+      input.atIso && Number.isFinite(Date.parse(input.atIso)) ? Date.parse(input.atIso) : undefined;
+    const centerMs =
+      parsedAtMs ?? (epTimestampMs !== undefined && Number.isFinite(epTimestampMs) ? epTimestampMs : undefined);
+    const windowMs = Math.max(1, input.windowMinutes ?? 15) * 60_000;
+    const queryHint = String(input.queryHint ?? "").trim();
+
+    if (centerMs === undefined && !targetEpId && !queryHint) {
+      return { allowed: true, items: [] };
+    }
+
+    const loadRadiusMs = Math.max(windowMs, PAIR_CONTEXT_MAX_GAP_MS) + 60_000;
+    const startMs = centerMs !== undefined ? centerMs - loadRadiusMs : 0;
+    const endMs = centerMs !== undefined ? centerMs + loadRadiusMs : this.nowMsFn() + DAY_MS;
+
+    const channelFilter: RecallChannelFilter = input.channel ?? "all";
+    const turns = this.collectTurns({
+      startMs,
+      endMs,
+      channelFilter,
+      ownerOnly: true,
+      allowWebChannelAlias: true,
+    });
+
+    const hitIndices = new Set<number>();
+    if (targetEpId) {
+      for (let i = 0; i < turns.length; i += 1) {
+        const turn = turns[i]!;
+        if (turn.episodeId === targetEpId || turn.altEpisodeIds?.includes(targetEpId)) {
+          hitIndices.add(i);
+        }
+      }
+    }
+
+    const shouldFallbackToWindow =
+      hitIndices.size === 0 && (!targetEpId || parsedAtMs !== undefined || Boolean(queryHint));
+    if (shouldFallbackToWindow) {
+      const keywords = extractRecallKeywords(queryHint);
+      for (let i = 0; i < turns.length; i += 1) {
+        const turn = turns[i]!;
+        if (centerMs !== undefined && Math.abs(turn.createdAtMs - centerMs) > windowMs) {
+          continue;
+        }
+        if (keywords.length === 0) {
+          hitIndices.add(i);
+        } else if (scoreTurnAgainstKeywords(turn.content, keywords) > 0) {
+          hitIndices.add(i);
+        }
+      }
+    }
+
+    if (hitIndices.size === 0) {
+      return { allowed: true, items: [] };
+    }
+
+    const selected = expandPairedContextIndices(turns, hitIndices)
+      .slice(-MAX_RECALL_LIMIT)
+      .map((idx) => this.turnToRecallItem(turns[idx]!));
+    return {
+      allowed: true,
+      items: selected,
     };
   }
 }

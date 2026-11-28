@@ -180,7 +180,15 @@ export interface DuoStewardCrystallizerOptions {
   bridgeTokens?: readonly string[];
   allowedEnvoyGroupIds?: readonly string[];
   selfEnvoyWxid?: string;
+  autoCandidateDebounceMs?: number;
+  autoCandidateMinUserTurns?: number;
   nowIso?: () => string;
+}
+
+export interface DuoPocketPartnerSummary {
+  totalNotes: number;
+  encryptedNotes: number;
+  promotedCount: number;
 }
 
 export interface DuoVaultSnapshot {
@@ -195,7 +203,21 @@ export interface DuoVaultSnapshot {
   commitments: DuoMicroCommitment[];
   recentReports: DuoSynthesisReport[];
   activeSubgraphMarkdown: string;
+  pocketSummary?: {
+    M: DuoPocketPartnerSummary;
+    W: DuoPocketPartnerSummary;
+  };
 }
+
+interface PendingAutoDialoguePayload {
+  spaceId: string;
+  speaker: DuoPartnerRole;
+  messages: Array<{ role: "user" | "assistant"; content: string }>;
+  partnerLabels?: { M: string; W: string };
+}
+
+const AUTO_CRYSTAL_RESONANCE_CUE_RE =
+  /(?:达成共识|以后咱们就|以后我们就|我们约好|咱们约好|就这么约定|就这么定|这个默契|很有共鸣|先发安心信号|先给安心信号|留白不谈工作|周五晚不加班|不冷战)/;
 
 interface PersistedDuoSpaceState {
   version: 1;
@@ -364,14 +386,26 @@ export class DuoStewardCrystallizer {
   private readonly nowIsoFn: () => string;
   private readonly tokenDigests: Buffer[];
   private readonly allowedGroupIds: Set<string>;
+  private readonly autoCandidateDebounceMs: number;
+  private readonly autoCandidateMinUserTurns: number;
   private readonly spaces = new Map<string, PersistedDuoSpaceState>();
   private readonly graphs = new Map<string, SugentKnowledgeGraph>();
+  private readonly rollingDialogues = new Map<
+    string,
+    Array<{ role: "user" | "assistant"; content: string }>
+  >();
+  private readonly pendingAutoTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly pendingAutoPayloads = new Map<string, PendingAutoDialoguePayload>();
+  private readonly inflightAutoPromises = new Map<string, Promise<DuoCrystal | null>>();
+  private disposed = false;
   readonly pockets: SymmetricPrivatePocketVault;
 
   constructor(private readonly opts: DuoStewardCrystallizerOptions) {
     this.rootDir = path.join(path.resolve(opts.dataDir), "duo-spaces");
     fs.mkdirSync(this.rootDir, { recursive: true, mode: 0o700 });
     this.nowIsoFn = opts.nowIso ?? (() => new Date().toISOString());
+    this.autoCandidateDebounceMs = Math.max(0, Math.trunc(opts.autoCandidateDebounceMs ?? 300));
+    this.autoCandidateMinUserTurns = Math.max(1, Math.trunc(opts.autoCandidateMinUserTurns ?? 2));
     this.pockets = new SymmetricPrivatePocketVault({
       duoRootDir: this.rootDir,
       nowIso: this.nowIsoFn,
@@ -389,6 +423,15 @@ export class DuoStewardCrystallizer {
         .map((id) => String(id ?? "").trim())
         .filter(Boolean),
     );
+  }
+
+  dispose(): void {
+    this.disposed = true;
+    for (const timer of this.pendingAutoTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.pendingAutoTimers.clear();
+    this.pendingAutoPayloads.clear();
   }
 
   /**
@@ -521,6 +564,24 @@ export class DuoStewardCrystallizer {
     }
   }
 
+  private getPocketSummary(spaceId: string): {
+    M: DuoPocketPartnerSummary;
+    W: DuoPocketPartnerSummary;
+  } {
+    const summarizeFor = (viewer: DuoPartnerRole): DuoPocketPartnerSummary => {
+      const notes = this.pockets.listPocketNotes({ spaceId, viewer });
+      return {
+        totalNotes: notes.length,
+        encryptedNotes: notes.filter((n) => Boolean(n.encrypted)).length,
+        promotedCount: notes.filter((n) => Boolean(n.promotedCrystalId)).length,
+      };
+    };
+    return {
+      M: summarizeFor("M"),
+      W: summarizeFor("W"),
+    };
+  }
+
   /**
    * 获取指定双人空间的完整星晶库、微约定与近期深度复盘快照。
    */
@@ -551,6 +612,7 @@ export class DuoStewardCrystallizer {
         .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
         .slice(0, 12),
       activeSubgraphMarkdown: subgraph.markdown,
+      pocketSummary: this.getPocketSummary(state.spaceId),
     };
   }
 
@@ -1217,6 +1279,338 @@ export class DuoStewardCrystallizer {
     return { systemPrompt, transcriptPrompt, activeCrystalCount, activeCommitmentCount, offlineReply };
   }
 
+  private recordDialogueTurnAndMaybeSchedule(
+    params: {
+      spaceId?: string;
+      speaker: DuoPartnerRole;
+      messages: Array<{ role: "user" | "assistant"; content: string }>;
+      partnerLabels?: { M: string; W: string };
+    },
+    reply: string,
+  ): void {
+    if (this.disposed) return;
+    const spaceId = sanitizeDuoSpaceId(params.spaceId);
+    const incoming = (params.messages ?? [])
+      .map((m) => ({
+        role: (m.role === "assistant" ? "assistant" : "user") as "user" | "assistant",
+        content: String(m.content ?? "").trim(),
+      }))
+      .filter((m) => m.content.length > 0);
+    if (incoming.length === 0) return;
+
+    const prev = this.rollingDialogues.get(spaceId) ?? [];
+    let merged: Array<{ role: "user" | "assistant"; content: string }>;
+    if (incoming.length >= 2) {
+      merged = [...incoming];
+    } else {
+      merged = [...prev];
+      const lastPrev = merged[merged.length - 1];
+      const firstInc = incoming[0]!;
+      if (!lastPrev || lastPrev.role !== firstInc.role || lastPrev.content !== firstInc.content) {
+        merged.push(firstInc);
+      }
+    }
+    const cleanReply = String(reply ?? "").trim();
+    if (cleanReply) {
+      merged.push({ role: "assistant", content: cleanReply });
+    }
+    if (merged.length > 24) {
+      merged = merged.slice(-24);
+    }
+    this.rollingDialogues.set(spaceId, merged);
+
+    if (merged.some((m) => looksSecret(m.content))) return;
+    const userTurns = merged.filter((m) => m.role === "user");
+    const hasResonanceCue = userTurns.some((m) => AUTO_CRYSTAL_RESONANCE_CUE_RE.test(m.content));
+    const hasSubstantiveMultiTurn =
+      merged.length >= this.autoCandidateMinUserTurns * 2 &&
+      userTurns.length >= this.autoCandidateMinUserTurns &&
+      userTurns.some((m) => m.content.length >= 12);
+
+    if (!hasResonanceCue && !hasSubstantiveMultiTurn) return;
+
+    const payload: PendingAutoDialoguePayload = {
+      spaceId,
+      speaker: params.speaker,
+      messages: merged.map((m) => ({ ...m })),
+      ...(params.partnerLabels ? { partnerLabels: params.partnerLabels } : {}),
+    };
+    this.pendingAutoPayloads.set(spaceId, payload);
+
+    const prevTimer = this.pendingAutoTimers.get(spaceId);
+    if (prevTimer) clearTimeout(prevTimer);
+
+    const timer = setTimeout(() => {
+      this.pendingAutoTimers.delete(spaceId);
+      const nextPayload = this.pendingAutoPayloads.get(spaceId);
+      this.pendingAutoPayloads.delete(spaceId);
+      if (nextPayload && !this.disposed) {
+        void this.launchAutoDistillPromise(nextPayload);
+      }
+    }, this.autoCandidateDebounceMs);
+    timer.unref?.();
+    this.pendingAutoTimers.set(spaceId, timer);
+  }
+
+  private launchAutoDistillPromise(payload: PendingAutoDialoguePayload): Promise<DuoCrystal | null> {
+    const p = this.distillAutoCandidateFromDialogue(payload).catch(() => null);
+    this.inflightAutoPromises.set(payload.spaceId, p);
+    void p.finally(() => {
+      if (this.inflightAutoPromises.get(payload.spaceId) === p) {
+        this.inflightAutoPromises.delete(payload.spaceId);
+      }
+    });
+    return p;
+  }
+
+  /**
+   * 立即排空待处理的防抖自动星晶提炼任务（便于测试与优雅停机前沿对齐）。
+   */
+  async flushPendingAutoCrystallize(spaceId?: string): Promise<DuoCrystal[]> {
+    const targetIds = spaceId
+      ? [sanitizeDuoSpaceId(spaceId)]
+      : Array.from(
+          new Set([
+            ...this.pendingAutoTimers.keys(),
+            ...this.pendingAutoPayloads.keys(),
+            ...this.inflightAutoPromises.keys(),
+          ]),
+        );
+
+    const results: DuoCrystal[] = [];
+    const seenIds = new Set<string>();
+
+    for (const sid of targetIds) {
+      const timer = this.pendingAutoTimers.get(sid);
+      if (timer) {
+        clearTimeout(timer);
+        this.pendingAutoTimers.delete(sid);
+      }
+      const payload = this.pendingAutoPayloads.get(sid);
+      this.pendingAutoPayloads.delete(sid);
+
+      const inflight = this.inflightAutoPromises.get(sid);
+      if (inflight) {
+        const res = await inflight;
+        if (res && !seenIds.has(res.id)) {
+          seenIds.add(res.id);
+          results.push(res);
+        }
+      }
+      if (payload && !this.disposed) {
+        const res = await this.launchAutoDistillPromise(payload);
+        if (res && !seenIds.has(res.id)) {
+          seenIds.add(res.id);
+          results.push(res);
+        }
+      }
+    }
+    return results;
+  }
+
+  /**
+   * 从多轮共鸣对话中提炼单枚待确认星晶候选（严格遵守主权红线：一律落为 `candidate`、`endorsedBy: []`、
+   * 按 `topicKey` 幂等去重且巩固次数封顶低于 `DUO_CRYSTAL_PROMOTE_THRESHOLD`，绝不未经双方点亮强制转正）。
+   */
+  async distillAutoCandidateFromDialogue(params: {
+    spaceId?: string;
+    speaker: DuoPartnerRole;
+    messages: Array<{ role: "user" | "assistant"; content: string }>;
+    partnerLabels?: { M: string; W: string };
+  }): Promise<DuoCrystal | null> {
+    if (this.disposed) return null;
+    const spaceId = sanitizeDuoSpaceId(params.spaceId);
+    const labels = params.partnerLabels ?? { M: "Andy", W: "Gillna" };
+    const cleaned = (params.messages ?? [])
+      .map((m) => ({
+        role: (m.role === "assistant" ? "assistant" : "user") as "user" | "assistant",
+        content: String(m.content ?? "").trim(),
+      }))
+      .filter((m) => m.content.length > 0);
+    if (cleaned.length === 0) return null;
+    if (cleaned.some((m) => looksSecret(m.content))) return null;
+
+    const userTurns = cleaned.filter((m) => m.role === "user");
+    if (userTurns.length === 0) return null;
+
+    const now = this.nowIsoFn();
+    const transcriptText = cleaned
+      .slice(-12)
+      .map((m) => `${m.role === "assistant" ? "Sugent" : params.speaker === "M" ? labels.M : labels.W}: ${m.content}`)
+      .join("\n");
+
+    if (!this.disposed) {
+      this.sealDuoPayload({
+        spaceId,
+        source: "duo_auto_dialogue",
+        eventType: "duo_auto_candidate",
+        eventId: `autocrys-${Date.now()}`,
+        title: `Duo Auto Candidate (${spaceId})`,
+        body: transcriptText,
+      });
+    }
+
+    const systemPrompt = [
+      `你是「Sugent · 星轨幕僚」的轻量共鸣星晶捕捉器，服务于 ${labels.M} (Pluto) 与 ${labels.W} (Charon)。`,
+      "请从下方近期对话中提炼 1 枚最值得双方共同点亮确认的「候选关系星晶（candidate）」。",
+      "严禁偏袒任何一方，严禁包含任何密钥、金额或隐私路径。只输出合法 JSON：",
+      JSON.stringify({
+        topicKey: "friday-quality-time",
+        kind: "consensus_tacit",
+        title: "10~20字温和晶体标题",
+        summary: "40~100字相处共识或调频规律总结",
+        orbitalMetaphor: "一句简短天体隐喻",
+        triggerSignal: "触发场景",
+        gentleAction: "温和可执行的双人动作",
+      }),
+    ].join("\n");
+
+    const llmRes = await this.callRoleChatJson({
+      role: "assessor",
+      systemPrompt,
+      userPrompt: transcriptText.slice(0, 4000),
+      temperature: 0.3,
+    });
+    if (this.disposed) return null;
+
+    const parsed = llmRes ? extractFirstJsonObject(llmRes.text) : null;
+
+    let rawTopicKey: string;
+    let kind: DuoCrystalKind;
+    let title: string;
+    let summary: string;
+    let orbitalMetaphor: string | undefined;
+    let triggerSignal: string | undefined;
+    let gentleAction: string | undefined;
+
+    if (
+      parsed &&
+      typeof parsed.title === "string" &&
+      parsed.title.trim() &&
+      typeof parsed.summary === "string" &&
+      parsed.summary.trim()
+    ) {
+      rawTopicKey = String(parsed.topicKey || parsed.title);
+      kind = VALID_CRYSTAL_KINDS.has(parsed.kind) ? parsed.kind : "consensus_tacit";
+      title = parsed.title.trim().slice(0, 48);
+      summary = parsed.summary.trim().slice(0, 240);
+      orbitalMetaphor = typeof parsed.orbitalMetaphor === "string" ? parsed.orbitalMetaphor.trim() : undefined;
+      triggerSignal = typeof parsed.triggerSignal === "string" ? parsed.triggerSignal.trim() : undefined;
+      gentleAction = typeof parsed.gentleAction === "string" ? parsed.gentleAction.trim() : undefined;
+    } else {
+      const combinedUserText = userTurns.map((t) => t.content).join(" ");
+      const focusTurn =
+        [...userTurns].reverse().find((t) => AUTO_CRYSTAL_RESONANCE_CUE_RE.test(t.content)) ??
+        [...userTurns].reverse().find((t) => t.content.length >= 12) ??
+        userTurns[userTurns.length - 1]!;
+
+      if (/(?:周五|周末|散步|留白不谈工作|周五晚不加班|共处)/.test(combinedUserText)) {
+        rawTopicKey = "auto-quality-time-window";
+        kind = "consensus_tacit";
+        title = "共处留白窗与无干扰陪伴默契";
+        summary = `从近期对话捕捉到共处心意：「${focusTurn.content.slice(0, 64)}」，待双方共同点亮确认后纳入星轨守护。`;
+        orbitalMetaphor = "双星行经近点时主动收起外围杂讯，守住静谧引力场。";
+        triggerSignal = "工作周收尾或约定共处时段临近";
+        gentleAction = "进入约定留白时段前提前收口待办，把完整注意力留给彼此。";
+      } else if (/(?:安心信号|不冷战|沉默|先说一声|缓冲)/.test(combinedUserText)) {
+        rawTopicKey = "auto-reassurance-signal";
+        kind = "friction_antidote";
+        title = "高压期先给安心信标再留白推演";
+        summary = `围绕沟通节奏形成温和默契：「${focusTurn.content.slice(0, 64)}」，用简短在场回应消解无声紧绷。`;
+        orbitalMetaphor = "压缩核发出恒温信标，感知核安心留出轨道缓冲。";
+        triggerSignal = "一方需要安静消化或决策节奏不同步时";
+        gentleAction = "先轻声告知“我在认真想，稍后聊”，再进入安静整理。";
+      } else if (/(?:睡前|晚安|十分钟)/.test(combinedUserText)) {
+        rawTopicKey = "auto-bedtime-checkin";
+        kind = "consensus_tacit";
+        title = "睡前轻柔对齐与日常心绪回温";
+        summary = `围绕睡前相处提炼候选默契：「${focusTurn.content.slice(0, 64)}」，待双方共阅点亮。`;
+        gentleAction = "睡前留出简短温柔窗口分享当日真实感受。";
+      } else {
+        rawTopicKey = `auto-${normalizeCrystalTopicKey(focusTurn.content.slice(0, 24)).slice(0, 32)}`;
+        kind = AUTO_CRYSTAL_RESONANCE_CUE_RE.test(focusTurn.content) ? "consensus_tacit" : "stage_evolution";
+        title = `围绕「${focusTurn.content.slice(0, 16)}」的对话共鸣候选`;
+        summary = `从多轮星轨对话自动捕捉的相处洞察：「${focusTurn.content.slice(0, 72)}」，等待伴侣双方共阅确认。`;
+        gentleAction = "在星晶面板共同审阅并点亮双星共鸣。";
+      }
+    }
+
+    if (
+      looksSecret(title) ||
+      looksSecret(summary) ||
+      (orbitalMetaphor && looksSecret(orbitalMetaphor)) ||
+      (triggerSignal && looksSecret(triggerSignal)) ||
+      (gentleAction && looksSecret(gentleAction))
+    ) {
+      return null;
+    }
+
+    if (this.disposed) return null;
+    const topicKey = normalizeCrystalTopicKey(rawTopicKey || title);
+    const state = this.loadSpace(spaceId);
+    const evidenceTag = `auto_dialogue:${now.slice(0, 10)}`;
+    const maxAutoReinforcements = Math.max(1, DUO_CRYSTAL_PROMOTE_THRESHOLD - 1);
+
+    const existingCandidate = state.crystals.find(
+      (c) => c.topicKey === topicKey && c.status === "candidate",
+    );
+
+    if (existingCandidate) {
+      existingCandidate.title = title;
+      existingCandidate.summary = summary;
+      existingCandidate.kind = kind;
+      if (orbitalMetaphor) existingCandidate.orbitalMetaphor = orbitalMetaphor;
+      if (triggerSignal) existingCandidate.triggerSignal = triggerSignal;
+      if (gentleAction) existingCandidate.gentleAction = gentleAction;
+      existingCandidate.evidenceRefs = Array.from(
+        new Set([...existingCandidate.evidenceRefs, evidenceTag]),
+      ).slice(0, 12);
+      existingCandidate.reinforcements = Math.min(
+        maxAutoReinforcements,
+        existingCandidate.reinforcements + 1,
+      );
+      existingCandidate.confidence = Math.min(
+        0.78,
+        Math.round((existingCandidate.confidence + 0.08) * 100) / 100,
+      );
+      existingCandidate.status = "candidate";
+      existingCandidate.updatedAt = now;
+      this.saveSpace(state);
+      return {
+        ...existingCandidate,
+        endorsedBy: [...existingCandidate.endorsedBy],
+        evidenceRefs: [...existingCandidate.evidenceRefs],
+      };
+    }
+
+    const created: DuoCrystal = {
+      id: `crys-${topicKey.slice(0, 20)}-${crypto.randomUUID().slice(0, 6)}`,
+      spaceId: state.spaceId,
+      topicKey,
+      kind,
+      status: "candidate",
+      title,
+      summary,
+      ...(orbitalMetaphor ? { orbitalMetaphor } : {}),
+      ...(triggerSignal ? { triggerSignal } : {}),
+      ...(gentleAction ? { gentleAction } : {}),
+      evidenceRefs: [evidenceTag],
+      confidence: 0.55,
+      reinforcements: 1,
+      endorsedBy: [],
+      sourcePeriod: now.slice(0, 7),
+      createdAt: now,
+      updatedAt: now,
+    };
+    state.crystals.push(created);
+    this.saveSpace(state);
+    return {
+      ...created,
+      endorsedBy: [...created.endorsedBy],
+      evidenceRefs: [...created.evidenceRefs],
+    };
+  }
+
   /**
    * 联邦「Sugent · 星轨幕僚」对话接口（走 `executor` 角色网关 + 自动注入空间生效星晶与微约定）。
    */
@@ -1246,6 +1640,7 @@ export class DuoStewardCrystallizer {
     });
 
     if (llmRes) {
+      this.recordDialogueTurnAndMaybeSchedule(params, llmRes.text);
       return {
         ok: true,
         reply: llmRes.text,
@@ -1255,6 +1650,7 @@ export class DuoStewardCrystallizer {
       };
     }
 
+    this.recordDialogueTurnAndMaybeSchedule(params, prep.offlineReply);
     return {
       ok: true,
       reply: prep.offlineReply,
@@ -1359,6 +1755,7 @@ export class DuoStewardCrystallizer {
             }
           }
           if (reply.trim()) {
+            this.recordDialogueTurnAndMaybeSchedule(params, reply);
             return {
               ok: true,
               reply,
@@ -1374,6 +1771,7 @@ export class DuoStewardCrystallizer {
           if (typeof content === "string" && content.trim()) {
             const reply = content.trim();
             this.emitReplyChunks(reply, params.onDelta, 3);
+            this.recordDialogueTurnAndMaybeSchedule(params, reply);
             return {
               ok: true,
               reply,
@@ -1390,6 +1788,7 @@ export class DuoStewardCrystallizer {
     }
 
     this.emitReplyChunks(prep.offlineReply, params.onDelta, 3);
+    this.recordDialogueTurnAndMaybeSchedule(params, prep.offlineReply);
     return {
       ok: true,
       reply: prep.offlineReply,

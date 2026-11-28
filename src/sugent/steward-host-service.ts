@@ -37,6 +37,7 @@ import {
 import type { BotBudgetStatus, LocalBudgetLedger } from "./local-budget.js";
 import {
   createAttentionBudgetGate,
+  matchActiveDuoProtectedWindow,
   scanLedgerImbalances,
   type CadenceBudgetState,
   type CadenceBudgetStoragePort,
@@ -50,6 +51,7 @@ import {
   runGardenerCycle,
   type GardenerCycleInput,
   type GardenerCycleOutput,
+  type MemoryDisambiguationCard,
 } from "./memory-gardener.js";
 import { PostTurnDigester } from "./post-turn-digester.js";
 import { quarantineSelfEvolutionArtifact } from "./self-evolution.js";
@@ -59,7 +61,9 @@ import {
   type AtlasNode,
   type AtlasPlaneSummary,
   type AtlasRecallResult,
+  type EpisodeProvenanceResult,
   type GraphPlaneId,
+  type PrincipalId,
 } from "./stereoscopic-atlas.js";
 import {
   EpistemicDigestionLoop,
@@ -67,6 +71,7 @@ import {
   detectLoyalDissentSignal,
   type LoyalDissentAlert,
   type MindJournalSnapshot,
+  type SiliconSurfaceId,
 } from "./silicon-identity-core.js";
 import {
   distillPartnerWeatherCapsule,
@@ -129,7 +134,7 @@ import { SugentModelCatalog, type ModelTier } from "./model-catalog.js";
 import { ModelPoolSyncer, type ProviderSyncResult } from "./model-pool-sync.js";
 import { RoutingExperienceStore, type RoutingOperatingMode, type RoutingPolicyState, type RoutingStrategyPreset, type TaskArchetype } from "./routing-experience-store.js";
 import { AdaptiveModelRouter, type AdaptiveRoutingDashboardSnapshot } from "./adaptive-router.js";
-import { DuoStewardCrystallizer } from "./duo-steward-crystallizer.js";
+import { DuoStewardCrystallizer, type DuoPocketPartnerSummary } from "./duo-steward-crystallizer.js";
 import {
   OpsBridgeClient,
   type OpsCommitmentStatusUpdate,
@@ -178,6 +183,7 @@ import {
 import {
   ChatTranscriptRecallService,
   type ChatHistoryRecallResult,
+  type RecallChannelFilter,
   type RecallChatHistoryInput,
 } from "./chat-transcript-recall.js";
 import {
@@ -319,11 +325,17 @@ export interface StewardWorkbenchSnapshot {
   mindJournal?: MindJournalSnapshot;
   duoAnchors?: OwnerDuoAnchor[];
   loyalDissent?: LoyalDissentAlert | null;
+  disambiguationCards?: MemoryDisambiguationCard[];
   duoSummary?: {
     spaceId: string;
     activeCrystalCount: number;
+    candidateCrystalCount?: number;
     commitmentCount: number;
     weather: PartnerWeatherCapsule;
+    pocketSummary?: {
+      M: DuoPocketPartnerSummary;
+      W: DuoPocketPartnerSummary;
+    };
   };
 }
 
@@ -558,6 +570,7 @@ export class SugentStewardHostService {
   > = {};
   private readonly pendingOpsCommitmentUpdates = new Map<string, OpsCommitmentStatusUpdate>();
   private readonly recentStewardTurns: Array<{ role: "user" | "assistant"; content: string }> = [];
+  private readonly tier0DigestedTurnKeys = new Set<string>();
   private lastLoyalDissent: LoyalDissentAlert | null = null;
 
   constructor(private readonly opts: SugentStewardHostServiceOptions) {
@@ -853,23 +866,41 @@ export class SugentStewardHostService {
     } catch {
       /* ignore malformed legacy entries during startup import */
     }
-    this.postTurnDigester = new PostTurnDigester({
-      knowledgeGraph: opts.knowledgeGraph,
-      ledger: this.ledger,
-      onNodeDelta: (delta) => {
-        try {
-          this.atlas.ingestLegacyDelta(delta, "owner_life", this.nowIsoFn());
-        } catch {
-          /* ignore */
-        }
-      },
-      ...(opts.syncBotMemoryEntry ? { syncMemoryEntry: opts.syncBotMemoryEntry } : {}),
-      ...(opts.stewardCompleteFn ? { completeFn: opts.stewardCompleteFn } : {}),
-      nowIso: this.nowIsoFn,
-    });
     this.mindLoop = new EpistemicDigestionLoop({
       stewardDir,
       atlas: this.atlas,
+      nowIso: this.nowIsoFn,
+    });
+    this.postTurnDigester = new PostTurnDigester({
+      knowledgeGraph: opts.knowledgeGraph,
+      ledger: this.ledger,
+      atlas: this.atlas,
+      assessorDigestHook: async (turn, nowIso) => {
+        if (
+          turn.channel === "concierge" ||
+          turn.channel === "wechat_envoy" ||
+          turn.peerId.startsWith("peer:")
+        ) {
+          return;
+        }
+        const turnKey = `${turn.channel}:${turn.userText.trim()}`;
+        if (this.tier0DigestedTurnKeys.delete(turnKey)) {
+          return;
+        }
+        const surface: SiliconSurfaceId =
+          turn.channel === "weixin" || turn.channel === "feishu" ? "im_owner" : "steward_hub";
+        await this.mindLoop.digestTurnFeedbackDualTrack(
+          {
+            userText: turn.userText,
+            assistantReply: turn.assistantReply,
+            surface,
+            assessorCompleteFn: this.buildAssessorCompleteFn(),
+          },
+          nowIso,
+        );
+      },
+      ...(opts.syncBotMemoryEntry ? { syncMemoryEntry: opts.syncBotMemoryEntry } : {}),
+      ...(opts.stewardCompleteFn ? { completeFn: opts.stewardCompleteFn } : {}),
       nowIso: this.nowIsoFn,
     });
     this.syncDuoMembraneToAtlas();
@@ -877,11 +908,59 @@ export class SugentStewardHostService {
 
   dispose(): void {
     this.postTurnDigester.dispose();
+    this.duoCrystallizer.dispose();
     try {
       this.atlas.close();
     } catch {
       /* ignore close errors */
     }
+  }
+
+  private buildAssessorCompleteFn(): ((system: string, user: string) => Promise<string>) | undefined {
+    const ep = this.resolveLiveRoleEndpoint("assessor");
+    const fetchFn = this.opts.llmFetch ?? globalThis.fetch;
+    if (!ep && !this.opts.stewardCompleteFn) return undefined;
+    return async (system: string, user: string): Promise<string> => {
+      if (ep?.baseUrl && ep.apiKey && typeof fetchFn === "function") {
+        const base = ep.baseUrl.replace(/\/+$/, "");
+        const url = base.endsWith("/chat/completions")
+          ? base
+          : base.endsWith("/v1")
+            ? `${base}/chat/completions`
+            : `${base}/v1/chat/completions`;
+        try {
+          const res = await fetchFn(url, {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              authorization: `Bearer ${ep.apiKey}`,
+            },
+            body: JSON.stringify({
+              model: ep.model,
+              temperature: 0.1,
+              messages: [
+                { role: "system", content: system },
+                { role: "user", content: user },
+              ],
+            }),
+            signal: AbortSignal.timeout(30_000),
+          });
+          if (res.ok) {
+            const json = (await res.json()) as {
+              choices?: Array<{ message?: { content?: string } }>;
+            };
+            const text = String(json.choices?.[0]?.message?.content ?? "").trim();
+            if (text) return text;
+          }
+        } catch {
+          /* fallback to stewardCompleteFn if configured */
+        }
+      }
+      if (this.opts.stewardCompleteFn) {
+        return this.opts.stewardCompleteFn(system, user);
+      }
+      return "";
+    };
   }
 
   private syncAtlasFromKnowledgeGraph(): void {
@@ -1071,13 +1150,19 @@ export class SugentStewardHostService {
     }
     if (callerDomain === "owner_private") {
       try {
-        this.mindLoop.digestUserFeedbackTurn(
+        const tier0Hit = this.mindLoop.digestUserFeedbackTurn(
           {
             userText: input.text,
             surface: input.channel === "weixin" || input.channel === "feishu" ? "im_owner" : "steward_hub",
           },
           this.nowIsoFn(),
         );
+        if (tier0Hit) {
+          if (this.tier0DigestedTurnKeys.size > 64) {
+            this.tier0DigestedTurnKeys.clear();
+          }
+          this.tier0DigestedTurnKeys.add(`${input.channel ?? "web_ui"}:${input.text.trim()}`);
+        }
       } catch {
         /* ignore secret-like content */
       }
@@ -1165,8 +1250,13 @@ export class SugentStewardHostService {
     return new UniversalDropzone({
       ledger: this.ledger,
       knowledgeGraph: this.opts.knowledgeGraph,
-      atlasRecall: (q) => ({
-        nodes: this.queryAtlas({ q, maxNodes: 12 }).recall?.nodes ?? [],
+      atlasRecall: (q, recallOpts) => ({
+        nodes:
+          this.queryAtlas({
+            q,
+            ...(recallOpts?.planes ? { planes: recallOpts.planes } : {}),
+            maxNodes: recallOpts?.maxNodes ?? 12,
+          }).recall?.nodes ?? [],
       }),
       gatewayConfig: this.opts.getGatewayConfig?.() ?? resolveSugentGatewayConfig(undefined, {}),
       ...(live
@@ -1352,13 +1442,16 @@ export class SugentStewardHostService {
             mindJournal: this.mindLoop.getMindJournalSnapshot(12),
             duoAnchors: this.getOwnerDuoAnchors(),
             loyalDissent: this.lastLoyalDissent,
+            disambiguationCards: this.gardenerStore.getState().pendingDisambiguationCards ?? [],
             duoSummary: (() => {
               const vault = this.duoCrystallizer.getVaultSnapshot();
               return {
                 spaceId: vault.spaceId,
                 activeCrystalCount: vault.crystals.crystallized.length,
+                candidateCrystalCount: vault.crystals.candidates.length,
                 commitmentCount: vault.commitments.filter((c) => c.status === "active" || c.status === "echoed").length,
                 weather: this.getDuoWeatherCapsule(vault.spaceId),
+                ...(vault.pocketSummary ? { pocketSummary: vault.pocketSummary } : {}),
               };
             })(),
           }
@@ -1590,6 +1683,7 @@ export class SugentStewardHostService {
     callerDomain?: CallerAccessDomain;
   } = {}): {
     emitNow: ProactiveCandidate[];
+    holdForBoundary?: ProactiveCandidate[];
     foldToMorningDigest: ProactiveCandidate[];
     suppressedIds: string[];
     workbench: StewardWorkbenchSnapshot;
@@ -1620,6 +1714,10 @@ export class SugentStewardHostService {
       candidates,
       dateKey,
       Boolean(input.quietHoursActive ?? this.quietHoursActive),
+      {
+        nowIso,
+        duoProtectedAnchors: this.getOwnerDuoAnchors(),
+      },
     );
     this.lastCadenceScan = {
       atIso: nowIso,
@@ -1629,6 +1727,7 @@ export class SugentStewardHostService {
     };
     return {
       emitNow: gated.emitNow,
+      holdForBoundary: gated.holdForBoundary ?? [],
       foldToMorningDigest: gated.foldToMorningDigest,
       suppressedIds: gated.suppressedIds,
       workbench: this.getWorkbench(input.callerDomain ?? "owner_private"),
@@ -1888,11 +1987,15 @@ export class SugentStewardHostService {
       ...(input.calibrationDue ? { calibrationDue: true } : {}),
       fleetPulses: [...scan.cadenceEvents, ...fleetEvents],
     });
+    const duoProtectedAnchors = input.flow.duoProtectedAnchors ?? this.getOwnerDuoAnchors();
     const res = this.budgetGate.evaluateFlowAndRecord(
       candidates,
       dateKey,
       Boolean(input.quietHoursActive ?? this.quietHoursActive),
-      input.flow,
+      {
+        ...input.flow,
+        duoProtectedAnchors,
+      },
       nowIso,
     );
     return {
@@ -1934,6 +2037,7 @@ export class SugentStewardHostService {
     partial: Partial<Omit<GardenerCycleInput, "nowIso" | "ledger" | "recentRounds">> = {},
   ): GardenerCycleOutput {
     const nowIso = this.nowIsoFn();
+    this.syncAtlasFromKnowledgeGraph();
     const prevState = this.gardenerStore.load();
     const ledgerSnap = this.ledger.snapshotForCaller("owner_private");
     const recentRounds = this.causalLedger.listRounds();
@@ -1962,12 +2066,16 @@ export class SugentStewardHostService {
       maxStewardTokenBudget: partial.maxStewardTokenBudget ?? 1024,
       windowDays: partial.windowDays,
     });
-    applyGardenerEffects(out, {
+    const effects = applyGardenerEffects(out, {
       knowledgeGraph: this.opts.knowledgeGraph,
       ledger: this.ledger,
+      atlas: this.atlas,
+      mindLoop: this.mindLoop,
+      weeklyCalibrationDue: true,
       onDemoteRule: this.opts.demoteProactiveRule,
       nowIso,
     });
+    const sleep = effects.sleepConsolidation;
     this.gardenerStore.save({
       version: 1,
       updatedAtIso: nowIso,
@@ -1976,6 +2084,22 @@ export class SugentStewardHostService {
       hypotheses: out.nextHypotheses,
       lastReport: out.driftReport,
       lastCalibrationLines: out.calibrationCardLines,
+      ...(sleep
+        ? {
+            pendingDisambiguationCards: sleep.disambiguationCards,
+            lastSleepConsolidation: {
+              triggered: sleep.triggered,
+              triggerReason: sleep.triggerReason,
+              crystallizedNodeIds: sleep.crystallizedNodes.map((n) => n.id),
+              synthesizedEdgesCount: sleep.synthesizedEdgesCount,
+              disambiguationCards: sleep.disambiguationCards,
+              expiredSandboxIds: sleep.expiredSandboxIds,
+              archivedNoiseEdgeIds: sleep.archivedNoiseEdgeIds,
+            },
+          }
+        : prevState.pendingDisambiguationCards
+          ? { pendingDisambiguationCards: prevState.pendingDisambiguationCards }
+          : {}),
     });
     this.syncAtlasFromKnowledgeGraph();
     return out;
@@ -2318,7 +2442,12 @@ export class SugentStewardHostService {
     }
 
     let boundaryDrain: { emitNow: ProactiveCandidate[]; supersededIds: string[] } | undefined;
-    if (input.drainBoundary !== false && !this.quietHoursActive) {
+    const windowCheckIso = input.nowMs !== undefined ? atIso : this.nowIsoFn();
+    const inDuoProtectedWindow = matchActiveDuoProtectedWindow(
+      windowCheckIso,
+      this.getOwnerDuoAnchors(),
+    ).active;
+    if (input.drainBoundary !== false && !this.quietHoursActive && !inDuoProtectedWindow) {
       const bDrained = this.drainFlowBoundary();
       if (bDrained.emitNow.length > 0 || bDrained.supersededIds.length > 0) {
         boundaryDrain = { emitNow: bDrained.emitNow, supersededIds: bDrained.supersededIds };
@@ -2758,9 +2887,11 @@ export class SugentStewardHostService {
     rawForwardedText: string;
     ownerName?: string;
   }): ThreeSecondForwardedBriefingResult {
+    this.syncAtlasFromKnowledgeGraph();
     return buildThreeSecondForwardedBriefing({
       workspaceDir: path.join(this.opts.dataDir, "sugent-stewardship", "weixin-briefings"),
       ledger: this.ledger,
+      atlas: this.atlas,
       rawForwardedText: input.rawForwardedText,
       ...(input.ownerName ? { ownerName: input.ownerName } : {}),
     });
@@ -2771,9 +2902,11 @@ export class SugentStewardHostService {
     ownerName?: string;
     autoRecordToLedger?: boolean;
   }): IngestForwardedBriefingResult {
+    this.syncAtlasFromKnowledgeGraph();
     return ingestForwardedBriefingToLedger({
       workspaceDir: path.join(this.opts.dataDir, "sugent-stewardship", "weixin-briefings"),
       ledger: this.ledger,
+      atlas: this.atlas,
       rawForwardedText: input.rawForwardedText,
       ...(input.ownerName ? { ownerName: input.ownerName } : {}),
       ...(input.autoRecordToLedger !== undefined ? { autoRecordToLedger: input.autoRecordToLedger } : {}),
@@ -3224,6 +3357,54 @@ export class SugentStewardHostService {
     }
     this.syncAtlasFromKnowledgeGraph();
     return { ok: true, ...(this.atlas.getNode(nodeId) ? { node: this.atlas.getNode(nodeId) } : {}), summary: this.atlas.getPlaneSummary() };
+  }
+
+  traceAtlasProvenance(input: {
+    nodeId: string;
+    callerDomain?: CallerAccessDomain;
+  }): EpisodeProvenanceResult & { ok: boolean } {
+    const callerDomain: CallerAccessDomain = input.callerDomain ?? "owner_private";
+    const isOwner = callerDomain === "owner_private";
+    const callerPrincipals: PrincipalId[] = isOwner ? ["sugent_self", "owner:M"] : ["public"];
+    if (isOwner) {
+      this.syncAtlasFromKnowledgeGraph();
+    }
+    const validChannels = new Set(["all", "weixin", "feishu", "web", "web_ui"]);
+    const traced = this.atlas.traceEpisodeProvenance(String(input.nodeId ?? "").trim(), {
+      callerPrincipals,
+      lookupTranscript: (hint) => {
+        const ch: RecallChannelFilter =
+          hint.channel && validChannels.has(hint.channel)
+            ? (hint.channel as RecallChannelFilter)
+            : "all";
+        let queryHint: string | undefined;
+        if (hint.summary) {
+          const uMatch = /^U:\s*(.+?)(?:\s*\|\s*A:|$)/.exec(hint.summary);
+          const candidateHint = (uMatch?.[1] ?? hint.summary).trim();
+          if (candidateHint) queryHint = candidateHint;
+        }
+        const callerPrincipal = isOwner ? "owner:M" : "public";
+        const first = this.chatRecall.lookupEpisodeContext({
+          ...(hint.episodeId ? { episodeId: hint.episodeId } : {}),
+          ...(hint.atIso ? { atIso: hint.atIso } : {}),
+          channel: ch,
+          ...(queryHint ? { queryHint } : {}),
+          callerPrincipal,
+        });
+        if (!first.allowed) return [];
+        if (first.items.length > 0 || !hint.atIso || !queryHint) {
+          return first.items;
+        }
+        const fallbackWindow = this.chatRecall.lookupEpisodeContext({
+          ...(hint.episodeId ? { episodeId: hint.episodeId } : {}),
+          atIso: hint.atIso,
+          channel: ch,
+          callerPrincipal,
+        });
+        return fallbackWindow.allowed ? fallbackWindow.items : [];
+      },
+    });
+    return { ok: traced.allowed, ...traced };
   }
 
   async autoDistillGroupScribeTick(opts?: {

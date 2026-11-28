@@ -1,11 +1,12 @@
 /**
  * 认知边界膜与对称隐私口袋（src/sugent/cognitive-membrane.ts）
  *
- * 实现 Wave P4.4 M1-M4：
+ * 实现 Wave P4.4 M1-M4 与 Wave P5.3 M5：
  * - M1: 伴侣状态天气胶囊（纯枚举零自由文本）与金丝雀零泄露门禁
  * - M2: 对称隐私口袋（M/W 物理隔离 + 可选 AES-256-GCM 口令加密 + 显式提炼晋升）
  * - M3: 双人共识单向投影至主理人生活面锚点（禁止 raw_episodic 跨面）
  * - M4: 脱敏关系启发式沉淀至硅基自我核心（剥离姓名与日期）
+ * - M5: 外事礼宾半透膜（concierge_envoy 脱敏对方沟通偏好 + 表面隔离教训 + 外发零金丝雀泄露）
  */
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
@@ -17,6 +18,7 @@ import type {
   DuoStewardCrystallizer,
   DuoVaultSnapshot,
 } from "./duo-steward-crystallizer.js";
+import type { EpistemicDigestionLoop } from "./silicon-identity-core.js";
 import type {
   AtlasEdgeInput,
   AtlasNodeInput,
@@ -85,8 +87,18 @@ export interface DeidentifiedRelationalHeuristic {
   updatedAt: string;
 }
 
+export interface ConciergeEnvoyTasteCapsule {
+  version: 1;
+  peerId: string;
+  formality: "formal_respectful" | "balanced_professional" | "casual_direct";
+  brevity: "short_3_lines" | "structured_concise" | "detailed_context";
+  styleDirectives: string[];
+  envoyCalibratedLessons: string[];
+  generatedAt: string;
+}
+
 const CURRENCY_AMOUNT_RE =
-  /(?:¥|\$|￥|\b\d+(?:\.\d+)?\s*(?:万|元|(?:usd|rmb|sol|usdc)\b))/i;
+  /(?:¥|\$|￥|\d+(?:\.\d+)?\s*(?:万元|万|元|块)|\b\d+(?:\.\d+)?\s*(?:usd|rmb|cny|hkd|eur|sol|usdc|usdt)\b|\b(?:usd|rmb|cny|hkd)\s*\d+)/i;
 const FS_PATH_RE = /(?:\/Users\/|\/home\/|[A-Za-z]:\\)/;
 
 function sanitizeSpaceId(raw?: string): string {
@@ -724,3 +736,195 @@ export function distillRelationalHeuristicToSelfCore(params: {
   }
   return results;
 }
+
+function containsMembraneCanary(
+  value: string,
+  forbiddenCanaryTokens?: readonly string[],
+): boolean {
+  try {
+    assertZeroCanaryLeak(value, forbiddenCanaryTokens);
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+const NON_ENVOY_SURFACE_TAG_RE = /\b(?:im_owner|duo_mediator|steward_hub|coding_orchestrator|owner_life)\b/i;
+
+/**
+ * M5: 蒸馏外事礼宾半透膜品味胶囊（仅导出枚举化沟通风格指引与经 concierge_envoy 表面过滤的校准教训，零泄露主理人隐私与底价）。
+ */
+export function distillConciergeEnvoyCapsule(params: {
+  peerId: string;
+  peerPreferences?: readonly string[];
+  peerTaboos?: readonly string[];
+  mindLoop?: Pick<EpistemicDigestionLoop, "getCalibratedLessons">;
+  rawEnvoyLessons?: readonly string[];
+  forbiddenCanaryTokens?: readonly string[];
+  nowIso?: string;
+}): ConciergeEnvoyTasteCapsule {
+  const nowIso = params.nowIso ?? new Date().toISOString();
+  const rawPeerId = String(params.peerId ?? "").trim() || "external_peer";
+  const safePeerId = containsMembraneCanary(rawPeerId) ? "external_peer" : rawPeerId;
+
+  const prefCorpus = (params.peerPreferences ?? []).map((p) => String(p ?? "").trim()).filter(Boolean).join(" ； ");
+  const tabooCorpus = (params.peerTaboos ?? []).map((t) => String(t ?? "").trim()).filter(Boolean).join(" ； ");
+
+  const formality: ConciergeEnvoyTasteCapsule["formality"] =
+    /(?:正式|克制|敬语|严谨|书面|礼貌|formal|respectful)/i.test(prefCorpus)
+      ? "formal_respectful"
+      : /(?:口语|直白|轻松|随意|熟人|casual|informal|direct)/i.test(prefCorpus)
+        ? "casual_direct"
+        : "balanced_professional";
+
+  const brevity: ConciergeEnvoyTasteCapsule["brevity"] =
+    /(?:短句|不超过\s*3\s*行|三行|简短|精简|直给结论|只看结论|concise|brief|short|tl;?dr)/i.test(prefCorpus)
+      ? "short_3_lines"
+      : /(?:展开|前因后果|详细|详尽|背景与依据|完整依据|detailed|thorough|comprehensive)/i.test(prefCorpus)
+        ? "detailed_context"
+        : "structured_concise";
+
+  const styleDirectives: string[] = [];
+  if (brevity === "short_3_lines") {
+    styleDirectives.push("篇幅控制：采用短句直给结论，正文控制在3行以内");
+  } else if (brevity === "detailed_context") {
+    styleDirectives.push("篇幅控制：结构化展开交代前因后果与依据");
+  } else {
+    styleDirectives.push("篇幅控制：条理清晰、重点先行，避免冗长寒暄");
+  }
+
+  if (formality === "formal_respectful") {
+    styleDirectives.push("语气风格：保持正式克制、礼貌得体的商务敬语");
+  } else if (formality === "casual_direct") {
+    styleDirectives.push("语气风格：保持自然直白、平实高效的日常口语");
+  } else {
+    styleDirectives.push("语气风格：保持温和专业的礼宾沟通基调");
+  }
+
+  if (/(?:排期|时段|时间节点|里程碑|schedule|timeline)/i.test(prefCorpus)) {
+    styleDirectives.push("表达重点：优先明确可约时段与关键时间节点");
+  }
+  if (/(?:书面|纪要|文字确认|文档|邮件|written)/i.test(prefCorpus)) {
+    styleDirectives.push("交互习惯：倾向书面要点留痕确认，避免模糊口头承诺");
+  }
+  if (/(?:催太急|催促|施压|逼单)/.test(tabooCorpus)) {
+    styleDirectives.push("沟通禁忌：避免急促催办或施压口吻");
+  }
+  if (/(?:长篇|啰嗦|铺垫过长)/.test(tabooCorpus)) {
+    styleDirectives.push("沟通禁忌：避免冗长铺垫");
+  }
+
+  const peerSafeCanaryList = (params.forbiddenCanaryTokens ?? []).filter(
+    (tok) => String(tok ?? "").trim().toLowerCase() !== safePeerId.toLowerCase(),
+  );
+  const INTERNAL_PRICING_NOTE_RE = /(?:底价|底线|内部备注|毛利|成本价)/;
+  for (const rawPref of (params.peerPreferences ?? []).slice(0, 4)) {
+    const item = String(rawPref ?? "").trim();
+    if (item.length < 2 || item.length > 48) continue;
+    if (NON_ENVOY_SURFACE_TAG_RE.test(item) || INTERNAL_PRICING_NOTE_RE.test(item)) continue;
+    if (containsMembraneCanary(item, peerSafeCanaryList)) continue;
+    styleDirectives.push(`对端偏好细则：${item}`);
+  }
+  for (const rawTaboo of (params.peerTaboos ?? []).slice(0, 4)) {
+    const item = String(rawTaboo ?? "").trim();
+    if (item.length < 2 || item.length > 48) continue;
+    if (NON_ENVOY_SURFACE_TAG_RE.test(item) || INTERNAL_PRICING_NOTE_RE.test(item)) continue;
+    if (containsMembraneCanary(item, peerSafeCanaryList)) continue;
+    styleDirectives.push(`沟通避讳细则（严禁外发复述）：${item}`);
+  }
+
+  const candidateLessons = params.mindLoop
+    ? params.mindLoop.getCalibratedLessons(4, { surfaces: ["concierge_envoy"] })
+    : (params.rawEnvoyLessons ?? []);
+
+  const envoyCalibratedLessons: string[] = [];
+  for (const rawLesson of candidateLessons) {
+    const clean = String(rawLesson ?? "").trim();
+    if (!clean) continue;
+    if (NON_ENVOY_SURFACE_TAG_RE.test(clean)) continue;
+    if (containsMembraneCanary(clean, params.forbiddenCanaryTokens)) continue;
+    if (!envoyCalibratedLessons.includes(clean)) {
+      envoyCalibratedLessons.push(clean);
+    }
+    if (envoyCalibratedLessons.length >= 4) break;
+  }
+
+  const filteredDirectives = styleDirectives.filter(
+    (d) => !containsMembraneCanary(d, params.forbiddenCanaryTokens),
+  );
+
+  const capsule: ConciergeEnvoyTasteCapsule = {
+    version: 1,
+    peerId: safePeerId,
+    formality,
+    brevity,
+    styleDirectives: filteredDirectives,
+    envoyCalibratedLessons,
+    generatedAt: nowIso,
+  };
+
+  assertZeroCanaryLeak(
+    `${capsule.styleDirectives.join("\n")}\n${capsule.envoyCalibratedLessons.join("\n")}`,
+    params.forbiddenCanaryTokens,
+  );
+  const peerSafeCanaries = (params.forbiddenCanaryTokens ?? []).filter(
+    (tok) => String(tok ?? "").trim().toLowerCase() !== safePeerId.toLowerCase(),
+  );
+  assertZeroCanaryLeak(JSON.stringify(capsule), peerSafeCanaries);
+
+  return capsule;
+}
+
+/**
+ * M5: 将外事品味胶囊渲染为外部拟稿提示词块，并在返回前强制执行零金丝雀泄露断言。
+ */
+export function renderConciergeEnvoyPromptBlock(
+  capsule: ConciergeEnvoyTasteCapsule,
+  forbiddenCanaryTokens?: readonly string[],
+): string {
+  const formalityLabel: Record<ConciergeEnvoyTasteCapsule["formality"], string> = {
+    formal_respectful: "正式克制敬语",
+    balanced_professional: "温和专业礼宾",
+    casual_direct: "自然直白口语",
+  };
+  const brevityLabel: Record<ConciergeEnvoyTasteCapsule["brevity"], string> = {
+    short_3_lines: "短句直给结论（不超过3行）",
+    structured_concise: "条理精炼优先",
+    detailed_context: "结构化交代前因后果与依据",
+  };
+
+  const lines: string[] = [
+    "=== 外事礼宾半透膜 (M5 · concierge_envoy) ===",
+    `对端沟通偏好 (${capsule.peerId})：语体=${formalityLabel[capsule.formality]}；篇幅=${brevityLabel[capsule.brevity]}。`,
+  ];
+  if (capsule.styleDirectives.length > 0) {
+    lines.push(`拟稿风格指引：${capsule.styleDirectives.join("；")}。`);
+  }
+  if (capsule.envoyCalibratedLessons.length > 0) {
+    lines.push(
+      "外事校准教训（仅限 concierge_envoy 表面）：\n" +
+        capsule.envoyCalibratedLessons.map((l) => `- ${l}`).join("\n"),
+    );
+  }
+  lines.push("M5 半透膜铁律：严禁泄露主理人私人生活(owner_life)、商业底价、密钥凭据或本机路径。");
+
+  const rendered = lines.join("\n");
+  const peerSafeCanaries = (forbiddenCanaryTokens ?? []).filter(
+    (tok) => String(tok ?? "").trim().toLowerCase() !== capsule.peerId.toLowerCase(),
+  );
+  assertZeroCanaryLeak(rendered, peerSafeCanaries);
+  return rendered;
+}
+
+/**
+ * M5: 外事外发文本强制守门断言，任何密钥、金额、本机路径或私有金丝雀词元一律抛出 MEMBRANE_CANARY_LEAK。
+ */
+export function guardConciergeOutboundText(
+  text: string,
+  forbiddenCanaryTokens?: readonly string[],
+): string {
+  const trimmed = String(text ?? "").trim();
+  assertZeroCanaryLeak(trimmed, forbiddenCanaryTokens);
+  return trimmed;
+}
+

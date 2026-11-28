@@ -119,6 +119,12 @@ export interface AtlasDelta {
   edges?: AtlasEdgeInput[];
 }
 
+export interface AtlasEmbeddingPort {
+  modelId?: string;
+  embedSync?: (text: string) => ArrayLike<number> | undefined;
+  embedBatch?: (texts: string[]) => Promise<Array<ArrayLike<number>>>;
+}
+
 export interface AtlasRecallOptions {
   planes?: GraphPlaneId[];
   minStratum?: EpistemicStratum;
@@ -126,6 +132,9 @@ export interface AtlasRecallOptions {
   maxHops?: number;
   maxNodes?: number;
   includeSuperseded?: boolean;
+  queryVector?: ArrayLike<number>;
+  nowIso?: string;
+  rrfK?: number;
 }
 
 export interface AtlasRecallResult {
@@ -134,6 +143,37 @@ export interface AtlasRecallResult {
   crossPlaneBridges: AtlasEdge[];
   markdown: string;
 }
+
+export interface EpisodeTranscriptSnippet {
+  atIso: string;
+  channel: string;
+  role: string;
+  snippet: string;
+  episodeId?: string;
+}
+
+export interface EpisodeProvenanceLookupHint {
+  episodeNodeId: string;
+  episodeId?: string;
+  channel?: string;
+  atIso?: string;
+  summary: string;
+}
+
+export type EpisodeProvenanceResult =
+  | {
+      allowed: false;
+      errorCode: "PROVENANCE_OWNER_ONLY";
+      chain: AtlasNode[];
+      episodeNodes: AtlasNode[];
+      transcriptSnippets: EpisodeTranscriptSnippet[];
+    }
+  | {
+      allowed: true;
+      chain: AtlasNode[];
+      episodeNodes: AtlasNode[];
+      transcriptSnippets: EpisodeTranscriptSnippet[];
+    };
 
 export interface AtlasPlaneSummary {
   totalNodes: number;
@@ -165,30 +205,232 @@ const STRATUM_WEIGHT: Record<EpistemicStratum, number> = {
   crystallized_wisdom: 1.35,
 };
 
+export const STRATUM_HALF_LIFE_DAYS: Record<EpistemicStratum, number> = {
+  raw_episodic: 14,
+  digested_state: 60,
+  verified_fact: 90,
+  crystallized_wisdom: 3650,
+};
+
+export const SOURCE_TRUST_WEIGHT: Record<string, number> = {
+  owner_confirmed: 1.15,
+  mutual_endorsed: 1.12,
+  deterministic_gate: 1.08,
+  legacy_import: 0.95,
+  llm_inferred: 0.92,
+};
+
+export function computeTemporalTrustMultiplier(
+  node: Pick<AtlasNode, "stratum" | "kind" | "sourceTrust" | "reinforcements" | "updatedAt">,
+  refTimeMs: number,
+): number {
+  const stratumWeight = STRATUM_WEIGHT[node.stratum] ?? 1.0;
+  const trustWeight = SOURCE_TRUST_WEIGHT[node.sourceTrust] ?? 1.0;
+  const halfLifeDays =
+    node.kind === "tombstone"
+      ? STRATUM_HALF_LIFE_DAYS.crystallized_wisdom
+      : (STRATUM_HALF_LIFE_DAYS[node.stratum] ?? 90);
+  const lambda = Math.LN2 / halfLifeDays;
+  const nodeMs = Date.parse(node.updatedAt);
+  const deltaDays =
+    Number.isFinite(nodeMs) && Number.isFinite(refTimeMs)
+      ? Math.max(0, (refTimeMs - nodeMs) / 86_400_000)
+      : 0;
+  const decay = Math.exp(-lambda * deltaDays);
+  const reinforcementBoost = 1 + 0.15 * Math.log1p(Math.max(0, node.reinforcements));
+  return stratumWeight * trustWeight * decay * reinforcementBoost;
+}
+
+export function encodeFloat32Blob(vec: ArrayLike<number>): Uint8Array {
+  const f32 = new Float32Array(vec.length);
+  for (let i = 0; i < vec.length; i++) {
+    const val = Number(vec[i]);
+    f32[i] = Number.isFinite(val) ? val : 0;
+  }
+  return new Uint8Array(f32.buffer.slice(0));
+}
+
+export function decodeFloat32Blob(blob: Uint8Array): Float32Array {
+  const byteLen = Math.floor(blob.byteLength / 4) * 4;
+  if (byteLen === 0) return new Float32Array(0);
+  const aligned = new Uint8Array(byteLen);
+  aligned.set(blob.subarray(0, byteLen));
+  return new Float32Array(aligned.buffer);
+}
+
+export function cosineSimilarity(a: ArrayLike<number>, b: ArrayLike<number>): number {
+  if (a.length === 0 || a.length !== b.length) return 0;
+  let dot = 0;
+  let normA = 0;
+  let normB = 0;
+  for (let i = 0; i < a.length; i++) {
+    const va = Number(a[i]) || 0;
+    const vb = Number(b[i]) || 0;
+    dot += va * vb;
+    normA += va * va;
+    normB += vb * vb;
+  }
+  const denom = Math.sqrt(normA) * Math.sqrt(normB);
+  if (denom <= 1e-12) return 0;
+  return dot / denom;
+}
+
+export function computeReciprocalRankFusion(
+  rankedLists: ReadonlyArray<ReadonlyArray<string>>,
+  k = 60,
+): Map<string, number> {
+  const safeK = Number.isFinite(k) && k > 0 ? k : 60;
+  const fused = new Map<string, number>();
+  for (const list of rankedLists) {
+    const seenInList = new Set<string>();
+    let rank = 0;
+    for (const id of list) {
+      if (!id || seenInList.has(id)) continue;
+      seenInList.add(id);
+      rank += 1;
+      fused.set(id, (fused.get(id) ?? 0) + 1 / (safeK + rank));
+    }
+  }
+  return fused;
+}
+
+export const SYNONYM_CLUSTERS: readonly (readonly string[])[] = [
+  // Commercial / Contract
+  ["账期", "净账期", "信用期", "付款周期", "结算期", "月结", "net", "net30", "net60", "net90", "payment-term"],
+  ["红线", "底线", "底价", "禁忌", "雷区", "护栏", "redline", "guardrail", "floor"],
+  ["报价", "单价", "总价", "顾问费", "价格", "预算", "quote", "pricing"],
+  ["违约", "赔付", "罚则", "连带责任", "无限连带", "毒丸条款", "penalty", "liability"],
+  ["首付", "预付款", "启动款", "零首付", "0首付", "downpayment"],
+  // Engineering / Ops
+  ["联调", "集成验证", "集成测试", "端到端验证", "integration", "e2e"],
+  ["部署", "上线", "发布", "热更新", "热更", "热重启", "滚动升级", "deploy", "release", "rollout", "hot-reload"],
+  ["门禁", "自检", "校验", "回归检查", "gate", "verify", "typecheck"],
+  ["沙盒", "工作树", "隔离环境", "worktree", "sandbox"],
+  ["金库", "跨链金库", "双链金库", "vault", "airtoken"],
+  ["边车", "无头守护", "辅助容器", "sidecar", "envoy"],
+  ["周报", "周度同步", "进展汇总", "weekly", "weekly-sync"],
+  // Personal / Duo / Epistemic
+  ["高负荷", "过载", "高压", "赶工", "熬夜", "精力透支", "压缩期", "overloaded", "crunch", "burnout"],
+  ["伴侣", "双人", "另一半", "爱人", "共处", "留白", "duo", "partner"],
+  ["墓碑", "避坑", "踩坑", "翻车", "教训", "证伪", "tombstone", "postmortem"],
+  ["沟通", "交流", "汇报", "对谈", "话术", "先给结论", "communication"],
+];
+
+const ASCII_ONLY_RE = /^[a-z0-9_.:/-]+$/;
+
+function escapeRegex(raw: string): string {
+  return raw.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function normalizeCompoundShorthands(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/(^|[^a-z0-9])net\s*(30|60|90)(?=$|[^a-z0-9])/gi, "$1net$2")
+    .replace(/0\s*首付/g, "0首付");
+}
+
+export function expandSearchSynonyms(tokens: readonly string[], rawText?: string): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const add = (tok: string) => {
+    const clean = tok.trim().toLowerCase();
+    if (!clean || seen.has(clean)) return;
+    seen.add(clean);
+    out.push(clean);
+  };
+
+  const normalizedTokens: string[] = [];
+  for (const t of tokens) {
+    const norm = normalizeCompoundShorthands(String(t ?? "").trim());
+    if (!norm) continue;
+    normalizedTokens.push(norm);
+    add(norm);
+  }
+  const tokenSet = new Set<string>(out);
+  const rawNorm = rawText ? normalizeCompoundShorthands(rawText) : "";
+
+  for (const cluster of SYNONYM_CLUSTERS) {
+    let matched = false;
+    for (const syn of cluster) {
+      const synLower = syn.toLowerCase();
+      if (tokenSet.has(synLower)) {
+        matched = true;
+        break;
+      }
+      if (ASCII_ONLY_RE.test(synLower)) {
+        if (rawNorm) {
+          const boundaryRe = new RegExp(`(?:^|[^a-z0-9])${escapeRegex(synLower)}(?:$|[^a-z0-9])`, "i");
+          if (boundaryRe.test(rawNorm)) {
+            matched = true;
+            break;
+          }
+        }
+      } else {
+        if (rawNorm && rawNorm.includes(synLower)) {
+          matched = true;
+          break;
+        }
+        if (normalizedTokens.some((tok) => tok.length >= synLower.length && tok.includes(synLower))) {
+          matched = true;
+          break;
+        }
+      }
+    }
+    if (matched) {
+      for (const syn of cluster) {
+        add(syn);
+      }
+    }
+  }
+  return out;
+}
+
 const DEFAULT_CALLER_PRINCIPALS: PrincipalId[] = ["sugent_self", "owner:M"];
 
 const CJK_STOP_RE =
   /(请问|一下|什么情况|是什么|怎么|情况|目前|现在|关于|能不能|可以|帮我|的|了|吗|呢|啊|吧)/g;
 
-export function tokenizeForSearch(text: string): string[] {
+function tokenizeBaseForSearch(text: string): string[] {
   const lower = String(text ?? "").toLowerCase().trim();
   if (!lower) return [];
   const tokens: string[] = [];
+  const seen = new Set<string>();
+  const pushTok = (tok: string) => {
+    if (!tok || seen.has(tok)) return;
+    seen.add(tok);
+    tokens.push(tok);
+  };
+
+  for (const m of lower.matchAll(/(?:^|[^a-z0-9])net\s*(30|60|90)(?=$|[^a-z0-9])/g)) {
+    if (m[1]) {
+      pushTok(`net${m[1]}`);
+      pushTok("net");
+    }
+  }
+  if (/0\s*首付/.test(lower)) {
+    pushTok("0首付");
+  }
+
   for (const seg of lower.split(/[\s,.;:!?，。；：！？、()（）【】\[\]"'“”‘’]+/).filter(Boolean)) {
     const asciiMatches = seg.match(/[a-z0-9_.:/-]{2,}/g) ?? [];
     for (const tok of asciiMatches) {
-      tokens.push(tok);
+      pushTok(tok);
       const subParts = tok.split(/[.:/_-]+/).filter((p) => p.length >= 2);
-      if (subParts.length > 1) tokens.push(...subParts);
+      if (subParts.length > 1) {
+        for (const sp of subParts) pushTok(sp);
+      }
     }
     const cjkClean = seg.replace(CJK_STOP_RE, " ");
     for (const cjkSeg of cjkClean.split(/\s+/).filter(Boolean)) {
       const chars = Array.from(cjkSeg).filter((ch) => /\p{Script=Han}/u.test(ch));
       if (chars.length === 1) {
-        tokens.push(chars[0]!);
-      } else {
+        pushTok(chars[0]!);
+      } else if (chars.length >= 2) {
         for (let i = 0; i + 1 < chars.length; i++) {
-          tokens.push(chars[i]! + chars[i + 1]!);
+          pushTok(chars[i]! + chars[i + 1]!);
+        }
+        for (let i = 0; i + 2 < chars.length; i++) {
+          pushTok(chars[i]! + chars[i + 1]! + chars[i + 2]!);
         }
       }
     }
@@ -196,9 +438,27 @@ export function tokenizeForSearch(text: string): string[] {
   return tokens;
 }
 
+export function tokenizeForSearch(text: string): string[] {
+  const raw = String(text ?? "").trim();
+  if (!raw) return [];
+  const baseTokens = tokenizeBaseForSearch(raw);
+  return expandSearchSynonyms(baseTokens, raw);
+}
+
 function buildSearchText(node: AtlasNode): string {
   const raw = `${node.id} ${node.plane} ${node.kind} ${node.name} ${node.summary} ${node.tags.join(" ")} ${(node.steps ?? []).join(" ")}`;
   return tokenizeForSearch(raw).join(" ");
+}
+
+function isOwnerOnlyProvenanceEdge(edge: {
+  relation: string;
+  isMembraneEdge?: boolean;
+  principalAcl?: readonly PrincipalId[];
+}): boolean {
+  if (edge.relation !== "derived_from_episode" || edge.isMembraneEdge === true) return false;
+  if (!edge.principalAcl || edge.principalAcl.length === 0) return false;
+  const unique = Array.from(new Set(edge.principalAcl));
+  return unique.length === 1 && unique[0] === "owner:M";
 }
 
 function defaultPrincipalsForPlane(plane: GraphPlaneId): PrincipalId[] {
@@ -353,15 +613,21 @@ export class StereoscopicAtlas {
   private readonly snapshotPath: string;
   private readonly db: DatabaseSync;
   private readonly bm25 = new InProcessBM25Index();
+  private embeddingPort: AtlasEmbeddingPort | undefined;
+  private embeddings = new Map<
+    string,
+    { dim: number; vector: Float32Array; modelId: string; updatedAt: string }
+  >();
   private nodes = new Map<string, AtlasNode>();
   private edges = new Map<string, AtlasEdge>();
   private closed = false;
 
-  constructor(rootDirOrMemory: string) {
+  constructor(rootDirOrMemory: string, opts?: { embeddingPort?: AtlasEmbeddingPort }) {
     this.isMemory = rootDirOrMemory === ":memory:";
     this.rootDir = this.isMemory ? ":memory:" : path.resolve(rootDirOrMemory);
     this.dbPath = this.isMemory ? ":memory:" : path.join(this.rootDir, "atlas.db");
     this.snapshotPath = this.isMemory ? "" : path.join(this.rootDir, "atlas-snapshot.json");
+    this.embeddingPort = opts?.embeddingPort;
     if (!this.isMemory) {
       fs.mkdirSync(this.rootDir, { recursive: true, mode: 0o700 });
     }
@@ -376,6 +642,10 @@ export class StereoscopicAtlas {
     }
     this.fts5Enabled = this.initSchema();
     this.loadFromDb();
+  }
+
+  attachEmbeddingPort(port: AtlasEmbeddingPort | undefined): void {
+    this.embeddingPort = port;
   }
 
   private initSchema(): boolean {
@@ -418,6 +688,13 @@ export class StereoscopicAtlas {
       );
       CREATE INDEX IF NOT EXISTS idx_atlas_edges_from ON atlas_edges(from_id);
       CREATE INDEX IF NOT EXISTS idx_atlas_edges_to ON atlas_edges(to_id);
+      CREATE TABLE IF NOT EXISTS atlas_embeddings (
+        node_id TEXT PRIMARY KEY,
+        dim INTEGER NOT NULL,
+        vector_blob BLOB NOT NULL,
+        model_id TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
     `);
     try {
       this.db.exec(
@@ -445,13 +722,37 @@ export class StereoscopicAtlas {
       this.nodes.set(node.id, node);
       if (!node.supersededAt && !node.archivedAt) {
         if (!this.fts5Enabled) {
-          this.bm25.upsert(node.id, tokenizeForSearch(buildSearchText(node)));
+          const searchText = buildSearchText(node);
+          this.bm25.upsert(node.id, searchText ? searchText.split(/\s+/).filter(Boolean) : []);
         }
       }
     }
     for (const row of edgeRows) {
       const edge = this.rowToEdge(row);
       this.edges.set(edge.id, edge);
+    }
+    const embRows = this.db
+      .prepare("SELECT node_id, dim, vector_blob, model_id, updated_at FROM atlas_embeddings")
+      .all() as Record<string, unknown>[];
+    for (const row of embRows) {
+      const nodeId = String(row.node_id);
+      const node = this.nodes.get(nodeId);
+      if (!node || node.supersededAt || node.archivedAt) {
+        this.db.prepare("DELETE FROM atlas_embeddings WHERE node_id = ?").run(nodeId);
+        continue;
+      }
+      const rawBlob = row.vector_blob;
+      if (rawBlob instanceof Uint8Array) {
+        const vec = decodeFloat32Blob(rawBlob);
+        if (vec.length > 0) {
+          this.embeddings.set(nodeId, {
+            dim: Number(row.dim) || vec.length,
+            vector: vec,
+            modelId: String(row.model_id),
+            updatedAt: String(row.updated_at),
+          });
+        }
+      }
     }
     if (this.nodes.size === 0 && !this.isMemory && fs.existsSync(this.snapshotPath)) {
       this.hydrateFromSnapshot();
@@ -599,6 +900,125 @@ export class StereoscopicAtlas {
       );
   }
 
+  private removeNodeEmbedding(nodeId: string): void {
+    this.db.prepare("DELETE FROM atlas_embeddings WHERE node_id = ?").run(nodeId);
+    this.embeddings.delete(nodeId);
+  }
+
+  private buildEmbeddingText(node: AtlasNode): string {
+    return `${node.name}\n${node.summary}\n${node.tags.join(" ")}`.trim();
+  }
+
+  upsertNodeEmbedding(
+    nodeId: string,
+    vector: ArrayLike<number>,
+    modelId = "byok-embedding",
+    nowIso = new Date().toISOString(),
+  ): void {
+    if (!nodeId || vector.length === 0) return;
+    const blob = encodeFloat32Blob(vector);
+    const decoded = decodeFloat32Blob(blob);
+    const dim = decoded.length;
+    if (dim === 0) return;
+    this.db
+      .prepare(
+        `INSERT INTO atlas_embeddings (node_id, dim, vector_blob, model_id, updated_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(node_id) DO UPDATE SET
+           dim=excluded.dim, vector_blob=excluded.vector_blob,
+           model_id=excluded.model_id, updated_at=excluded.updated_at`,
+      )
+      .run(nodeId, dim, blob, modelId, nowIso);
+    this.embeddings.set(nodeId, {
+      dim,
+      vector: decoded,
+      modelId,
+      updatedAt: nowIso,
+    });
+  }
+
+  getNodeEmbedding(
+    nodeId: string,
+  ): { dim: number; vector: Float32Array; modelId: string; updatedAt: string } | undefined {
+    const entry = this.embeddings.get(nodeId);
+    if (!entry) return undefined;
+    return {
+      dim: entry.dim,
+      vector: entry.vector.slice(),
+      modelId: entry.modelId,
+      updatedAt: entry.updatedAt,
+    };
+  }
+
+  async indexMissingEmbeddings(opts?: { limit?: number; modelId?: string }): Promise<{ indexed: number }> {
+    const port = this.embeddingPort;
+    if (!port || (!port.embedBatch && !port.embedSync)) {
+      return { indexed: 0 };
+    }
+    const limit = Math.max(0, opts?.limit ?? 100);
+    if (limit === 0) return { indexed: 0 };
+    const targetModelId = opts?.modelId ?? port.modelId ?? "byok-embedding";
+    const missing: AtlasNode[] = [];
+    for (const node of this.nodes.values()) {
+      if (node.supersededAt || node.archivedAt) continue;
+      const existingEmb = this.embeddings.get(node.id);
+      if (existingEmb && (!opts?.modelId || existingEmb.modelId === opts.modelId)) {
+        continue;
+      }
+      missing.push(node);
+      if (missing.length >= limit) break;
+    }
+    if (missing.length === 0) return { indexed: 0 };
+
+    const nowIso = new Date().toISOString();
+    let indexed = 0;
+    if (port.embedBatch) {
+      try {
+        const texts = missing.map((n) => this.buildEmbeddingText(n));
+        const vectors = await port.embedBatch(texts);
+        this.db.exec("BEGIN");
+        try {
+          for (let i = 0; i < missing.length; i++) {
+            const vec = vectors[i];
+            if (vec && vec.length > 0) {
+              this.upsertNodeEmbedding(missing[i]!.id, vec, targetModelId, nowIso);
+              indexed += 1;
+            }
+          }
+          this.db.exec("COMMIT");
+        } catch (err) {
+          this.db.exec("ROLLBACK");
+          throw err;
+        }
+        return { indexed };
+      } catch {
+        if (!port.embedSync) return { indexed: 0 };
+      }
+    }
+
+    if (port.embedSync) {
+      this.db.exec("BEGIN");
+      try {
+        for (const node of missing) {
+          try {
+            const vec = port.embedSync(this.buildEmbeddingText(node));
+            if (vec && vec.length > 0) {
+              this.upsertNodeEmbedding(node.id, vec, targetModelId, nowIso);
+              indexed += 1;
+            }
+          } catch {
+            /* graceful skip on offline / transient embedding error */
+          }
+        }
+        this.db.exec("COMMIT");
+      } catch (err) {
+        this.db.exec("ROLLBACK");
+        throw err;
+      }
+    }
+    return { indexed };
+  }
+
   private removeFromSearchIndex(nodeId: string): void {
     if (this.fts5Enabled) {
       this.db.prepare("DELETE FROM atlas_fts WHERE node_id = ?").run(nodeId);
@@ -606,6 +1026,7 @@ export class StereoscopicAtlas {
       this.db.prepare("DELETE FROM atlas_search_index WHERE node_id = ?").run(nodeId);
       this.bm25.remove(nodeId);
     }
+    this.removeNodeEmbedding(nodeId);
   }
 
   private syncSearchIndex(node: AtlasNode): void {
@@ -628,6 +1049,21 @@ export class StereoscopicAtlas {
         )
         .run(node.id, searchText, JSON.stringify(tokens), tokens.length);
       this.bm25.upsert(node.id, tokens);
+    }
+    if (this.embeddingPort?.embedSync) {
+      try {
+        const vec = this.embeddingPort.embedSync(this.buildEmbeddingText(node));
+        if (vec && vec.length > 0) {
+          this.upsertNodeEmbedding(
+            node.id,
+            vec,
+            this.embeddingPort.modelId ?? "byok-embedding",
+            node.updatedAt,
+          );
+        }
+      } catch {
+        /* graceful offline fallback */
+      }
     }
   }
 
@@ -735,7 +1171,11 @@ export class StereoscopicAtlas {
       const toNode = projectedNodes.get(edge.to);
       const isCrossPlane =
         Boolean(edge.isMembraneEdge) || Boolean(fromNode && toNode && fromNode.plane !== toNode.plane);
-      if (isCrossPlane && (fromNode?.stratum === "raw_episodic" || toNode?.stratum === "raw_episodic")) {
+      if (
+        isCrossPlane &&
+        !isOwnerOnlyProvenanceEdge(edge) &&
+        (fromNode?.stratum === "raw_episodic" || toNode?.stratum === "raw_episodic")
+      ) {
         throw new AtlasError(
           "ATLAS_RAW_MEMBRANE_FORBIDDEN",
           `Cannot create cross-plane or membrane edge involving raw_episodic node (${edge.from} -> ${edge.to})`,
@@ -749,7 +1189,10 @@ export class StereoscopicAtlas {
         if (edge.supersededAt || (edge.from !== merged.id && edge.to !== merged.id)) continue;
         const fromN = projectedNodes.get(edge.from);
         const toN = projectedNodes.get(edge.to);
-        if (edge.isMembraneEdge || (fromN && toN && fromN.plane !== toN.plane)) {
+        if (
+          (edge.isMembraneEdge || (fromN && toN && fromN.plane !== toN.plane)) &&
+          !isOwnerOnlyProvenanceEdge(edge)
+        ) {
           throw new AtlasError("ATLAS_RAW_MEMBRANE_FORBIDDEN", `Node ${merged.id} has active membrane edge`);
         }
       }
@@ -819,7 +1262,7 @@ export class StereoscopicAtlas {
         const fromNode = this.nodes.get(edgeInput.from);
         const toNode = this.nodes.get(edgeInput.to);
         const crossPlane = Boolean(fromNode && toNode && fromNode.plane !== toNode.plane);
-        const isMembrane = Boolean(edgeInput.isMembraneEdge) || crossPlane;
+        const isMembrane = Boolean(edgeInput.isMembraneEdge) || (crossPlane && !isOwnerOnlyProvenanceEdge(edgeInput));
         const plane: GraphPlaneId = edgeInput.plane ?? fromNode?.plane ?? toNode?.plane ?? "owner_life";
         const edgeId = `${edgeInput.from}--${edgeInput.relation}-->${edgeInput.to}`;
         const existing = this.edges.get(edgeId);
@@ -945,6 +1388,297 @@ export class StereoscopicAtlas {
     }
     this.writeSnapshot();
     return updated;
+  }
+
+  importLosslessSnapshot(snapshot: {
+    nodes: readonly AtlasNode[];
+    edges: readonly AtlasEdge[];
+  }): { importedNodes: number; importedEdges: number } {
+    const projectedNodes = new Map<string, AtlasNode>(this.nodes);
+    const preparedNodes: AtlasNode[] = [];
+    for (const n of snapshot.nodes ?? []) {
+      const secretText = `${n.name}\n${n.summary}\n${(n.tags ?? []).join(" ")}\n${(n.steps ?? []).join(" ")}`;
+      if (looksSecret(secretText)) {
+        throw new AtlasError("ATLAS_SECRET_REJECTED", `Refused secret-like content in snapshot node ${n.id}`);
+      }
+      const existing = this.nodes.get(n.id);
+      const keepLocalTombstone =
+        Boolean(existing && (existing.supersededAt || existing.archivedAt)) &&
+        Boolean(existing && existing.updatedAt > n.updatedAt);
+      const cloned: AtlasNode = {
+        id: n.id,
+        plane: n.plane,
+        stratum: n.stratum,
+        kind: n.kind,
+        name: n.name,
+        summary: n.summary,
+        tags: Array.from(new Set(n.tags ?? [])),
+        principalAcl:
+          n.principalAcl && n.principalAcl.length > 0
+            ? Array.from(new Set(n.principalAcl))
+            : defaultPrincipalsForPlane(n.plane),
+        reinforcements: n.reinforcements,
+        confidence: n.confidence,
+        sourceTrust: n.sourceTrust,
+        ...(n.steps?.length ? { steps: [...n.steps] } : {}),
+        ...(n.skillGateStatus ? { skillGateStatus: n.skillGateStatus } : {}),
+        updatedAt: keepLocalTombstone && existing ? existing.updatedAt : n.updatedAt,
+        ...(n.supersededAt
+          ? { supersededAt: n.supersededAt }
+          : keepLocalTombstone && existing?.supersededAt
+            ? { supersededAt: existing.supersededAt }
+            : {}),
+        ...(n.supersededBy
+          ? { supersededBy: n.supersededBy }
+          : keepLocalTombstone && existing?.supersededBy
+            ? { supersededBy: existing.supersededBy }
+            : {}),
+        ...(n.archivedAt
+          ? { archivedAt: n.archivedAt }
+          : keepLocalTombstone && existing?.archivedAt
+            ? { archivedAt: existing.archivedAt }
+            : {}),
+      };
+      preparedNodes.push(cloned);
+      projectedNodes.set(cloned.id, cloned);
+    }
+
+    const preparedEdges: AtlasEdge[] = [];
+    for (const e of snapshot.edges ?? []) {
+      if (looksSecret(`${e.relation} ${e.source} ${e.membranePolicy ?? ""}`)) {
+        throw new AtlasError("ATLAS_SECRET_REJECTED", `Refused secret-like content in snapshot edge ${e.from}->${e.to}`);
+      }
+      const fromNode = projectedNodes.get(e.from);
+      const toNode = projectedNodes.get(e.to);
+      const isCrossPlane =
+        Boolean(e.isMembraneEdge) || Boolean(fromNode && toNode && fromNode.plane !== toNode.plane);
+      if (
+        !e.supersededAt &&
+        isCrossPlane &&
+        !isOwnerOnlyProvenanceEdge(e) &&
+        (fromNode?.stratum === "raw_episodic" || toNode?.stratum === "raw_episodic")
+      ) {
+        throw new AtlasError(
+          "ATLAS_RAW_MEMBRANE_FORBIDDEN",
+          `Cannot import cross-plane or membrane edge involving raw_episodic node (${e.from} -> ${e.to})`,
+        );
+      }
+      const edgeId = e.id || `${e.from}--${e.relation}-->${e.to}`;
+      const existingEdge = this.edges.get(edgeId);
+      const keepEdgeTombstone =
+        Boolean(existingEdge?.supersededAt) && Boolean(existingEdge && existingEdge.updatedAt > e.updatedAt);
+      const clonedEdge: AtlasEdge = {
+        id: edgeId,
+        plane: e.plane ?? fromNode?.plane ?? toNode?.plane ?? "owner_life",
+        from: e.from,
+        relation: e.relation,
+        to: e.to,
+        weight: e.weight,
+        source: e.source,
+        ...(e.isMembraneEdge ? { isMembraneEdge: true } : {}),
+        ...(e.membranePolicy ? { membranePolicy: e.membranePolicy } : {}),
+        ...(e.principalAcl?.length ? { principalAcl: Array.from(new Set(e.principalAcl)) } : {}),
+        validFrom: e.validFrom,
+        updatedAt: keepEdgeTombstone && existingEdge ? existingEdge.updatedAt : e.updatedAt,
+        ...(e.supersededAt
+          ? { supersededAt: e.supersededAt }
+          : keepEdgeTombstone && existingEdge?.supersededAt
+            ? { supersededAt: existingEdge.supersededAt }
+            : {}),
+      };
+      preparedEdges.push(clonedEdge);
+    }
+
+    let importedNodes = 0;
+    let importedEdges = 0;
+    this.db.exec("BEGIN");
+    try {
+      for (const node of preparedNodes) {
+        this.nodes.set(node.id, node);
+        this.persistNode(node);
+        this.syncSearchIndex(node);
+        importedNodes += 1;
+      }
+      for (const edge of preparedEdges) {
+        this.edges.set(edge.id, edge);
+        this.persistEdge(edge);
+        importedEdges += 1;
+      }
+      this.db.exec("COMMIT");
+    } catch (err) {
+      this.db.exec("ROLLBACK");
+      throw err;
+    }
+    this.writeSnapshot();
+    return { importedNodes, importedEdges };
+  }
+
+  traceEpisodeProvenance(
+    nodeId: string,
+    opts?: {
+      callerPrincipals?: readonly PrincipalId[];
+      maxDepth?: number;
+      lookupTranscript?: (
+        hint: EpisodeProvenanceLookupHint,
+      ) => Array<{ atIso: string; channel: string; role: string; snippet: string; episodeId?: string }>;
+    },
+  ): EpisodeProvenanceResult {
+    const callerPrincipals = opts?.callerPrincipals ?? DEFAULT_CALLER_PRINCIPALS;
+    if (!callerPrincipals.includes("owner:M")) {
+      return {
+        allowed: false,
+        errorCode: "PROVENANCE_OWNER_ONLY",
+        chain: [],
+        episodeNodes: [],
+        transcriptSnippets: [],
+      };
+    }
+
+    const startNode = this.nodes.get(nodeId);
+    if (!startNode || !hasPrincipalAccess(startNode.principalAcl, callerPrincipals)) {
+      return {
+        allowed: true,
+        chain: [],
+        episodeNodes: [],
+        transcriptSnippets: [],
+      };
+    }
+
+    const maxDepth = Math.max(0, opts?.maxDepth ?? 4);
+    const provenanceRelations = new Set(["derived_from_episode", "synthesized_from", "supersedes"]);
+    const visitedIds = new Set<string>([startNode.id]);
+    const chain: AtlasNode[] = [startNode];
+    let queue: string[] = [startNode.id];
+
+    for (let depth = 0; depth < maxDepth && queue.length > 0; depth++) {
+      const nextQueue: string[] = [];
+      for (const curId of queue) {
+        for (const edge of this.edges.values()) {
+          if (!provenanceRelations.has(edge.relation)) continue;
+          if (edge.principalAcl?.length && !hasPrincipalAccess(edge.principalAcl, callerPrincipals)) continue;
+
+          let targetId: string | undefined;
+          if (edge.from === curId) {
+            targetId = edge.to;
+          } else if (edge.to === curId && edge.relation === "derived_from_episode") {
+            const candidateFrom = this.nodes.get(edge.from);
+            if (candidateFrom?.stratum === "raw_episodic") {
+              targetId = edge.from;
+            }
+          }
+          if (!targetId || visitedIds.has(targetId)) continue;
+          const targetNode = this.nodes.get(targetId);
+          if (!targetNode || !hasPrincipalAccess(targetNode.principalAcl, callerPrincipals)) continue;
+          visitedIds.add(targetNode.id);
+          chain.push(targetNode);
+          nextQueue.push(targetNode.id);
+        }
+
+        for (const candidatePredecessor of this.nodes.values()) {
+          if (candidatePredecessor.supersededBy !== curId) continue;
+          if (visitedIds.has(candidatePredecessor.id)) continue;
+          if (!hasPrincipalAccess(candidatePredecessor.principalAcl, callerPrincipals)) continue;
+          visitedIds.add(candidatePredecessor.id);
+          chain.push(candidatePredecessor);
+          nextQueue.push(candidatePredecessor.id);
+        }
+      }
+      queue = nextQueue;
+    }
+
+    const episodeNodes = chain.filter(
+      (n) =>
+        n.stratum === "raw_episodic" ||
+        n.kind === "episode_anchor" ||
+        n.id.startsWith("ep:") ||
+        n.tags.some((t) => t === "episode_anchor" || t.startsWith("ep:") || t.startsWith("episode:")),
+    );
+
+    const transcriptSnippets: EpisodeTranscriptSnippet[] = [];
+    if (opts?.lookupTranscript && episodeNodes.length > 0) {
+      const seenSnippets = new Set<string>();
+      for (const epNode of episodeNodes) {
+        const hint = this.extractEpisodeLookupHint(epNode);
+        const found = opts.lookupTranscript(hint) ?? [];
+        for (const item of found) {
+          const dedupKey = `${item.atIso}|${item.channel}|${item.role}|${item.snippet}`;
+          if (seenSnippets.has(dedupKey)) continue;
+          seenSnippets.add(dedupKey);
+          transcriptSnippets.push({
+            atIso: item.atIso,
+            channel: item.channel,
+            role: item.role,
+            snippet: item.snippet,
+            ...(item.episodeId ? { episodeId: item.episodeId } : hint.episodeId ? { episodeId: hint.episodeId } : {}),
+          });
+        }
+      }
+    }
+
+    return {
+      allowed: true,
+      chain,
+      episodeNodes,
+      transcriptSnippets,
+    };
+  }
+
+  private extractEpisodeLookupHint(epNode: AtlasNode): EpisodeProvenanceLookupHint {
+    let episodeId: string | undefined;
+    if (epNode.id.startsWith("ep:")) {
+      episodeId = epNode.id;
+    } else {
+      for (const tag of epNode.tags) {
+        if (tag.startsWith("ep:")) {
+          episodeId = tag;
+          break;
+        }
+        if (tag.startsWith("episode:")) {
+          episodeId = tag.slice("episode:".length);
+          break;
+        }
+      }
+    }
+
+    let channel: string | undefined;
+    let atIso: string | undefined;
+    for (const tag of epNode.tags) {
+      if (!channel && tag.startsWith("channel:")) {
+        channel = tag.slice("channel:".length).trim();
+      } else if (!atIso && tag.startsWith("at:")) {
+        const candidateIso = tag.slice("at:".length).trim();
+        if (Number.isFinite(Date.parse(candidateIso))) {
+          atIso = candidateIso;
+        }
+      }
+    }
+
+    if (episodeId) {
+      const epParts = episodeId.match(/^ep:([^:]+):(\d{10,15}):/);
+      if (epParts) {
+        if (!channel && epParts[1]) channel = epParts[1];
+        if (!atIso && epParts[2]) {
+          const ts = Number(epParts[2]);
+          if (Number.isFinite(ts)) atIso = new Date(ts).toISOString();
+        }
+      }
+    }
+
+    if (!channel) {
+      const summaryCh = epNode.summary.match(/\[(weixin|feishu|web_ui|web)\]/i);
+      if (summaryCh?.[1]) channel = summaryCh[1].toLowerCase();
+    }
+    if (!atIso && Number.isFinite(Date.parse(epNode.updatedAt))) {
+      atIso = epNode.updatedAt;
+    }
+
+    return {
+      episodeNodeId: epNode.id,
+      ...(episodeId ? { episodeId } : {}),
+      ...(channel ? { channel } : {}),
+      ...(atIso ? { atIso } : {}),
+      summary: epNode.summary,
+    };
   }
 
   ingestLegacyDelta(
@@ -1081,6 +1815,21 @@ export class StereoscopicAtlas {
     return scores;
   }
 
+  private resolveReferenceTimeMs(eligibleNodes: Iterable<AtlasNode>, nowIso?: string): number {
+    if (nowIso) {
+      const parsed = Date.parse(nowIso);
+      if (Number.isFinite(parsed)) return parsed;
+    }
+    let maxUpdatedMs = -Infinity;
+    for (const node of eligibleNodes) {
+      const parsed = Date.parse(node.updatedAt);
+      if (Number.isFinite(parsed) && parsed > maxUpdatedMs) {
+        maxUpdatedMs = parsed;
+      }
+    }
+    return Number.isFinite(maxUpdatedMs) ? maxUpdatedMs : Date.now();
+  }
+
   recallStereoscopic(query: string, opts?: AtlasRecallOptions): AtlasRecallResult {
     const callerPrincipals = opts?.callerPrincipals ?? DEFAULT_CALLER_PRINCIPALS;
     const maxHops = opts?.maxHops ?? 2;
@@ -1109,70 +1858,177 @@ export class StereoscopicAtlas {
       return true;
     });
 
+    const refTimeMs = this.resolveReferenceTimeMs(eligibleNodes.values(), opts?.nowIso);
+    const temporalTrustMap = new Map<string, number>();
+    for (const node of eligibleNodes.values()) {
+      temporalTrustMap.set(node.id, computeTemporalTrustMultiplier(node, refTimeMs));
+    }
+
     const trimmed = query.trim();
     const scoreMap = new Map<string, number>();
-    if (!trimmed) {
+    if (!trimmed && !opts?.queryVector) {
       const ranked = Array.from(eligibleNodes.values())
         .map((n) => ({
           node: n,
-          score: STRATUM_WEIGHT[n.stratum] * (1 + Math.log1p(n.reinforcements) * 0.2),
+          score: temporalTrustMap.get(n.id) ?? 1,
         }))
-        .sort((a, b) => b.score - a.score || b.node.updatedAt.localeCompare(a.node.updatedAt) || a.node.id.localeCompare(b.node.id))
+        .sort(
+          (a, b) =>
+            b.score - a.score ||
+            b.node.updatedAt.localeCompare(a.node.updatedAt) ||
+            a.node.id.localeCompare(b.node.id),
+        )
         .slice(0, maxNodes);
       for (const item of ranked) scoreMap.set(item.node.id, item.score);
-      return this.finalizeRecall(ranked.map((r) => r.node), eligibleEdges, scoreMap);
+      return this.finalizeRecall(
+        ranked.map((r) => r.node),
+        eligibleEdges,
+        scoreMap,
+      );
     }
 
-    const queryLower = trimmed.toLowerCase();
-    const rawTokens = tokenizeForSearch(trimmed);
-    const queryTokens = rawTokens.length > 0 ? rawTokens : [queryLower];
-    const bm25Scores = this.computeBm25Scores(queryTokens);
+    const lexicalScoreMap = new Map<string, number>();
+    if (trimmed) {
+      const queryLower = trimmed.toLowerCase();
+      const rawBaseTokens = tokenizeBaseForSearch(trimmed);
+      const baseTokens = rawBaseTokens.length > 0 ? rawBaseTokens : [queryLower];
+      const baseTokenSet = new Set<string>(baseTokens);
+      const expandedTokens = tokenizeForSearch(trimmed);
+      const synOnlyTokens = expandedTokens.filter((t) => !baseTokenSet.has(t));
+
+      const bm25Base = this.computeBm25Scores(baseTokens);
+      const bm25Syn =
+        synOnlyTokens.length > 0 ? this.computeBm25Scores(synOnlyTokens) : new Map<string, number>();
+
+      for (const node of eligibleNodes.values()) {
+        const hay = `${node.id} ${node.name} ${node.summary} ${node.tags.join(" ")} ${(node.steps ?? []).join(" ")}`.toLowerCase();
+        const bm25Raw = (bm25Base.get(node.id) ?? 0) + (bm25Syn.get(node.id) ?? 0) * 0.55;
+        const directHits = baseTokens.filter((t) => hay.includes(t)).length;
+        const synHits = synOnlyTokens.filter((t) => hay.includes(t)).length;
+        const phraseBoost = hay.includes(queryLower) ? 1.5 : 0;
+        const baseCoverage = baseTokens.length > 0 ? directHits / baseTokens.length : 0;
+        const synBoost = synHits > 0 ? Math.min(1.0, synHits * 0.35) : 0;
+        const lexicalScore = bm25Raw + baseCoverage * 1.2 + synBoost + phraseBoost;
+        if (lexicalScore > 0) {
+          lexicalScoreMap.set(node.id, lexicalScore);
+        }
+      }
+    }
+
+    const lexicalRankedIds = Array.from(lexicalScoreMap.entries())
+      .sort((a, b) => {
+        const diff = b[1] - a[1];
+        if (Math.abs(diff) > 1e-9) return diff;
+        const multDiff = (temporalTrustMap.get(b[0]) ?? 1) - (temporalTrustMap.get(a[0]) ?? 1);
+        if (Math.abs(multDiff) > 1e-9) return multDiff;
+        const nodeA = eligibleNodes.get(a[0])!;
+        const nodeB = eligibleNodes.get(b[0])!;
+        return nodeB.updatedAt.localeCompare(nodeA.updatedAt) || nodeA.id.localeCompare(nodeB.id);
+      })
+      .map(([id]) => id);
+
+    let resolvedQueryVec: ArrayLike<number> | undefined = opts?.queryVector;
+    if (!resolvedQueryVec && trimmed && this.embeddingPort?.embedSync) {
+      try {
+        resolvedQueryVec = this.embeddingPort.embedSync(trimmed);
+      } catch {
+        resolvedQueryVec = undefined;
+      }
+    }
+
+    const vectorSimMap = new Map<string, number>();
+    if (resolvedQueryVec && resolvedQueryVec.length > 0) {
+      for (const node of eligibleNodes.values()) {
+        const emb = this.embeddings.get(node.id);
+        if (!emb || emb.dim !== resolvedQueryVec.length) continue;
+        const sim = cosineSimilarity(resolvedQueryVec, emb.vector);
+        if (sim > 0.15) {
+          vectorSimMap.set(node.id, sim);
+        }
+      }
+    }
+
+    const vectorRankedIds = Array.from(vectorSimMap.entries())
+      .sort((a, b) => {
+        const diff = b[1] - a[1];
+        if (Math.abs(diff) > 1e-9) return diff;
+        const multDiff = (temporalTrustMap.get(b[0]) ?? 1) - (temporalTrustMap.get(a[0]) ?? 1);
+        if (Math.abs(multDiff) > 1e-9) return multDiff;
+        const nodeA = eligibleNodes.get(a[0])!;
+        const nodeB = eligibleNodes.get(b[0])!;
+        return nodeB.updatedAt.localeCompare(nodeA.updatedAt) || nodeA.id.localeCompare(nodeB.id);
+      })
+      .map(([id]) => id);
+
+    const rrfK = opts?.rrfK && Number.isFinite(opts.rrfK) && opts.rrfK > 0 ? opts.rrfK : 60;
+    const rankedLists: string[][] = [];
+    if (lexicalRankedIds.length > 0) rankedLists.push(lexicalRankedIds);
+    if (vectorRankedIds.length > 0) rankedLists.push(vectorRankedIds);
+
+    const rrfMap = computeReciprocalRankFusion(rankedLists, rrfK);
+    let maxLex = 1;
+    for (const val of lexicalScoreMap.values()) {
+      if (val > maxLex) maxLex = val;
+    }
 
     const seedList: Array<{ node: AtlasNode; score: number }> = [];
-    for (const node of eligibleNodes.values()) {
-      const hay = `${node.id} ${node.name} ${node.summary} ${node.tags.join(" ")} ${(node.steps ?? []).join(" ")}`.toLowerCase();
-      const bm25Raw = bm25Scores.get(node.id) ?? 0;
-      const termHits = queryTokens.filter((t) => hay.includes(t)).length;
-      const phraseBoost = hay.includes(queryLower) ? 1.5 : 0;
-      const termCoverage = queryTokens.length > 0 ? termHits / queryTokens.length : 0;
-      const lexicalScore = bm25Raw + termCoverage * 1.2 + phraseBoost;
-      if (lexicalScore <= 0) continue;
-      const totalScore = lexicalScore * STRATUM_WEIGHT[node.stratum] * (1 + Math.log1p(node.reinforcements) * 0.2);
+    for (const [nodeId, rrfScore] of rrfMap.entries()) {
+      const node = eligibleNodes.get(nodeId);
+      if (!node) continue;
+      const scaledRrf = rrfScore * (rrfK + 1);
+      const normLex = (lexicalScoreMap.get(nodeId) ?? 0) / maxLex;
+      const vecSim = vectorSimMap.get(nodeId) ?? 0;
+      const signalStrength = Math.max(normLex, vecSim);
+      const fusedRelevance = scaledRrf * (0.2 + 0.8 * signalStrength);
+      const totalScore = fusedRelevance * (temporalTrustMap.get(nodeId) ?? 1);
       seedList.push({ node, score: totalScore });
     }
-    seedList.sort((a, b) => b.score - a.score || b.node.updatedAt.localeCompare(a.node.updatedAt) || a.node.id.localeCompare(b.node.id));
+    seedList.sort(
+      (a, b) =>
+        b.score - a.score ||
+        b.node.updatedAt.localeCompare(a.node.updatedAt) ||
+        a.node.id.localeCompare(b.node.id),
+    );
 
+    const topSeedScore = seedList[0]?.score ?? 0;
     const visited = new Map<string, number>();
     let frontier: string[] = [];
     for (const seed of seedList.slice(0, maxNodes)) {
       visited.set(seed.node.id, seed.score);
-      frontier.push(seed.node.id);
+      if (seed.score >= topSeedScore * 0.35) {
+        frontier.push(seed.node.id);
+      }
     }
 
-    for (let hop = 0; hop < maxHops && frontier.length > 0 && visited.size < maxNodes; hop++) {
+    for (let hop = 0; hop < maxHops && frontier.length > 0; hop++) {
       const frontierSet = new Set(frontier);
       const candidates: Array<{ neighborId: string; score: number }> = [];
       for (const edge of eligibleEdges) {
         let neighborId: string | undefined;
         let parentScore = 0;
-        if (frontierSet.has(edge.from) && !visited.has(edge.to)) {
+        if (frontierSet.has(edge.from)) {
           neighborId = edge.to;
-          parentScore = visited.get(edge.from) ?? 1;
-        } else if (frontierSet.has(edge.to) && !visited.has(edge.from)) {
+          parentScore = visited.get(edge.from) ?? 0;
+        } else if (frontierSet.has(edge.to)) {
           neighborId = edge.from;
-          parentScore = visited.get(edge.to) ?? 1;
+          parentScore = visited.get(edge.to) ?? 0;
         }
-        if (!neighborId) continue;
+        if (!neighborId || parentScore <= 0) continue;
         const neighbor = eligibleNodes.get(neighborId);
         if (!neighbor) continue;
-        const hopScore = parentScore * 0.65 * STRATUM_WEIGHT[neighbor.stratum] * Math.max(0.5, edge.weight);
-        candidates.push({ neighborId, score: hopScore });
+        const baseDecay = edge.relation === "derived_from_episode" ? 0.35 : 0.65;
+        const edgeFactor = Math.min(1.0, Math.max(0.5, edge.weight));
+        const rawHopScore = parentScore * baseDecay * (STRATUM_WEIGHT[neighbor.stratum] ?? 1.0) * edgeFactor;
+        const hopScore = Math.min(parentScore * 0.92, rawHopScore);
+        if (hopScore > (visited.get(neighborId) ?? 0)) {
+          candidates.push({ neighborId, score: hopScore });
+        }
       }
       candidates.sort((a, b) => b.score - a.score);
       const nextFrontier: string[] = [];
       for (const cand of candidates) {
-        if (visited.size >= maxNodes) break;
-        if (visited.has(cand.neighborId)) continue;
+        if (nextFrontier.length >= maxNodes) break;
+        if (cand.score <= (visited.get(cand.neighborId) ?? 0)) continue;
         visited.set(cand.neighborId, cand.score);
         nextFrontier.push(cand.neighborId);
       }
@@ -1182,7 +2038,13 @@ export class StereoscopicAtlas {
     const selectedNodes = Array.from(visited.keys())
       .map((id) => eligibleNodes.get(id)!)
       .filter(Boolean)
-      .sort((a, b) => (visited.get(b.id) ?? 0) - (visited.get(a.id) ?? 0) || b.reinforcements - a.reinforcements)
+      .sort(
+        (a, b) =>
+          (visited.get(b.id) ?? 0) - (visited.get(a.id) ?? 0) ||
+          b.reinforcements - a.reinforcements ||
+          b.updatedAt.localeCompare(a.updatedAt) ||
+          a.id.localeCompare(b.id),
+      )
       .slice(0, maxNodes);
     return this.finalizeRecall(selectedNodes, eligibleEdges, visited);
   }
@@ -1195,7 +2057,9 @@ export class StereoscopicAtlas {
     const selectedIds = new Set(nodes.map((n) => n.id));
     const edges = eligibleEdges.filter((e) => selectedIds.has(e.from) && selectedIds.has(e.to));
     const crossPlaneBridges = edges.filter(
-      (e) => Boolean(e.isMembraneEdge) || this.nodes.get(e.from)?.plane !== this.nodes.get(e.to)?.plane,
+      (e) =>
+        !isOwnerOnlyProvenanceEdge(e) &&
+        (Boolean(e.isMembraneEdge) || this.nodes.get(e.from)?.plane !== this.nodes.get(e.to)?.plane),
     );
     const lines: string[] = [];
     if (nodes.length > 0) {
@@ -1253,7 +2117,10 @@ export class StereoscopicAtlas {
         bucket.activeEdges++;
         const fromN = this.nodes.get(e.from);
         const toN = this.nodes.get(e.to);
-        if (e.isMembraneEdge || (fromN && toN && fromN.plane !== toN.plane)) {
+        if (
+          !isOwnerOnlyProvenanceEdge(e) &&
+          (e.isMembraneEdge || (fromN && toN && fromN.plane !== toN.plane))
+        ) {
           membraneBridgeCount++;
         }
       }

@@ -61,11 +61,26 @@ export interface CadenceBudgetState {
   topicCooldownUntilIso?: Record<string, string>;
 }
 
+export interface DuoProtectedWindowAnchor {
+  id: string;
+  title: string;
+  detail?: string;
+  protectedWindowKeywords?: readonly string[];
+}
+
+export interface DuoProtectedWindowGateOptions {
+  nowIso?: string;
+  duoProtectedAnchors?: readonly DuoProtectedWindowAnchor[];
+  duoProtectedWindowActive?: boolean;
+}
+
 export interface OwnerFlowContext {
   mode: "co_working" | "deep_focus" | "idle_or_boundary" | "quiet_hours";
   activeGoalId?: string;
   activeProjectKey?: string;
   flowStrength?: number;
+  duoProtectedWindowActive?: boolean;
+  duoProtectedAnchors?: readonly DuoProtectedWindowAnchor[];
 }
 
 export interface CadenceBudgetStoragePort {
@@ -83,6 +98,197 @@ function parseTimestampMs(iso: string | undefined): number {
 function extractDateKey(iso: string): string {
   const match = /^(\d{4}-\d{2}-\d{2})/.exec(String(iso ?? "").trim());
   return match?.[1] ?? "unknown";
+}
+
+interface ParsedWallClock {
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+  weekday: number;
+  dateStr: string;
+}
+
+function computeWeekday(year: number, month: number, day: number): number {
+  const offsets = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
+  const y = month < 3 ? year - 1 : year;
+  return (
+    y +
+    Math.floor(y / 4) -
+    Math.floor(y / 100) +
+    Math.floor(y / 400) +
+    (offsets[month - 1] ?? 0) +
+    day
+  ) % 7;
+}
+
+function isLeapYear(year: number): boolean {
+  return (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+}
+
+function parseIsoWallClock(nowIso: string | undefined): ParsedWallClock | null {
+  if (typeof nowIso !== "string") return null;
+  const trimmed = nowIso.trim();
+  if (!trimmed || !Number.isFinite(parseTimestampMs(trimmed))) return null;
+  const m =
+    /^(\d{4})-(\d{2})-(\d{2})(?:[T\s](\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?$/.exec(
+      trimmed,
+    );
+  if (!m) return null;
+  const year = Number(m[1]);
+  const month = Number(m[2]);
+  const day = Number(m[3]);
+  const hour = m[4] !== undefined ? Number(m[4]) : 0;
+  const minute = m[5] !== undefined ? Number(m[5]) : 0;
+  if (month < 1 || month > 12 || hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+    return null;
+  }
+  const daysInMonth = [31, isLeapYear(year) ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  const maxDay = daysInMonth[month - 1] ?? 31;
+  if (day < 1 || day > maxDay) return null;
+  return {
+    year,
+    month,
+    day,
+    hour,
+    minute,
+    weekday: computeWeekday(year, month, day),
+    dateStr: `${m[1]}-${m[2]}-${m[3]}`,
+  };
+}
+
+/**
+ * 纯函数判定当前时间戳是否命中 M3 双人共处保护留白窗。
+ * 零系统时钟调用，严格按传入 ISO 字符串的日期与时分确定性计算。
+ */
+export function matchActiveDuoProtectedWindow(
+  nowIso: string,
+  anchors: readonly DuoProtectedWindowAnchor[] | undefined,
+): {
+  active: boolean;
+  matchedAnchorId?: string;
+  matchedTitle?: string;
+  matchedKeyword?: string;
+} {
+  if (!anchors || anchors.length === 0) return { active: false };
+  const clock = parseIsoWallClock(nowIso);
+  if (!clock) return { active: false };
+
+  const nowTotalMinutes = clock.hour * 60 + clock.minute;
+
+  for (const anchor of anchors) {
+    if (!anchor) continue;
+    const kwList = (anchor.protectedWindowKeywords ?? [])
+      .map((k) => String(k ?? "").trim())
+      .filter(Boolean);
+    const combinedText = [anchor.title, anchor.detail ?? "", ...kwList].join(" ");
+    if (!combinedText.trim()) continue;
+
+    const dayHits: Array<{ label: string; ok: boolean }> = [];
+    const periodTimeHits: Array<{ label: string; ok: boolean }> = [];
+    const clockTimeHits: Array<{ label: string; ok: boolean }> = [];
+
+    const hasFriNight = /(?:周五|星期五)晚/.test(combinedText);
+    const hasSatNight = /(?:周六|星期六)晚/.test(combinedText);
+    const hasSunNight = /(?:周日|周天|星期日|星期天)晚/.test(combinedText);
+    const hasWeekendNight = /周末晚/.test(combinedText);
+
+    if (hasFriNight) {
+      dayHits.push({ label: "周五晚", ok: clock.weekday === 5 });
+      periodTimeHits.push({ label: "周五晚", ok: clock.hour >= 18 });
+    } else if (/(?:周五|星期五)/.test(combinedText)) {
+      dayHits.push({ label: "周五", ok: clock.weekday === 5 });
+    }
+
+    if (hasSatNight) {
+      dayHits.push({ label: "周六晚", ok: clock.weekday === 6 });
+      periodTimeHits.push({ label: "周六晚", ok: clock.hour >= 18 });
+    } else if (/(?:周六|星期六)/.test(combinedText)) {
+      dayHits.push({ label: "周六", ok: clock.weekday === 6 });
+    }
+
+    if (hasSunNight) {
+      dayHits.push({ label: "周日晚", ok: clock.weekday === 0 });
+      periodTimeHits.push({ label: "周日晚", ok: clock.hour >= 18 });
+    } else if (/(?:周日|周天|星期日|星期天)/.test(combinedText)) {
+      dayHits.push({ label: "周日", ok: clock.weekday === 0 });
+    }
+
+    if (hasWeekendNight) {
+      dayHits.push({ label: "周末晚", ok: clock.weekday === 6 || clock.weekday === 0 });
+      periodTimeHits.push({ label: "周末晚", ok: clock.hour >= 18 });
+    } else if (/周末/.test(combinedText)) {
+      dayHits.push({ label: "周末", ok: clock.weekday === 6 || clock.weekday === 0 });
+    }
+
+    const otherWeekdays: Array<{ re: RegExp; label: string; day: number }> = [
+      { re: /(?:周一|星期一)/, label: "周一", day: 1 },
+      { re: /(?:周二|星期二)/, label: "周二", day: 2 },
+      { re: /(?:周三|星期三)/, label: "周三", day: 3 },
+      { re: /(?:周四|星期四)/, label: "周四", day: 4 },
+    ];
+    for (const wd of otherWeekdays) {
+      if (wd.re.test(combinedText)) {
+        dayHits.push({ label: wd.label, ok: clock.weekday === wd.day });
+      }
+    }
+
+    for (const dm of combinedText.matchAll(/\b(\d{4}-\d{2}-\d{2})\b/g)) {
+      const ds = dm[1]!;
+      dayHits.push({ label: ds, ok: clock.dateStr === ds });
+    }
+    for (const mdm of combinedText.matchAll(/(\d{1,2})月(\d{1,2})[日号]?/g)) {
+      const mm = Number(mdm[1]);
+      const dd = Number(mdm[2]);
+      dayHits.push({ label: mdm[0], ok: clock.month === mm && clock.day === dd });
+    }
+
+    for (const hm of combinedText.matchAll(/(?:^|[^\d:])([01]?\d|2[0-3]):([0-5]\d)(?![:\d])/g)) {
+      const hh = Number(hm[1]);
+      const mi = Number(hm[2]);
+      const targetMin = hh * 60 + mi;
+      const diff = Math.abs(nowTotalMinutes - targetMin);
+      const circularDiff = Math.min(diff, 1440 - diff);
+      const label = `${String(hh).padStart(2, "0")}:${hm[2]}`;
+      clockTimeHits.push({ label, ok: circularDiff <= 90 });
+    }
+
+    if (/睡前/.test(combinedText)) {
+      periodTimeHits.push({ label: "睡前", ok: clock.hour >= 22 || clock.hour < 2 });
+    }
+    if (/傍晚/.test(combinedText)) {
+      periodTimeHits.push({ label: "傍晚", ok: clock.hour >= 17 && clock.hour <= 19 });
+    }
+    for (const eveKw of ["今晚", "晚间", "晚上"] as const) {
+      if (combinedText.includes(eveKw)) {
+        periodTimeHits.push({ label: eveKw, ok: clock.hour >= 19 || clock.hour < 1 });
+      }
+    }
+
+    const effectiveTimeHits = clockTimeHits.length > 0 ? clockTimeHits : periodTimeHits;
+    if (dayHits.length === 0 && effectiveTimeHits.length === 0) {
+      continue;
+    }
+
+    const matchedDay = dayHits.find((d) => d.ok);
+    const matchedTime = effectiveTimeHits.find((t) => t.ok);
+    const dayOk = dayHits.length === 0 || Boolean(matchedDay);
+    const timeOk = effectiveTimeHits.length === 0 || Boolean(matchedTime);
+
+    if (dayOk && timeOk) {
+      const matchedKeyword =
+        matchedTime?.label ?? matchedDay?.label ?? kwList[0] ?? anchor.title;
+      return {
+        active: true,
+        matchedAnchorId: anchor.id,
+        matchedTitle: anchor.title,
+        matchedKeyword,
+      };
+    }
+  }
+
+  return { active: false };
 }
 
 function compactLine(text: string | undefined, maxLen = 72): string {
@@ -375,14 +581,17 @@ export function filterSupersededBeforeSend(
 /**
  * 每日注意力配额与免打扰门控纯函数：
  * - 已发送或同批重复 dedupeKey -> suppressedIds；
- * - urgent 级候选绕过配额与免打扰限制直接放行（仍受 dedupeKey 去重约束）；
- * - 非 urgent 候选在免打扰或超配额时折叠进 morningDigestQueue（按 dedupeKey 去重）。
+ * - urgent 级候选绕过配额、免打扰与双人共处留白窗限制直接放行（仍受 dedupeKey 去重约束）；
+ * - 非 urgent 候选在免打扰或超配额时折叠进 morningDigestQueue（按 dedupeKey 去重）；
+ * - 非 urgent 候选在 M3 双人共处保护窗内自动降级并暂存至 boundaryQueue，待窗口结束后平滑排空。
  */
 export function gateProactiveCandidates(
   candidates: readonly ProactiveCandidate[],
   budget: CadenceBudgetState,
+  opts?: DuoProtectedWindowGateOptions,
 ): {
   emitNow: ProactiveCandidate[];
+  holdForBoundary?: ProactiveCandidate[];
   foldToMorningDigest: ProactiveCandidate[];
   suppressedIds: string[];
   nextState: CadenceBudgetState;
@@ -395,8 +604,17 @@ export function gateProactiveCandidates(
   const batchSeen = new Set<string>();
   const nextMorningQueue = (budget.morningDigestQueue ?? []).map(cloneCandidate);
   const queuedKeys = new Set<string>(nextMorningQueue.map((c) => c.dedupeKey));
+  const nextBoundaryQueue = (budget.boundaryQueue ?? []).map(cloneCandidate);
+  const boundaryKeys = new Set<string>(nextBoundaryQueue.map((c) => c.dedupeKey));
+  const inDuoWindow =
+    Boolean(opts?.duoProtectedWindowActive) ||
+    Boolean(
+      opts?.nowIso &&
+        matchActiveDuoProtectedWindow(opts.nowIso, opts.duoProtectedAnchors).active,
+    );
 
   const emitNow: ProactiveCandidate[] = [];
+  const holdForBoundary: ProactiveCandidate[] = [];
   const foldToMorningDigest: ProactiveCandidate[] = [];
   const suppressedIds: string[] = [];
 
@@ -424,6 +642,15 @@ export function gateProactiveCandidates(
       continue;
     }
 
+    if (inDuoWindow) {
+      holdForBoundary.push(copy);
+      if (!boundaryKeys.has(copy.dedupeKey)) {
+        nextBoundaryQueue.push(cloneCandidate(copy));
+        boundaryKeys.add(copy.dedupeKey);
+      }
+      continue;
+    }
+
     emitNow.push(copy);
     nonUrgentSentCount += 1;
     sentSet.add(copy.dedupeKey);
@@ -436,11 +663,11 @@ export function gateProactiveCandidates(
     quietHoursActive: Boolean(budget.quietHoursActive),
     sentDedupeKeys: Array.from(sentSet),
     morningDigestQueue: nextMorningQueue.filter((item) => !sentSet.has(item.dedupeKey)),
-    boundaryQueue: (budget.boundaryQueue ?? []).map(cloneCandidate),
+    boundaryQueue: nextBoundaryQueue.filter((item) => !sentSet.has(item.dedupeKey)),
     topicCooldownUntilIso: { ...(budget.topicCooldownUntilIso ?? {}) },
   };
 
-  return { emitNow, foldToMorningDigest, suppressedIds, nextState };
+  return { emitNow, holdForBoundary, foldToMorningDigest, suppressedIds, nextState };
 }
 
 /**
@@ -456,8 +683,10 @@ export function createAttentionBudgetGate(
     candidates: readonly ProactiveCandidate[],
     dateKey: string,
     quietHoursActive: boolean,
+    opts?: DuoProtectedWindowGateOptions,
   ): {
     emitNow: ProactiveCandidate[];
+    holdForBoundary?: ProactiveCandidate[];
     foldToMorningDigest: ProactiveCandidate[];
     suppressedIds: string[];
     state: CadenceBudgetState;
@@ -528,12 +757,13 @@ export function createAttentionBudgetGate(
     getState(dateKey: string): CadenceBudgetState {
       return cloneBudgetState(resolveStateForDate(dateKey));
     },
-    evaluateAndRecord(candidates, dateKey, quietHoursActive) {
+    evaluateAndRecord(candidates, dateKey, quietHoursActive, opts) {
       const baseState = resolveStateForDate(dateKey);
-      const gated = gateProactiveCandidates(candidates, { ...baseState, quietHoursActive });
+      const gated = gateProactiveCandidates(candidates, { ...baseState, quietHoursActive }, opts);
       writeState(gated.nextState);
       return {
         emitNow: gated.emitNow,
+        holdForBoundary: gated.holdForBoundary ?? [],
         foldToMorningDigest: gated.foldToMorningDigest,
         suppressedIds: gated.suppressedIds,
         state: cloneBudgetState(gated.nextState),
@@ -591,6 +821,7 @@ export function snoozeProactiveTopic(
 /**
  * 基于信息价值与主人当下心流状态的动态投递门控（无固定每日总次数封顶）：
  * - Co-working 同频共创或闲置边界期：立即放行（仅受去重与同题冷却约束）；
+ * - M3 双人共处保护窗：所有非紧急事项自动降级压入 boundaryQueue，紧急告警照常放行；
  * - Deep Focus 异构深潜期：非当前主目标/项目的非紧急事项压入 boundaryQueue，待切换或收尾边界投递；
  * - Quiet Hours：非紧急项折叠进 morningDigestQueue。
  */
@@ -616,6 +847,9 @@ export function evaluateFlowAwareDelivery(
   const morningKeys = new Set<string>(nextMorning.map((c) => c.dedupeKey));
   const nextBoundary = (budget.boundaryQueue ?? []).map(cloneCandidate);
   const boundaryKeys = new Set<string>(nextBoundary.map((c) => c.dedupeKey));
+  const inDuoWindow =
+    Boolean(flow.duoProtectedWindowActive) ||
+    matchActiveDuoProtectedWindow(nowIso, flow.duoProtectedAnchors).active;
 
   const emitNow: ProactiveCandidate[] = [];
   const holdForBoundary: ProactiveCandidate[] = [];
@@ -642,6 +876,14 @@ export function evaluateFlowAwareDelivery(
       if (!morningKeys.has(copy.dedupeKey)) {
         nextMorning.push(cloneCandidate(copy));
         morningKeys.add(copy.dedupeKey);
+      }
+      continue;
+    }
+    if (inDuoWindow) {
+      holdForBoundary.push(copy);
+      if (!boundaryKeys.has(copy.dedupeKey)) {
+        nextBoundary.push(cloneCandidate(copy));
+        boundaryKeys.add(copy.dedupeKey);
       }
       continue;
     }

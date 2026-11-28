@@ -173,6 +173,18 @@ import {
   renderWeatherCapsuleForDuoPrompt,
   MembraneError,
   SymmetricPrivatePocketVault,
+  createAtlasMindSyncPort,
+  computeReciprocalRankFusion,
+  expandSearchSynonyms,
+  distillConciergeEnvoyCapsule,
+  renderConciergeEnvoyPromptBlock,
+  detectImplicitFeedbackSignal,
+  runAtlasSleepConsolidation,
+  matchActiveDuoProtectedWindow,
+  computeBinaryJudgeCalibration,
+  computeRoganGladenCorrection,
+  runCalibratedMemoryJudges,
+  replayGoldenMemoryTraces,
 } from "../dist/src/sugent/index.js";
 import { normalizeSettings } from "../dist/src/agent/settings.js";
 import { extractForwardedRecordText, weixinParts } from "../dist/src/channels/weixin/channel.js";
@@ -1920,6 +1932,123 @@ import { extractForwardedRecordText, weixinParts } from "../dist/src/channels/we
   }
 }
 
+// ---------------------------------------------------------------------------
+// 33. Wave P5 全量合龙：原生五平面 E2EE v2、同义词/RRF 与 S0->S3 溯源、M5 外事膜、隐式自省、睡眠重整、M3 护窗与校准二元 Judge
+// ---------------------------------------------------------------------------
+{
+  const s33Dir = fs.mkdtempSync(path.join(os.tmpdir(), "verify-sugent-s33-"));
+  try {
+    // P5.1: Native Atlas PostTurnDigester + v2 E2EE Sync Port
+    const kg = new SugentKnowledgeGraph(path.join(s33Dir, "kg"));
+    const ledger = new StewardshipLedger({ dataDir: s33Dir, knowledgeGraph: kg });
+    const atlas = new StereoscopicAtlas(path.join(s33Dir, "atlas"));
+    const mindLoop = new EpistemicDigestionLoop({ stewardDir: s33Dir, atlas, nowIso: () => "2026-11-28T15:00:00Z" });
+    const digester = new PostTurnDigester({ knowledgeGraph: kg, ledger, atlas, nowIso: () => "2026-11-28T15:00:00Z" });
+    const digRes = await digester.digestTurnNow({
+      channel: "weixin",
+      peerId: "owner",
+      userText: "请记住每次上线前必须执行 e2e 集成验证",
+      assistantReply: "已记住该上线门禁。",
+    });
+    assert.equal(digRes.nativeAtlasNodes >= 1, true);
+    assert.equal(Boolean(digRes.episodeAnchorId), true);
+
+    const syncPort = createAtlasMindSyncPort({
+      atlas,
+      mindJournalPath: path.join(s33Dir, "mind-journal.json"),
+    });
+    assert.equal(syncPort.exportAtlas().nodes.length >= 2, true);
+
+    // P5.2: Synonym expansion + RRF + S0->S3 owner-only provenance
+    assert.equal(expandSearchSynonyms(["账期"], "账期").some((t) => t.includes("net") || t.includes("信用期")), true);
+    const rrf = computeReciprocalRankFusion([["n1", "n2"], ["n2", "n3"]], 60);
+    assert.equal((rrf.get("n2") ?? 0) > (rrf.get("n1") ?? 0), true);
+    const wfNode = atlas.allNodes().find((n) => !n.tags.includes("episode_anchor"));
+    assert.ok(wfNode);
+    const provOwner = atlas.traceEpisodeProvenance(wfNode.id, { callerPrincipals: ["owner:M"] });
+    assert.equal(provOwner.allowed, true);
+    assert.equal(provOwner.episodeNodes.length >= 1, true);
+    const provPartner = atlas.traceEpisodeProvenance(wfNode.id, { callerPrincipals: ["partner:W"] });
+    assert.equal(provPartner.allowed, false);
+
+    // P5.3: Membrane M5 (concierge_envoy) zero canary leak
+    mindLoop.recordJudgment({ topicKey: "m5-priv", surface: "im_owner", hypothesis: "CANARY_OWNER_FLOOR_88W" });
+    const m5Cap = distillConciergeEnvoyCapsule({
+      peerId: "wx_client_1",
+      peerPreferences: ["偏好短句直给结论（不超过3行）", "内部备注底价 ¥880000 CANARY_OWNER_FLOOR_88W"],
+      mindLoop,
+      forbiddenCanaryTokens: ["CANARY_OWNER_FLOOR_88W"],
+    });
+    const m5Prompt = renderConciergeEnvoyPromptBlock(m5Cap, ["CANARY_OWNER_FLOOR_88W"]);
+    assert.equal(m5Prompt.includes("CANARY_OWNER_FLOOR_88W"), false);
+    assert.equal(m5Prompt.includes("短句直给结论"), true);
+
+    // P5.4: Implicit natural-language feedback + Gardener Sleep Consolidation
+    assert.equal(detectImplicitFeedbackSignal("照上次那么签差点被违约条款坑了"), "falsified");
+    assert.equal(detectImplicitFeedbackSignal("这轮排查节奏很舒服，比之前顺畅多了"), "confirmed");
+    atlas.applyDelta(
+      {
+        nodes: [
+          { id: "fact:sc-1", plane: "domain_work:ops", stratum: "verified_fact", kind: "concept", name: "缓存策略观察1", summary: "生产热点键开启本地二级缓存降低延迟", tags: ["topic:hot-cache"] },
+          { id: "fact:sc-2", plane: "domain_work:ops", stratum: "verified_fact", kind: "concept", name: "缓存策略观察2", summary: "本地二级缓存配5分钟主动失效广播", tags: ["topic:hot-cache"] },
+          { id: "fact:sc-3", plane: "domain_work:ops", stratum: "verified_fact", kind: "concept", name: "缓存策略观察3", summary: "压测峰值下二级缓存命中率稳定在94%", tags: ["topic:hot-cache"] },
+        ],
+      },
+      "2026-11-28T15:10:00Z",
+    );
+    const sleepOut = runAtlasSleepConsolidation({
+      atlas,
+      mindLoop,
+      nowIso: "2026-11-28T16:00:00Z",
+      weeklyCalibrationDue: true,
+    });
+    assert.equal(sleepOut.triggered, true);
+    assert.equal(sleepOut.crystallizedNodes.length >= 1, true);
+
+    // P5.5: M3 Duo protected window matching
+    const m3Match = matchActiveDuoProtectedWindow("2026-11-27T20:30:00+08:00", [
+      { id: "d1", title: "周五晚散步留白", protectedWindowKeywords: ["周五晚"] },
+    ]);
+    assert.equal(m3Match.active, true);
+
+    // P5.6: L2 Golden Trace Replay + L3 Held-out Calibrated Binary Judges (TPR/TNR >= 0.85 + Rogan-Gladen)
+    const cal = computeBinaryJudgeCalibration([
+      { humanLabel: true, judgePass: true },
+      { humanLabel: true, judgePass: true },
+      { humanLabel: false, judgePass: false },
+      { humanLabel: false, judgePass: false },
+    ]);
+    assert.equal(cal.tpr, 1);
+    assert.equal(cal.tnr, 1);
+    const rg = computeRoganGladenCorrection({
+      rawPassRate: 0.6,
+      tpr: 0.9,
+      tnr: 0.9,
+      sampleSize: 50,
+      calibrationPositives: 20,
+      calibrationNegatives: 20,
+    });
+    assert.equal(rg.valid, true);
+    assert.equal(rg.ci95[0] <= rg.correctedPassRate && rg.correctedPassRate <= rg.ci95[1], true);
+
+    const traceReport = await replayGoldenMemoryTraces();
+    assert.equal(traceReport.passRate, 1);
+    const judgeReport = await runCalibratedMemoryJudges({ split: "test" });
+    assert.equal(judgeReport.allDimensionsPassed, true);
+    assert.equal(judgeReport.zeroTrainSplitLeakage, true);
+    for (const dim of Object.values(judgeReport.dimensions)) {
+      assert.equal(dim.calibration.tpr >= 0.85, true);
+      assert.equal(dim.calibration.tnr >= 0.85, true);
+    }
+
+    digester.dispose();
+    atlas.close();
+  } finally {
+    fs.rmSync(s33Dir, { recursive: true, force: true });
+  }
+}
+
 console.log(
-  "verify:sugent — 全部核心契约断言通过 (M1.1–M1.6 / M2.1 / Cowork 联邦 / P0 Broker + P1 幕僚耳麦 + P2 BYOK 诊断与零知识加密同步 / Sprint 1–3 / M1–M4 Vibe Coding 闭环 / 能力自感知与全文读取 / 形象工坊与桌宠契约 / M-Auto 1–4 双环自治与 SIM 演进 / M1–M3 全量模型同步与经验驱动自适应路由 / L0–L3 分层热启动与热更新 / Wave P0 双脑归一与宿主主循环合龙 / GCE 常驻中枢与微信单持有者舰队桥接 / Wave P1 零填表冷启动、ACP 编码军团与隐藏快照防呆 / Wave P2 合盖离线韧性、微信 3 秒转发参谋与端-边联邦标杆武器包 / 云端唯一大脑、跨天全渠道对话记忆与多节点边缘触手中枢 / Wave P3 双微信号前店后厂、助理无头边车与项目群静默纪要 / 人机混合项目规划与现实待办闭环 / Duo 双人关系幕僚与记忆晶化隔离契约 / Wave P4 全量合龙: 记忆回流、五维立体图谱、硅基个体心智核、半透认知膜与无损同步)",
+  "verify:sugent — 全部核心契约断言通过 (M1.1–M1.6 / M2.1 / Cowork 联邦 / P0 Broker + P1 幕僚耳麦 + P2 BYOK 诊断与零知识加密同步 / Sprint 1–3 / M1–M4 Vibe Coding 闭环 / 能力自感知与全文读取 / 形象工坊与桌宠契约 / M-Auto 1–4 双环自治与 SIM 演进 / M1–M3 全量模型同步与经验驱动自适应路由 / L0–L3 分层热启动与热更新 / Wave P0 双脑归一与宿主主循环合龙 / GCE 常驻中枢与微信单持有者舰队桥接 / Wave P1 零填表冷启动、ACP 编码军团与隐藏快照防呆 / Wave P2 合盖离线韧性、微信 3 秒转发参谋与端-边联邦标杆武器包 / 云端唯一大脑、跨天全渠道对话记忆与多节点边缘触手中枢 / Wave P3 双微信号前店后厂、助理无头边车与项目群静默纪要 / 人机混合项目规划与现实待办闭环 / Duo 双人关系幕僚与记忆晶化隔离契约 / Wave P4 全量合龙: 记忆回流、五维立体图谱、硅基个体心智核、半透认知膜与无损同步 / Wave P5 全面跃迁: 原生五平面 E2EE v2 漫游、混合语义 RRF 与 S0->S3 原话溯源、全表面参谋与 M5 外事半透膜、双轨隐式自省与睡眠重整、双人自动候选星晶与 M3 护窗及三层校准评测飞轮)",
 );
+

@@ -6,7 +6,16 @@ import {
   randomBytes,
 } from "node:crypto";
 import type { SugentBrokerClaims } from "./auth-broker-contract.js";
+import type { SkillGateStatus } from "./knowledge-graph.js";
+import type { EpistemicJudgmentEntry } from "./silicon-identity-core.js";
 import type { LedgerSnapshot } from "./stewardship-ledger.js";
+import type {
+  AtlasNodeKind,
+  EpistemicStratum,
+  GraphPlaneId,
+  PrincipalId,
+  SourceTrust,
+} from "./stereoscopic-atlas.js";
 
 export type { SugentBrokerClaims } from "./auth-broker-contract.js";
 
@@ -79,12 +88,67 @@ export interface SyncableKGEdge {
   lamportClock: number;
 }
 
+export interface SyncableAtlasNode {
+  id: string;
+  plane: GraphPlaneId;
+  stratum: EpistemicStratum;
+  kind: AtlasNodeKind;
+  name: string;
+  summary: string;
+  tags: string[];
+  principalAcl: PrincipalId[];
+  reinforcements: number;
+  confidence: number;
+  sourceTrust: SourceTrust;
+  steps?: string[];
+  skillGateStatus?: SkillGateStatus;
+  updatedAt: string;
+  supersededAt?: string | null;
+  supersededBy?: string | null;
+  archivedAt?: string | null;
+  lamportClock: number;
+}
+
+export interface SyncableAtlasEdge {
+  id: string;
+  plane: GraphPlaneId;
+  from: string;
+  relation: string;
+  to: string;
+  weight: number;
+  source: string;
+  isMembraneEdge?: boolean;
+  membranePolicy?: string | null;
+  principalAcl?: PrincipalId[];
+  validFrom: string;
+  updatedAt: string;
+  supersededAt?: string | null;
+  lamportClock: number;
+}
+
+export interface SyncableMindJournalEntry extends EpistemicJudgmentEntry {
+  lamportClock?: number;
+}
+
+export interface SyncableAtlasSnapshotV2 {
+  version: 2;
+  nodes: SyncableAtlasNode[];
+  edges: SyncableAtlasEdge[];
+  mindJournal?: {
+    charterVersion: "1.0";
+    updatedAt: string;
+    entries: SyncableMindJournalEntry[];
+  };
+}
+
 export interface SyncableKnowledgeGraphSnapshot {
+  schemaVersion?: 1 | 2;
   lamportClock: number;
   deviceId: string;
   nodes: SyncableKGNode[];
   edges: SyncableKGEdge[];
   stewardshipLedger?: LedgerSnapshot;
+  atlasSnapshot?: SyncableAtlasSnapshotV2;
 }
 
 export function deriveSyncKeyHierarchy(params: {
@@ -487,6 +551,360 @@ function mergeStewardshipLedgers(
   };
 }
 
+function canonicalTieKey(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalTieKey).join(",")}]`;
+  }
+  if (value !== null && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, v]) => v !== undefined)
+      .sort(([ka], [kb]) => ka.localeCompare(kb));
+    return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonicalTieKey(v)}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function pickOrderedAtlasPair<T extends { lamportClock?: number; updatedAt: string }>(
+  a: T,
+  b: T,
+): { winner: T; loser: T } {
+  const clockA = a.lamportClock ?? 0;
+  const clockB = b.lamportClock ?? 0;
+  if (clockA !== clockB) {
+    return clockA > clockB ? { winner: a, loser: b } : { winner: b, loser: a };
+  }
+  if (a.updatedAt !== b.updatedAt) {
+    return a.updatedAt > b.updatedAt ? { winner: a, loser: b } : { winner: b, loser: a };
+  }
+  return canonicalTieKey(a) >= canonicalTieKey(b)
+    ? { winner: a, loser: b }
+    : { winner: b, loser: a };
+}
+
+function mergeAtlasNodeRecords(a: SyncableAtlasNode, b: SyncableAtlasNode): SyncableAtlasNode {
+  const { winner, loser } = pickOrderedAtlasPair(a, b);
+  const supAtA = a.supersededAt || null;
+  const supAtB = b.supersededAt || null;
+  const mergedSupersededAt =
+    supAtA && supAtB ? (supAtA <= supAtB ? supAtA : supAtB) : (supAtA ?? supAtB);
+
+  const supByA = a.supersededBy || null;
+  const supByB = b.supersededBy || null;
+  let mergedSupersededBy: string | null = null;
+  if (supByA && supByB) {
+    if (supAtA && supAtB && supAtA !== supAtB) {
+      mergedSupersededBy = supAtA < supAtB ? supByA : supByB;
+    } else {
+      mergedSupersededBy = winner.supersededBy || supByA;
+    }
+  } else {
+    mergedSupersededBy = supByA ?? supByB;
+  }
+
+  const archA = a.archivedAt || null;
+  const archB = b.archivedAt || null;
+  const mergedArchivedAt =
+    archA && archB ? (archA <= archB ? archA : archB) : (archA ?? archB);
+
+  const tags = Array.from(new Set([...(winner.tags ?? []), ...(loser.tags ?? [])]));
+  const principalAcl = winner.principalAcl?.length
+    ? [...winner.principalAcl]
+    : [...(loser.principalAcl ?? ["sugent_self", "owner:M"])];
+
+  return {
+    ...winner,
+    tags,
+    principalAcl,
+    reinforcements: Math.max(a.reinforcements ?? 0, b.reinforcements ?? 0),
+    supersededAt: mergedSupersededAt,
+    supersededBy: mergedSupersededBy,
+    archivedAt: mergedArchivedAt,
+  };
+}
+
+function mergeAtlasEdgeRecords(a: SyncableAtlasEdge, b: SyncableAtlasEdge): SyncableAtlasEdge {
+  const { winner, loser } = pickOrderedAtlasPair(a, b);
+  const supAtA = a.supersededAt || null;
+  const supAtB = b.supersededAt || null;
+  const mergedSupersededAt =
+    supAtA && supAtB ? (supAtA <= supAtB ? supAtA : supAtB) : (supAtA ?? supAtB);
+  const validFrom =
+    a.validFrom && b.validFrom
+      ? a.validFrom <= b.validFrom
+        ? a.validFrom
+        : b.validFrom
+      : winner.validFrom || loser.validFrom;
+
+  return {
+    ...winner,
+    weight: Math.max(a.weight ?? 1, b.weight ?? 1),
+    validFrom,
+    supersededAt: mergedSupersededAt,
+  };
+}
+
+function mergeMindJournalEntries(
+  a: SyncableMindJournalEntry,
+  b: SyncableMindJournalEntry,
+): SyncableMindJournalEntry {
+  const { winner, loser } = pickOrderedAtlasPair(a, b);
+
+  let status = winner.status;
+  let stratum = winner.stratum;
+  if (a.status === "falsified" || b.status === "falsified") {
+    status = "falsified";
+    stratum = a.status === "falsified" ? a.stratum : b.stratum;
+  } else if (a.status === "superseded" || b.status === "superseded") {
+    status = "superseded";
+  } else if (a.status === "crystallized" || b.status === "crystallized") {
+    status = "crystallized";
+    stratum = "crystallized_wisdom";
+  }
+
+  const supersededBy = winner.supersededBy || loser.supersededBy;
+  const confirmations = Math.max(a.confirmations ?? 0, b.confirmations ?? 0);
+  const contradictions = Math.max(a.contradictions ?? 0, b.contradictions ?? 0);
+  const evidenceNotes = Array.from(
+    new Set([...(loser.evidenceNotes ?? []), ...(winner.evidenceNotes ?? [])]),
+  );
+  const confidence =
+    status === "falsified" && winner.status !== "falsified" && loser.status === "falsified"
+      ? loser.confidence
+      : winner.confidence;
+  const hasClock = a.lamportClock !== undefined || b.lamportClock !== undefined;
+  const maxClock = Math.max(a.lamportClock ?? 0, b.lamportClock ?? 0);
+
+  return {
+    ...winner,
+    status,
+    stratum,
+    confidence,
+    confirmations,
+    contradictions,
+    evidenceNotes,
+    ...(supersededBy ? { supersededBy } : {}),
+    ...(hasClock ? { lamportClock: maxClock } : {}),
+  };
+}
+
+function inferPlaneFromLegacyId(
+  id: string,
+  kind: string,
+  reinforcements: number,
+): { plane: GraphPlaneId; stratum: EpistemicStratum; principalAcl: PrincipalId[] } {
+  if (id.startsWith("self:")) {
+    return {
+      plane: "self_core",
+      stratum: kind === "workflow" ? "crystallized_wisdom" : "digested_state",
+      principalAcl: ["sugent_self", "owner:M"],
+    };
+  }
+  if (/^(?:rel|duo|crystal|peer):/.test(id)) {
+    const sub = id.split(":")[1] || "default";
+    const plane: GraphPlaneId = id.startsWith("peer:")
+      ? `relational:peer:${sub}`
+      : id.startsWith("rel:")
+        ? `relational:${sub}`
+        : `relational:duo:${sub}`;
+    return {
+      plane,
+      stratum: id.startsWith("crystal:") ? "crystallized_wisdom" : "verified_fact",
+      principalAcl: id.startsWith("peer:") ? ["owner:M", `peer:${sub}`] : ["sugent_self", "owner:M"],
+    };
+  }
+  if (/^(?:proj|repo|cap|fde):/.test(id)) {
+    const key = id.split(":")[1] || "default";
+    return {
+      plane: `domain_work:${key}`,
+      stratum: kind === "workflow" ? "crystallized_wisdom" : "verified_fact",
+      principalAcl: ["sugent_self", "owner:M"],
+    };
+  }
+  if (/^(?:wf|sim):/.test(id)) {
+    return {
+      plane: "meta_evolution",
+      stratum:
+        id.startsWith("wf:") && reinforcements >= 3
+          ? "crystallized_wisdom"
+          : id.startsWith("sim:")
+            ? "digested_state"
+            : "verified_fact",
+      principalAcl: ["sugent_self", "owner:M"],
+    };
+  }
+  return {
+    plane: "owner_life",
+    stratum: kind === "workflow" ? "crystallized_wisdom" : "verified_fact",
+    principalAcl: ["owner:M"],
+  };
+}
+
+function convertLegacyNodeToSyncableAtlas(n: SyncableKGNode): SyncableAtlasNode {
+  const props = n.properties ?? {};
+  const reinforcements =
+    typeof props.reinforcements === "number" && Number.isFinite(props.reinforcements)
+      ? props.reinforcements
+      : 1;
+  const cls = inferPlaneFromLegacyId(n.id, n.type, reinforcements);
+  const tags = Array.isArray(props.tags) ? props.tags.map(String) : [];
+  const steps = Array.isArray(props.steps) ? props.steps.map(String) : undefined;
+  const rawGate = props.skillGateStatus;
+  const skillGateStatus: SkillGateStatus | undefined =
+    rawGate === "candidate" || rawGate === "approved" || rawGate === "rejected"
+      ? rawGate
+      : undefined;
+  return {
+    id: n.id,
+    plane: cls.plane,
+    stratum: cls.stratum,
+    kind: (n.type || "concept") as AtlasNodeKind,
+    name: n.label,
+    summary: typeof props.summary === "string" ? props.summary : "",
+    tags,
+    principalAcl: cls.principalAcl,
+    reinforcements,
+    confidence: cls.stratum === "crystallized_wisdom" ? 0.92 : 0.82,
+    sourceTrust: "legacy_import",
+    ...(steps?.length ? { steps } : {}),
+    ...(skillGateStatus ? { skillGateStatus } : {}),
+    updatedAt: n.updatedAt,
+    supersededAt: n.supersededAt ?? null,
+    supersededBy: null,
+    archivedAt: null,
+    lamportClock: n.lamportClock,
+  };
+}
+
+function mergeAtlasSnapshotsV2(
+  local: SyncableKnowledgeGraphSnapshot,
+  remote: SyncableKnowledgeGraphSnapshot,
+): SyncableAtlasSnapshotV2 | undefined {
+  if (!local.atlasSnapshot && !remote.atlasSnapshot) return undefined;
+
+  const atlasNodeMap = new Map<string, SyncableAtlasNode>();
+  for (const n of local.atlasSnapshot?.nodes ?? []) {
+    atlasNodeMap.set(n.id, n);
+  }
+  for (const rn of remote.atlasSnapshot?.nodes ?? []) {
+    const existing = atlasNodeMap.get(rn.id);
+    atlasNodeMap.set(rn.id, existing ? mergeAtlasNodeRecords(existing, rn) : rn);
+  }
+
+  // Bridge v1-only nodes if one peer did not yet emit atlasSnapshot v2
+  const v1Sides: SyncableKnowledgeGraphSnapshot[] = [];
+  if (!local.atlasSnapshot) v1Sides.push(local);
+  if (!remote.atlasSnapshot) v1Sides.push(remote);
+  for (const v1Snap of v1Sides) {
+    for (const v1Node of v1Snap.nodes) {
+      const existing = atlasNodeMap.get(v1Node.id);
+      if (!existing) {
+        atlasNodeMap.set(v1Node.id, convertLegacyNodeToSyncableAtlas(v1Node));
+      } else {
+        const v1Reinf =
+          typeof v1Node.properties?.reinforcements === "number" &&
+          Number.isFinite(v1Node.properties.reinforcements)
+            ? v1Node.properties.reinforcements
+            : 0;
+        const supAtExisting = existing.supersededAt || null;
+        const supAtV1 = v1Node.supersededAt || null;
+        const mergedSupAt =
+          supAtExisting && supAtV1
+            ? supAtExisting <= supAtV1
+              ? supAtExisting
+              : supAtV1
+            : (supAtExisting ?? supAtV1);
+        atlasNodeMap.set(v1Node.id, {
+          ...existing,
+          reinforcements: Math.max(existing.reinforcements, v1Reinf),
+          supersededAt: mergedSupAt,
+        });
+      }
+    }
+  }
+
+  const atlasEdgeMap = new Map<string, SyncableAtlasEdge>();
+  for (const e of local.atlasSnapshot?.edges ?? []) {
+    atlasEdgeMap.set(e.id, e);
+  }
+  for (const re of remote.atlasSnapshot?.edges ?? []) {
+    const existing = atlasEdgeMap.get(re.id);
+    atlasEdgeMap.set(re.id, existing ? mergeAtlasEdgeRecords(existing, re) : re);
+  }
+  for (const v1Snap of v1Sides) {
+    for (const v1Edge of v1Snap.edges) {
+      const existing = atlasEdgeMap.get(v1Edge.id);
+      if (!existing) {
+        const fromN = atlasNodeMap.get(v1Edge.source);
+        const toN = atlasNodeMap.get(v1Edge.target);
+        const crossPlane = Boolean(fromN && toN && fromN.plane !== toN.plane);
+        atlasEdgeMap.set(v1Edge.id, {
+          id: v1Edge.id,
+          plane: fromN?.plane ?? toN?.plane ?? "owner_life",
+          from: v1Edge.source,
+          relation: v1Edge.relation,
+          to: v1Edge.target,
+          weight: v1Edge.weight ?? 1,
+          source: v1Edge.provenanceSource || "e2ee_sync",
+          ...(crossPlane ? { isMembraneEdge: true } : {}),
+          validFrom: v1Edge.validFrom,
+          updatedAt: v1Edge.updatedAt,
+          supersededAt: v1Edge.supersededAt ?? null,
+          lamportClock: v1Edge.lamportClock,
+        });
+      } else {
+        const supAtExisting = existing.supersededAt || null;
+        const supAtV1 = v1Edge.supersededAt || null;
+        const mergedSupAt =
+          supAtExisting && supAtV1
+            ? supAtExisting <= supAtV1
+              ? supAtExisting
+              : supAtV1
+            : (supAtExisting ?? supAtV1);
+        atlasEdgeMap.set(v1Edge.id, {
+          ...existing,
+          weight: Math.max(existing.weight, v1Edge.weight ?? 1),
+          supersededAt: mergedSupAt,
+        });
+      }
+    }
+  }
+
+  const localMind = local.atlasSnapshot?.mindJournal;
+  const remoteMind = remote.atlasSnapshot?.mindJournal;
+  let mindJournal: SyncableAtlasSnapshotV2["mindJournal"] | undefined;
+  if (localMind || remoteMind) {
+    const mindMap = new Map<string, SyncableMindJournalEntry>();
+    for (const entry of localMind?.entries ?? []) {
+      mindMap.set(entry.id, entry);
+    }
+    for (const rEntry of remoteMind?.entries ?? []) {
+      const existing = mindMap.get(rEntry.id);
+      mindMap.set(rEntry.id, existing ? mergeMindJournalEntries(existing, rEntry) : rEntry);
+    }
+    const entries = Array.from(mindMap.values()).sort(
+      (x, y) => x.createdAt.localeCompare(y.createdAt) || x.id.localeCompare(y.id),
+    );
+    const maxEntryUpdated = entries.reduce((acc, e) => (e.updatedAt > acc ? e.updatedAt : acc), "");
+    const updatedAt =
+      [localMind?.updatedAt ?? "", remoteMind?.updatedAt ?? "", maxEntryUpdated]
+        .filter(Boolean)
+        .sort()
+        .pop() || new Date().toISOString();
+    mindJournal = {
+      charterVersion: "1.0",
+      updatedAt,
+      entries,
+    };
+  }
+
+  return {
+    version: 2,
+    nodes: Array.from(atlasNodeMap.values()).sort((x, y) => x.id.localeCompare(y.id)),
+    edges: Array.from(atlasEdgeMap.values()).sort((x, y) => x.id.localeCompare(y.id)),
+    ...(mindJournal ? { mindJournal } : {}),
+  };
+}
+
 export function mergeKnowledgeGraphSnapshots(
   local: SyncableKnowledgeGraphSnapshot,
   remote: SyncableKnowledgeGraphSnapshot,
@@ -511,13 +929,16 @@ export function mergeKnowledgeGraphSnapshots(
   const nodes = Array.from(nodeMap.values()).sort((x, y) => x.id.localeCompare(y.id));
   const edges = Array.from(edgeMap.values()).sort((x, y) => x.id.localeCompare(y.id));
   const stewardshipLedger = mergeStewardshipLedgers(local.stewardshipLedger, remote.stewardshipLedger);
+  const atlasSnapshot = mergeAtlasSnapshotsV2(local, remote);
 
   return {
+    ...(atlasSnapshot ? { schemaVersion: 2 as const } : {}),
     lamportClock: nextLamport,
     deviceId: mergingDeviceId,
     nodes,
     edges,
     ...(stewardshipLedger ? { stewardshipLedger } : {}),
+    ...(atlasSnapshot ? { atlasSnapshot } : {}),
   };
 }
 

@@ -938,6 +938,10 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
           }),
         );
       }
+      if (sub === "atlas/provenance" && m === "GET") {
+        const nodeId = url.searchParams.get("nodeId") ?? "";
+        return send(res, 200, app.stewardService.traceAtlasProvenance({ nodeId, callerDomain: domain }));
+      }
       if (sub === "atlas/mutate" && m === "POST") {
         const b = await readJson(req);
         if (b?.action !== "promote_stratum" && b?.action !== "supersede_node" && b?.action !== "tombstone_node") {

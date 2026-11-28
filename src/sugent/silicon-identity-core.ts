@@ -7,7 +7,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { looksSecret } from "../agent/memory.js";
-import type { StereoscopicAtlas } from "./stereoscopic-atlas.js";
+import { tokenizeForSearch, type StereoscopicAtlas } from "./stereoscopic-atlas.js";
 
 export type SiliconSurfaceId =
   | "steward_hub"
@@ -243,6 +243,138 @@ const FEEDBACK_CONFIRM_RE =
 const FEEDBACK_FALSIFY_RE =
   /(?:(?:刚才|上次|之前|那条)?(?:你的|那个)?(?:判断|建议|方案|思路|结论).*(?:错了|不对|有问题|翻车|踩坑|行不通|被拒|失败了|无效))|(?:按你说的.*(?:没成|失败了|被拒|行不通|踩坑))/;
 
+const QUESTION_TAIL_RE = /(?:[？?]\s*$)|(?:吗\s*[。！!]?\s*$)/;
+const IMPLICIT_NON_FEEDBACK_GUARD_RE =
+  /(?:[？?]\s*$)|(?:(?:吗|呢)\s*[。！!]?\s*$)|(?:^(?:帮我|请帮|麻烦帮|请问|去查|查一下|帮查|打开|看看|搜索|列出|生成|写一个|请按|请照|如果|假如|要是|万一|能不能|能否|可不可以|要不要|会不会))|(?:会不会|能不能|要不要|是否应该|怎么防|如何避免)/;
+
+const IMPLICIT_RETROSPECTIVE_ANCHOR_RE =
+  /(?:(?:幸亏|还好|得亏)(?:没|没有)(?:按|照|用|听|发)?(?:刚才|上次|之前|那版|那个|那套|这么|那么))|(?:(?:照|按|按照|顺着|沿用)(?:上次|刚才|之前|前阵子|昨天|前天|那套|那个|那版|那条|这么|那么|[^，。；;\n]{1,14}(?:的方式|的路子|的做法|的节奏|的策略|的顺序|的步骤|的话术)))|(?:(?:上次|刚才|之前|前天|昨天)(?:那套|那个|那版|那条)?.{0,18}(?:做法|路子|策略|话术|方式|节奏|拆法|改法|缓冲|信号|摘要|清单|流程))|(?:(?:这轮|这波|这版|这套).{0,14}(?:排查节奏|沟通节奏|推进节奏|节奏|话术|双方案|摘要|做法|路子|策略|拆法|清单))/;
+
+const IMPLICIT_FALSIFY_OUTCOME_RE =
+  /(?:(?:差点|险些).{0,14}(?:坑了|被.{0,8}坑|踩坑|踩雷|穿了|崩了|翻车|露底|吃亏|出事))|(?:(?:不然|否则|要不然).{0,16}(?:穿了|直接穿|露底|崩了|爆了|亏惨|翻车|被动|完了|被坑))|(?:(?:结果|反而|反倒).{0,20}(?:冷场|不回了|不回|不理|拉黑|戒心|反弹|反感|抵触|僵住|黄了|崩了|挂了|挂掉|报错|卡死|更糟|被动))|(?:(?:改完|跑完|跑了一晚|试完|试了下|试下来|上线后|发出去后|推过去后).{0,16}(?:还是|依然|照样|结果).{0,14}(?:死锁|挂掉|挂了|崩了|超时|报错|冷场|不回|失败|卡死|复现))|(?:(?:根本没|完全没|并没有|没能)(?:换来|起到|解决|打动|降下来|稳住))|(?:白(?:让|忙|改|折腾|费劲|给)了|不买账|打了水漂)/;
+
+const IMPLICIT_CONFIRM_OUTCOME_RE =
+  /(?:(?:节奏|配合|推进|体感).{0,8}(?:很舒服|舒服多了|很顺|太顺了))|(?:比之前(?:顺畅|稳|快|好|丝滑|省心)(?:多了|不少|很多)?)|(?:(?:秒回|当场|一次就|很快).{0,10}(?:拍板|过审|放行|敲定|同意|通过|签了))|(?:(?:对方|客户|法务|[\u4e00-\u9fff]{1,4}总).{0,12}(?:很受用|很买账|很认可|秒回拍板|拍板了|松口了))|(?:顺利推进到.{0,12}阶段)|(?:(?:确实|果然|真的)(?:把.{0,14}(?:降下来|稳住|解开|压住|理顺)了?|没再(?:卡壳|报错|死锁|翻车|出问题|超时)|顺畅多了|管用|奏效|稳住了))|(?:派上(?:大)?用场|零告警|平稳落地)/;
+
+export function detectImplicitFeedbackSignal(userText: string): "confirmed" | "falsified" | null {
+  const clean = String(userText ?? "").trim();
+  if (!clean || looksSecret(clean)) return null;
+  if (!QUESTION_TAIL_RE.test(clean)) {
+    if (FEEDBACK_FALSIFY_RE.test(clean)) return "falsified";
+    if (FEEDBACK_CONFIRM_RE.test(clean)) return "confirmed";
+  }
+  if (IMPLICIT_NON_FEEDBACK_GUARD_RE.test(clean)) return null;
+  if (!IMPLICIT_RETROSPECTIVE_ANCHOR_RE.test(clean)) return null;
+  if (IMPLICIT_FALSIFY_OUTCOME_RE.test(clean)) return "falsified";
+  if (IMPLICIT_CONFIRM_OUTCOME_RE.test(clean)) return "confirmed";
+  return null;
+}
+
+export type AssessorFeedbackMatch = {
+  id: string;
+  outcome: "confirmed" | "falsified";
+  confidence: number;
+  evidenceNote?: string;
+};
+
+export const ASSESSOR_FEEDBACK_DIGEST_SYSTEM = [
+  "你是 Sugent 的认知消化评估器（assessor）。",
+  "任务：根据用户本轮自然语言发言，判断其中是否包含对【待印证沙盒假设（sandbox）】的事后现实印证（confirmed）或证伪/踩坑反馈（falsified）。",
+  "规则：",
+  "1. 只捕捉针对既有策略、建议或判断的真实执行结果与事后体感（含委婉表达、反事实庆幸或隐式复盘）。",
+  "2. 若用户只是日常提问、下达普通指令、闲聊或未验证的假设性探讨，返回空数组。",
+  "3. 严禁在 evidenceNote 中包含任何密钥、令牌或口令。",
+  '4. 严格只输出合法 JSON，格式为：{"matches":[{"id":"self:hyp:...","outcome":"confirmed|falsified","confidence":0.85,"evidenceNote":"简短依据"}]}',
+].join("\n");
+
+export function parseAssessorFeedbackMatches(raw: string): AssessorFeedbackMatch[] {
+  const trimmed = String(raw ?? "").trim();
+  if (!trimmed) return [];
+  const unfenced = trimmed
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .trim();
+  const start = unfenced.indexOf("{");
+  const end = unfenced.lastIndexOf("}");
+  if (start < 0 || end <= start) return [];
+  try {
+    const parsed = JSON.parse(unfenced.slice(start, end + 1)) as {
+      matches?: Array<Record<string, unknown>>;
+    };
+    if (!Array.isArray(parsed.matches)) return [];
+    const out: AssessorFeedbackMatch[] = [];
+    const seen = new Set<string>();
+    for (const item of parsed.matches) {
+      if (!item || typeof item !== "object") continue;
+      const id = typeof item.id === "string" ? item.id.trim() : "";
+      const outcome = item.outcome;
+      if (!id || seen.has(id)) continue;
+      if (outcome !== "confirmed" && outcome !== "falsified") continue;
+      const rawConf = Number(item.confidence);
+      const confidence = Number.isFinite(rawConf) ? Math.max(0, Math.min(1, rawConf)) : 0;
+      const evidenceNote = typeof item.evidenceNote === "string" ? item.evidenceNote.trim() : undefined;
+      seen.add(id);
+      out.push({
+        id,
+        outcome,
+        confidence,
+        ...(evidenceNote ? { evidenceNote } : {}),
+      });
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+const CANDIDATE_NOISE_TOKENS = new Set([
+  "turn",
+  "self",
+  "hyp",
+  "源自",
+  "对话",
+  "助手",
+  "输出",
+  "提炼",
+  "steward_hub",
+  "im_owner",
+  "coding_orchestrator",
+  "duo_mediator",
+  "concierge_envoy",
+]);
+
+function scoreSandboxCandidateMatch(
+  cand: EpistemicJudgmentEntry,
+  cleanUserText: string,
+  userTokens: ReadonlySet<string>,
+  turnSurface: SiliconSurfaceId,
+): number {
+  const userLower = cleanUserText.toLowerCase();
+  let score = 0;
+  const topicLower = cand.topicKey.trim().toLowerCase();
+  if (topicLower.length >= 2 && !topicLower.startsWith("turn:") && userLower.includes(topicLower)) {
+    score += 6;
+  }
+  for (const part of topicLower.split(/[:/_-]+/)) {
+    if (part.length >= 2 && !CANDIDATE_NOISE_TOKENS.has(part) && !/^[0-9a-f]{8,}$/.test(part)) {
+      if (userLower.includes(part)) score += 3;
+    }
+  }
+  const candTokens = tokenizeForSearch(`${cand.topicKey} ${cand.hypothesis} ${cand.rationale}`);
+  for (const tok of candTokens) {
+    if (tok.length < 2 || CANDIDATE_NOISE_TOKENS.has(tok)) continue;
+    if (userTokens.has(tok)) {
+      score += tok.length >= 3 ? 1.5 : 1;
+    }
+  }
+  if (score > 0 && cand.surface === turnSurface) {
+    score += 0.25;
+  }
+  return score;
+}
+
+const MS_PER_DAY = 86_400_000;
+
 export class EpistemicDigestionLoop {
   private readonly stewardDir: string;
   private readonly journalPath: string;
@@ -274,6 +406,11 @@ export class EpistemicDigestionLoop {
     }
   }
 
+  reloadFromDisk(): void {
+    this.entries = [];
+    this.load();
+  }
+
   private persist(): void {
     fs.mkdirSync(this.stewardDir, { recursive: true, mode: 0o700 });
     const snapshot = this.getMindJournalSnapshot(Math.max(1000, this.entries.length));
@@ -285,6 +422,224 @@ export class EpistemicDigestionLoop {
     } catch {
       /* ignore */
     }
+  }
+
+  private syncEntryToAtlas(entry: EpistemicJudgmentEntry, now: string): void {
+    if (!this.atlas) return;
+    const ts = entry.updatedAt || now;
+    if (entry.status === "sandbox" || entry.status === "crystallized") {
+      const promoted = entry.status === "crystallized";
+      const existingReinf = this.atlas.getNode(entry.id)?.reinforcements ?? 0;
+      const reinfDelta = Math.max(0, entry.confirmations - existingReinf);
+      this.atlas.applyDelta(
+        {
+          nodes: [
+            {
+              id: entry.id,
+              plane: "self_core",
+              stratum: promoted ? "crystallized_wisdom" : "digested_state",
+              kind: "hypothesis",
+              name: `${entry.topicKey} [${entry.surface}]`,
+              summary: entry.hypothesis,
+              tags: [
+                promoted ? "epistemic_crystallized" : "epistemic_sandbox",
+                `surface:${entry.surface}`,
+                `topic:${entry.topicKey}`,
+              ],
+              principalAcl: ["sugent_self", "owner:M"],
+              confidence: entry.confidence,
+              sourceTrust: promoted ? "deterministic_gate" : "llm_inferred",
+              reinforcements: reinfDelta,
+            },
+          ],
+        },
+        ts,
+      );
+      return;
+    }
+
+    if (entry.status === "falsified") {
+      const tombstoneId = `self:tombstone:${entry.id}`;
+      if (!this.atlas.getNode(entry.id)) {
+        this.atlas.applyDelta(
+          {
+            nodes: [
+              {
+                id: entry.id,
+                plane: "self_core",
+                stratum: "digested_state",
+                kind: "hypothesis",
+                name: `${entry.topicKey} [${entry.surface}]`,
+                summary: entry.hypothesis,
+                tags: ["epistemic_sandbox", `surface:${entry.surface}`, `topic:${entry.topicKey}`],
+                principalAcl: ["sugent_self", "owner:M"],
+                confidence: entry.confidence,
+                sourceTrust: "llm_inferred",
+                reinforcements: 1,
+              },
+            ],
+          },
+          entry.createdAt || ts,
+        );
+      }
+      this.atlas.supersedeNode(entry.id, tombstoneId, ts);
+      const lastNote = entry.evidenceNotes[entry.evidenceNotes.length - 1];
+      const noteSuffix = lastNote ? `（证伪依据：${lastNote}）` : "";
+      const tombstoneLesson = `避坑教训 [${entry.topicKey}]：原判断「${entry.hypothesis}」已被证伪${noteSuffix}，后续同类场景须降低先验置信度并先做验证。`;
+      this.atlas.applyDelta(
+        {
+          nodes: [
+            {
+              id: tombstoneId,
+              plane: "self_core",
+              stratum: "crystallized_wisdom",
+              kind: "tombstone",
+              name: `教训墓碑: ${entry.topicKey}`,
+              summary: tombstoneLesson,
+              tags: ["epistemic_tombstone", `surface:${entry.surface}`, `topic:${entry.topicKey}`],
+              principalAcl: ["sugent_self", "owner:M"],
+              confidence: 0.9,
+              sourceTrust: "deterministic_gate",
+              reinforcements: this.atlas.getNode(tombstoneId) ? 0 : 1,
+            },
+          ],
+        },
+        ts,
+      );
+      return;
+    }
+
+    if (entry.status === "superseded") {
+      if (entry.evidenceNotes.includes("expired_unconfirmed_7d") && !entry.supersededBy) {
+        this.atlas.archiveNode(entry.id, ts);
+      } else {
+        this.atlas.supersedeNode(entry.id, entry.supersededBy, ts);
+      }
+    }
+  }
+
+  importSyncedEntries(entries: readonly EpistemicJudgmentEntry[], nowIso?: string): number {
+    const now = nowIso ?? this.nowIso();
+    let importedCount = 0;
+
+    for (const inc of entries ?? []) {
+      if (!inc || typeof inc.id !== "string" || typeof inc.topicKey !== "string" || typeof inc.hypothesis !== "string") {
+        continue;
+      }
+      const notes = Array.isArray(inc.evidenceNotes) ? inc.evidenceNotes.filter((n) => typeof n === "string") : [];
+      if (looksSecret(`${inc.topicKey}\n${inc.hypothesis}\n${inc.rationale ?? ""}\n${notes.join("\n")}`)) {
+        continue;
+      }
+
+      const existing = this.entries.find((e) => e.id === inc.id);
+      if (!existing) {
+        const cloned: EpistemicJudgmentEntry = {
+          id: inc.id,
+          topicKey: inc.topicKey,
+          surface: inc.surface,
+          hypothesis: inc.hypothesis,
+          rationale: inc.rationale ?? "",
+          status: inc.status,
+          stratum: inc.status === "crystallized" ? "crystallized_wisdom" : inc.stratum ?? "digested_state",
+          confidence: inc.confidence,
+          confirmations: inc.confirmations,
+          contradictions: inc.contradictions,
+          evidenceNotes: [...notes],
+          createdAt: inc.createdAt || now,
+          updatedAt: inc.updatedAt || now,
+          ...(inc.supersededBy ? { supersededBy: inc.supersededBy } : {}),
+        };
+        this.entries.push(cloned);
+        this.syncEntryToAtlas(cloned, now);
+        importedCount += 1;
+        continue;
+      }
+
+      // Terminal anti-resurrection guard: falsified / superseded entries never revert to sandbox / crystallized
+      if (
+        (existing.status === "falsified" || existing.status === "superseded") &&
+        (inc.status === "sandbox" || inc.status === "crystallized")
+      ) {
+        continue;
+      }
+
+      if (inc.status === "falsified" && existing.status !== "falsified") {
+        existing.status = "falsified";
+        existing.confidence = 0.2;
+        existing.contradictions = Math.max(existing.contradictions, inc.contradictions || 1, 1);
+        existing.evidenceNotes = Array.from(new Set([...existing.evidenceNotes, ...notes]));
+        existing.updatedAt = inc.updatedAt > existing.updatedAt ? inc.updatedAt : now;
+        this.syncEntryToAtlas(existing, now);
+        importedCount += 1;
+        continue;
+      }
+
+      if (inc.status === "superseded" && existing.status !== "falsified" && existing.status !== "superseded") {
+        existing.status = "superseded";
+        if (inc.supersededBy) existing.supersededBy = inc.supersededBy;
+        existing.evidenceNotes = Array.from(new Set([...existing.evidenceNotes, ...notes]));
+        existing.updatedAt = inc.updatedAt > existing.updatedAt ? inc.updatedAt : now;
+        this.syncEntryToAtlas(existing, now);
+        importedCount += 1;
+        continue;
+      }
+
+      if (existing.status === "sandbox" || existing.status === "crystallized") {
+        const shouldPromote = existing.status === "crystallized" || inc.status === "crystallized";
+        const mergedNotes = Array.from(new Set([...existing.evidenceNotes, ...notes]));
+        const changed =
+          (shouldPromote && existing.status !== "crystallized") ||
+          inc.confirmations > existing.confirmations ||
+          inc.confidence > existing.confidence ||
+          inc.updatedAt > existing.updatedAt ||
+          mergedNotes.length > existing.evidenceNotes.length;
+        if (changed) {
+          existing.status = shouldPromote ? "crystallized" : "sandbox";
+          existing.stratum = shouldPromote ? "crystallized_wisdom" : "digested_state";
+          existing.confirmations = Math.max(existing.confirmations, inc.confirmations);
+          existing.confidence = Math.max(existing.confidence, inc.confidence);
+          existing.evidenceNotes = mergedNotes;
+          if (inc.updatedAt > existing.updatedAt) {
+            existing.updatedAt = inc.updatedAt;
+          }
+          this.syncEntryToAtlas(existing, now);
+          importedCount += 1;
+        }
+      }
+    }
+
+    if (importedCount > 0) {
+      this.persist();
+    }
+    return importedCount;
+  }
+
+  pruneExpiredSandboxEntries(maxAgeDays = 7, nowIso?: string): string[] {
+    const now = nowIso ?? this.nowIso();
+    const nowMs = Date.parse(now);
+    if (!Number.isFinite(nowMs)) return [];
+
+    const expiredIds: string[] = [];
+    for (const entry of this.entries) {
+      if (entry.status !== "sandbox") continue;
+      if (entry.confirmations >= 3) continue;
+      const updatedMs = Date.parse(entry.updatedAt);
+      if (!Number.isFinite(updatedMs)) continue;
+      if ((nowMs - updatedMs) / MS_PER_DAY >= maxAgeDays) {
+        entry.status = "superseded";
+        if (!entry.evidenceNotes.includes("expired_unconfirmed_7d")) {
+          entry.evidenceNotes.push("expired_unconfirmed_7d");
+        }
+        entry.updatedAt = now;
+        this.atlas?.archiveNode(entry.id, now);
+        expiredIds.push(entry.id);
+      }
+    }
+
+    if (expiredIds.length > 0) {
+      this.persist();
+    }
+    return expiredIds;
   }
 
   recordJudgment(
@@ -491,24 +846,37 @@ export class EpistemicDigestionLoop {
   ): { entry: EpistemicJudgmentEntry; outcome: "confirmed" | "falsified"; tombstoneLesson?: string } | null {
     const clean = input.userText.trim();
     if (!clean || looksSecret(clean)) return null;
-    const outcome: "confirmed" | "falsified" | null = FEEDBACK_FALSIFY_RE.test(clean)
-      ? "falsified"
-      : FEEDBACK_CONFIRM_RE.test(clean)
-        ? "confirmed"
-        : null;
+    const outcome = detectImplicitFeedbackSignal(clean);
     if (!outcome) return null;
 
     const candidates = this.entries.filter((e) => e.status === "sandbox");
     if (candidates.length === 0) return null;
-    let target = candidates[candidates.length - 1]!;
-    for (let i = candidates.length - 1; i >= 0; i--) {
+
+    const userTokens = new Set(tokenizeForSearch(clean));
+    let bestTarget: EpistemicJudgmentEntry | undefined;
+    let bestScore = 0;
+    for (let i = 0; i < candidates.length; i++) {
       const cand = candidates[i]!;
-      const keys = [cand.topicKey, ...cand.hypothesis.split(/[：:，,。；;\s]+/).filter((w) => w.length >= 2)];
-      if (keys.some((k) => clean.includes(k))) {
-        target = cand;
-        break;
+      const score = scoreSandboxCandidateMatch(cand, clean, userTokens, input.surface);
+      if (score > 0 && score >= bestScore) {
+        bestScore = score;
+        bestTarget = cand;
       }
     }
+
+    let target = bestTarget;
+    if (!target) {
+      for (let i = candidates.length - 1; i >= 0; i--) {
+        if (candidates[i]!.surface === input.surface) {
+          target = candidates[i]!;
+          break;
+        }
+      }
+      if (!target) {
+        target = candidates[candidates.length - 1]!;
+      }
+    }
+
     const res = this.reconcileOutcome(
       {
         idOrTopic: target.id,
@@ -519,6 +887,121 @@ export class EpistemicDigestionLoop {
       nowIso,
     );
     return res ? { entry: res.entry, outcome, ...(res.tombstoneLesson ? { tombstoneLesson: res.tombstoneLesson } : {}) } : null;
+  }
+
+  async digestTurnFeedbackDualTrack(
+    input: {
+      userText: string;
+      assistantReply?: string;
+      surface: SiliconSurfaceId;
+      assessorCompleteFn?: (system: string, user: string) => Promise<string>;
+      minAssessorConfidence?: number;
+    },
+    nowIso?: string,
+  ): Promise<{
+    reconciled: Array<{
+      entry: EpistemicJudgmentEntry;
+      outcome: "confirmed" | "falsified";
+      channel: "tier0_deterministic" | "tier1_assessor";
+      tombstoneLesson?: string;
+    }>;
+  }> {
+    const tier0 = this.digestUserFeedbackTurn({ userText: input.userText, surface: input.surface }, nowIso);
+    if (tier0) {
+      return {
+        reconciled: [
+          {
+            entry: tier0.entry,
+            outcome: tier0.outcome,
+            channel: "tier0_deterministic",
+            ...(tier0.tombstoneLesson ? { tombstoneLesson: tier0.tombstoneLesson } : {}),
+          },
+        ],
+      };
+    }
+
+    const cleanUser = input.userText.trim();
+    if (!cleanUser || !input.assessorCompleteFn || looksSecret(cleanUser)) {
+      return { reconciled: [] };
+    }
+
+    const activeSandbox = this.entries.filter((e) => e.status === "sandbox");
+    if (activeSandbox.length === 0) {
+      return { reconciled: [] };
+    }
+
+    const promptCandidates = activeSandbox.slice(-8).map((e) => ({
+      id: e.id,
+      topicKey: e.topicKey,
+      surface: e.surface,
+      hypothesis: e.hypothesis,
+    }));
+    const safeReply =
+      input.assistantReply && !looksSecret(input.assistantReply)
+        ? input.assistantReply.trim().slice(0, 240)
+        : "";
+    const userPayload = JSON.stringify(
+      {
+        surface: input.surface,
+        sandboxHypotheses: promptCandidates,
+        userText: cleanUser,
+        ...(safeReply ? { assistantReplyContext: safeReply } : {}),
+      },
+      null,
+      2,
+    );
+
+    let raw = "";
+    try {
+      raw = await input.assessorCompleteFn(ASSESSOR_FEEDBACK_DIGEST_SYSTEM, userPayload);
+    } catch {
+      return { reconciled: [] };
+    }
+
+    const matches = parseAssessorFeedbackMatches(raw);
+    if (matches.length === 0) {
+      return { reconciled: [] };
+    }
+
+    const minConf = input.minAssessorConfidence ?? 0.65;
+    const reconciled: Array<{
+      entry: EpistemicJudgmentEntry;
+      outcome: "confirmed" | "falsified";
+      channel: "tier0_deterministic" | "tier1_assessor";
+      tombstoneLesson?: string;
+    }> = [];
+
+    for (const match of matches) {
+      if (match.confidence < minConf) continue;
+      const note = (match.evidenceNote ?? "").trim();
+      if (note && looksSecret(note)) continue;
+
+      const cand = this.entries.find(
+        (e) => e.status === "sandbox" && (e.id === match.id || e.topicKey === match.id),
+      );
+      if (!cand) continue;
+
+      const res = this.reconcileOutcome(
+        {
+          idOrTopic: cand.id,
+          outcome: match.outcome,
+          evidenceNote: note || `${input.surface} assessor 隐式反馈 (${match.confidence.toFixed(2)})`,
+          ownerEndorsed:
+            match.outcome === "falsified" || input.surface === "im_owner" || input.surface === "steward_hub",
+        },
+        nowIso,
+      );
+      if (res) {
+        reconciled.push({
+          entry: res.entry,
+          outcome: match.outcome,
+          channel: "tier1_assessor",
+          ...(res.tombstoneLesson ? { tombstoneLesson: res.tombstoneLesson } : {}),
+        });
+      }
+    }
+
+    return { reconciled };
   }
 
   extractTurnJudgmentDeterministically(
@@ -586,4 +1069,18 @@ export class EpistemicDigestionLoop {
       calibratedLessons: this.getCalibratedLessons(6),
     };
   }
+}
+
+export async function digestImplicitFeedbackWithAssessor(
+  loop: EpistemicDigestionLoop,
+  input: {
+    userText: string;
+    assistantReply?: string;
+    surface: SiliconSurfaceId;
+    assessorCompleteFn?: (system: string, user: string) => Promise<string>;
+    minAssessorConfidence?: number;
+  },
+  nowIso?: string,
+) {
+  return loop.digestTurnFeedbackDualTrack(input, nowIso);
 }

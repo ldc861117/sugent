@@ -69,6 +69,7 @@ import {
   SugentP2HostService,
   SugentStewardHostService,
   buildBrokerDesktopAuthConfig,
+  createAtlasMindSyncPort,
   createEnvelopedRuleEventSink,
   decodeJwtPayloadUnsafe,
   deriveMagpieApiBases,
@@ -77,6 +78,7 @@ import {
   probeGeminiWeb2Api,
   resolveOpsBridgeConfig,
   resolveSugentGatewayConfig,
+  resolveUnifiedCausalLedgerDir,
   resolveUnifiedKnowledgeGraphDir,
   type GeminiWeb2ApiProbeResult,
   type ProviderSyncResult,
@@ -472,10 +474,19 @@ export class App {
       },
     });
     this.conciergeBridge.attachLedger(this.stewardService.ledger);
+    this.conciergeBridge.attachMindLoop(this.stewardService.mindLoop);
+    this.conciergeBridge.attachAtlas(this.stewardService.atlas);
     this.p2Service.attachStewardshipLedgerPort({
       exportLedger: () => this.stewardService.ledger.exportSnapshotForSync(),
       importLedger: (snap) => this.stewardService.ledger.mergeRemoteSnapshot(snap),
     });
+    this.p2Service.attachAtlasSyncPort(
+      createAtlasMindSyncPort({
+        atlas: this.stewardService.atlas,
+        mindJournalPath: path.join(resolveUnifiedCausalLedgerDir(config.dataDir), "mind-journal.json"),
+        onMindJournalImported: () => this.stewardService.mindLoop.reloadFromDisk(),
+      }),
+    );
     if (config.magpie.mode === "managed") {
       this.magpie = new MagpieSupervisor({
         dataDir: config.dataDir,

@@ -10,8 +10,19 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { looksSecret } from "../agent/memory.js";
 import type { RoundTraceProjection } from "./causal-ledger.js";
 import type { KGDelta, KGEdge, SugentKnowledgeGraph } from "./knowledge-graph.js";
+import type { EpistemicDigestionLoop } from "./silicon-identity-core.js";
+import {
+  tokenizeForSearch,
+  type AtlasEdgeInput,
+  type AtlasNode,
+  type AtlasNodeInput,
+  type GraphPlaneId,
+  type PrincipalId,
+  type StereoscopicAtlas,
+} from "./stereoscopic-atlas.js";
 import type { ContextPartition, LedgerSnapshot, StewardshipLedger } from "./stewardship-ledger.js";
 
 export const URGENT_SURPRISE_THRESHOLD = 0.7;
@@ -22,6 +33,27 @@ export const SANDBOX_EXPIRY_DAYS = 7;
 
 export type GardenerCostTier = "tier0_deterministic" | "tier1_template" | "tier2_steward_llm";
 export type HypothesisState = "PROPOSED" | "VALIDATED" | "DISCARDED";
+
+export interface MemoryDisambiguationCard {
+  cardId: string;
+  plane: GraphPlaneId;
+  topicKey: string;
+  nodeA: { id: string; name: string; summary: string; updatedAt: string };
+  nodeB: { id: string; name: string; summary: string; updatedAt: string };
+  conflictReason: string;
+  question: string;
+  options: [string, string];
+}
+
+export interface SleepConsolidationOutput {
+  triggered: boolean;
+  triggerReason: "weekly_calibration" | "surprise_momentum" | "forced" | "idle_skipped";
+  crystallizedNodes: AtlasNode[];
+  synthesizedEdgesCount: number;
+  disambiguationCards: MemoryDisambiguationCard[];
+  expiredSandboxIds: string[];
+  archivedNoiseEdgeIds: string[];
+}
 
 export interface GardenerSandboxHypothesis {
   id: string;
@@ -297,6 +329,33 @@ export interface GardenerSandboxState {
   hypotheses: GardenerSandboxHypothesis[];
   lastReport?: GoalActionDriftReport;
   lastCalibrationLines?: [string, string, string];
+  pendingDisambiguationCards?: MemoryDisambiguationCard[];
+  lastSleepConsolidation?: Omit<SleepConsolidationOutput, "crystallizedNodes"> & {
+    crystallizedNodeIds: string[];
+  };
+}
+
+function cloneDisambiguationCard(card: MemoryDisambiguationCard): MemoryDisambiguationCard {
+  return {
+    ...card,
+    nodeA: { ...card.nodeA },
+    nodeB: { ...card.nodeB },
+    options: [card.options[0], card.options[1]],
+  };
+}
+
+function cloneLastSleepSummary(
+  s: NonNullable<GardenerSandboxState["lastSleepConsolidation"]>,
+): NonNullable<GardenerSandboxState["lastSleepConsolidation"]> {
+  return {
+    triggered: s.triggered,
+    triggerReason: s.triggerReason,
+    crystallizedNodeIds: [...s.crystallizedNodeIds],
+    synthesizedEdgesCount: s.synthesizedEdgesCount,
+    disambiguationCards: s.disambiguationCards.map(cloneDisambiguationCard),
+    expiredSandboxIds: [...s.expiredSandboxIds],
+    archivedNoiseEdgeIds: [...s.archivedNoiseEdgeIds],
+  };
 }
 
 export class GardenerStateStore {
@@ -333,9 +392,15 @@ export class GardenerStateStore {
         ...(Array.isArray(raw.lastCalibrationLines) && raw.lastCalibrationLines.length === 3
           ? { lastCalibrationLines: raw.lastCalibrationLines as [string, string, string] }
           : {}),
+        ...(Array.isArray(raw.pendingDisambiguationCards)
+          ? { pendingDisambiguationCards: raw.pendingDisambiguationCards.map(cloneDisambiguationCard) }
+          : {}),
+        ...(raw.lastSleepConsolidation
+          ? { lastSleepConsolidation: cloneLastSleepSummary(raw.lastSleepConsolidation) }
+          : {}),
       };
       this.state = loaded;
-      return { ...loaded, hypotheses: loaded.hypotheses.map((h) => ({ ...h })) };
+      return this.getState();
     } catch {
       this.state = fallback;
       return { ...fallback, hypotheses: [] };
@@ -356,6 +421,12 @@ export class GardenerStateStore {
       ...(state.lastCalibrationLines
         ? { lastCalibrationLines: [...state.lastCalibrationLines] as [string, string, string] }
         : {}),
+      ...(state.pendingDisambiguationCards
+        ? { pendingDisambiguationCards: state.pendingDisambiguationCards.map(cloneDisambiguationCard) }
+        : {}),
+      ...(state.lastSleepConsolidation
+        ? { lastSleepConsolidation: cloneLastSleepSummary(state.lastSleepConsolidation) }
+        : {}),
     };
     const tmp = `${this.filePath}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`;
     fs.writeFileSync(tmp, `${JSON.stringify(normalized, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
@@ -372,6 +443,12 @@ export class GardenerStateStore {
       ...(this.state.lastReport ? { lastReport: { ...this.state.lastReport } } : {}),
       ...(this.state.lastCalibrationLines
         ? { lastCalibrationLines: [...this.state.lastCalibrationLines] as [string, string, string] }
+        : {}),
+      ...(this.state.pendingDisambiguationCards
+        ? { pendingDisambiguationCards: this.state.pendingDisambiguationCards.map(cloneDisambiguationCard) }
+        : {}),
+      ...(this.state.lastSleepConsolidation
+        ? { lastSleepConsolidation: cloneLastSleepSummary(this.state.lastSleepConsolidation) }
         : {}),
     };
   }
@@ -503,19 +580,647 @@ export function deriveGardenerHypotheses(params: {
 }
 
 
+const GENERIC_CLUSTER_TAGS = new Set([
+  "post-turn",
+  "domain_work",
+  "owner_life",
+  "self_core",
+  "meta_evolution",
+  "relational",
+  "workflow",
+  "preference",
+  "archive",
+  "review",
+  "ops",
+  "epistemic_sandbox",
+  "epistemic_crystallized",
+  "epistemic_tombstone",
+  "sleep_consolidated",
+  "episode_anchor",
+]);
+
+function isSpecificClusterTag(rawTag: string): boolean {
+  const t = rawTag.trim().toLowerCase();
+  if (!t || GENERIC_CLUSTER_TAGS.has(t)) return false;
+  if (
+    t.startsWith("topic:") ||
+    t.startsWith("surface:") ||
+    t.startsWith("ep:") ||
+    t.startsWith("episode:")
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function extractExplicitTopicTag(tags: readonly string[]): string | undefined {
+  for (const tag of tags) {
+    const trimmed = tag.trim();
+    if (trimmed.toLowerCase().startsWith("topic:")) {
+      const val = trimmed.slice("topic:".length).trim().toLowerCase();
+      if (val) return val;
+    }
+  }
+  return undefined;
+}
+
+function extractNameEntityPrefix(name: string): string | undefined {
+  const clean = name.trim();
+  const cjk = clean.match(/[\u4e00-\u9fff]{4}/)?.[0];
+  if (cjk) return cjk;
+  const ascii = clean.toLowerCase().match(/[a-z0-9][a-z0-9_-]{2,}/)?.[0];
+  return ascii;
+}
+
+export type MemoryConflictDetection = {
+  kind: "numeric" | "polarity";
+  reason: string;
+};
+
+function extractPaymentDays(text: string): number[] {
+  const out: number[] = [];
+  const push = (n: number) => {
+    if (Number.isFinite(n) && n >= 0 && !out.includes(n)) out.push(n);
+  };
+  for (const m of text.matchAll(/(?:^|[^a-z0-9])net\s*(\d+(?:\.\d+)?)(?=$|[^a-z0-9])/gi)) {
+    push(Number(m[1]));
+  }
+  for (const clause of text.split(/[。；;！!\n]+/)) {
+    if (!/(?:账期|净账期|信用期|付款周期|结算期|回款|月结)/.test(clause)) continue;
+    for (const m of clause.matchAll(/(\d+(?:\.\d+)?)\s*(?:个?工作日|天|日)/g)) {
+      push(Number(m[1]));
+    }
+    for (const m of clause.matchAll(/(\d+(?:\.\d+)?)\s*个?月/g)) {
+      push(Number(m[1]) * 30);
+    }
+  }
+  return out;
+}
+
+function extractPriceValues(text: string): Array<{ raw: string; rmb: number }> {
+  const out: Array<{ raw: string; rmb: number }> = [];
+  const add = (numStr: string, unitStr: string) => {
+    const val = Number(numStr);
+    if (!Number.isFinite(val)) return;
+    const u = unitStr.toLowerCase();
+    const mult = u === "万" || u === "w" ? 10_000 : u === "千" || u === "k" ? 1_000 : 1;
+    const rmb = val * mult;
+    if (!out.some((x) => Math.abs(x.rmb - rmb) < 1e-6)) {
+      out.push({ raw: `${numStr}${unitStr}`, rmb });
+    }
+  };
+  const forwardRe = /(?:底价|最低价|单价|报价|总价|打包价|顾问费|年费|预算)[^，,。；;\n\d]{0,12}?(\d+(?:\.\d+)?)\s*(万|w|千|k|元)/gi;
+  const reverseRe = /(\d+(?:\.\d+)?)\s*(万|w|千|k|元)[^，,。；;\n\d]{0,8}?(?:的)?(?:底价|最低价|单价|报价|总价|打包价|顾问费|年费|预算)/gi;
+  for (const m of text.matchAll(forwardRe)) add(m[1]!, m[2]!);
+  for (const m of text.matchAll(reverseRe)) add(m[1]!, m[2]!);
+  return out;
+}
+
+function extractDownpaymentRatios(text: string): number[] {
+  const out: number[] = [];
+  const push = (n: number) => {
+    if (Number.isFinite(n) && !out.includes(n)) out.push(n);
+  };
+  if (/(?:零首付|0\s*首付)/.test(text)) push(0);
+  for (const m of text.matchAll(/(?:首付|预付款|启动款)[^，,。；;\n\d]{0,12}?(\d+(?:\.\d+)?)\s*%/g)) {
+    push(Number(m[1]));
+  }
+  for (const m of text.matchAll(/(\d+(?:\.\d+)?)\s*%[^，,。；;\n\d]{0,6}?(?:首付|预付款|启动款)/g)) {
+    push(Number(m[1]));
+  }
+  return out;
+}
+
+function extractGenericScopedNumbers(
+  text: string,
+  topicKey?: string,
+): Array<{ attrTokens: string[]; num: number; unit: string; rawAttr: string }> {
+  const out: Array<{ attrTokens: string[]; num: number; unit: string; rawAttr: string }> = [];
+  const topicLower = topicKey?.trim().toLowerCase() ?? "";
+  const re =
+    /([\u4e00-\u9fffa-z0-9_-]{2,10}?)(?:上限|最多|不超过|不高于|至少|最低|不低于|不少于|设为|定为|控制在|限制在|保留|锁定)?\s*(\d+(?:\.\d+)?)\s*(天|日|小时|分钟|秒|ms|%|万|元|次|个|条|gb|mb)(?=$|[^a-z0-9])/gi;
+  for (const m of text.matchAll(re)) {
+    let rawAttr = m[1]!.trim();
+    if (topicLower && rawAttr.toLowerCase().startsWith(topicLower)) {
+      rawAttr = rawAttr.slice(topicLower.length).trim();
+    }
+    rawAttr = rawAttr.replace(/(?:上限|最多|不超过|不高于|至少|最低|不低于|不少于|比例|额度|标准|要求|调整为|改为)/g, "").trim();
+    if (rawAttr.length < 2) continue;
+    const attrTokens = tokenizeForSearch(rawAttr).filter((t) => t.length >= 2);
+    if (attrTokens.length === 0) continue;
+    const num = Number(m[2]);
+    if (!Number.isFinite(num)) continue;
+    const rawUnit = m[3]!.toLowerCase();
+    const unit = rawUnit === "日" ? "天" : rawUnit;
+    out.push({ attrTokens, num, unit, rawAttr });
+  }
+  return out;
+}
+
+const PROHIBITIVE_DIRECTIVE_RE = /(?:禁止|严禁|不得|切勿|不要|绝不|不能|不可|拒绝|不接受|关闭|禁用)/;
+const PERMISSIVE_DIRECTIVE_RE = /(?:允许|可以|可直接|直接|默认开启|开启|启用|无需|免审|跳过|接受|放行)/;
+const STRIP_POLARITY_CUE_RE =
+  /(?:禁止|严禁|不得|切勿|不要|绝不|不能|不可|拒绝|不接受|关闭|禁用|允许|可以|默认开启|开启|启用|无需|免审|接受|放行)/g;
+const MANNER_STOP_TOKENS = new Set([
+  "直接",
+  "跳过",
+  "默认",
+  "目前",
+  "现在",
+  "一律",
+  "统一",
+  "先发",
+  "规定",
+  "策略",
+  "规则",
+  "要求",
+]);
+
+function extractClausePolarityInfos(
+  text: string,
+): Array<{ polarity: "prohibitive" | "permissive"; tokens: string[]; postCueTokens: Set<string> }> {
+  const out: Array<{ polarity: "prohibitive" | "permissive"; tokens: string[]; postCueTokens: Set<string> }> = [];
+  const clauses = text.split(/[。；;！!\n]+|(?:[，,]\s*(?:但|但是|不过|然而|而))/);
+  for (const rawClause of clauses) {
+    const c = rawClause.trim();
+    if (!c) continue;
+    const prohibMatch = PROHIBITIVE_DIRECTIVE_RE.exec(c);
+    const isProhib = Boolean(prohibMatch);
+    const permMatch = !isProhib ? PERMISSIVE_DIRECTIVE_RE.exec(c) : null;
+    const isPerm = Boolean(permMatch);
+    if (!isProhib && !isPerm) continue;
+    const cueMatch = prohibMatch ?? permMatch!;
+    const afterCue = c.slice(cueMatch.index + cueMatch[0].length);
+    const postCueTokens = new Set(
+      tokenizeForSearch(afterCue.replace(STRIP_POLARITY_CUE_RE, " ")).filter(
+        (tok) => tok.length >= 2 && !MANNER_STOP_TOKENS.has(tok),
+      ),
+    );
+    const stripped = c.replace(STRIP_POLARITY_CUE_RE, " ");
+    const tokens = tokenizeForSearch(stripped).filter(
+      (tok) => tok.length >= 2 && !MANNER_STOP_TOKENS.has(tok),
+    );
+    if (tokens.length > 0) {
+      out.push({ polarity: isProhib ? "prohibitive" : "permissive", tokens, postCueTokens });
+    }
+  }
+  return out;
+}
+
+export function detectPairwiseMemoryConflict(
+  a: Pick<AtlasNode, "name" | "summary"> & Partial<Pick<AtlasNode, "id" | "tags">>,
+  b: Pick<AtlasNode, "name" | "summary"> & Partial<Pick<AtlasNode, "id" | "tags">>,
+  topicKey?: string,
+): MemoryConflictDetection | null {
+  const textA = `${a.name ?? ""}。${a.summary ?? ""}`.trim();
+  const textB = `${b.name ?? ""}。${b.summary ?? ""}`.trim();
+  if (!textA || !textB || textA === textB) return null;
+
+  const daysA = extractPaymentDays(textA);
+  const daysB = extractPaymentDays(textB);
+  if (daysA.length > 0 && daysB.length > 0 && !daysA.some((d) => daysB.includes(d))) {
+    return {
+      kind: "numeric",
+      reason: `账期/结算天数互斥（${daysA[0]}天 vs ${daysB[0]}天）`,
+    };
+  }
+
+  const pricesA = extractPriceValues(textA);
+  const pricesB = extractPriceValues(textB);
+  if (
+    pricesA.length > 0 &&
+    pricesB.length > 0 &&
+    !pricesA.some((pa) => pricesB.some((pb) => Math.abs(pa.rmb - pb.rmb) < 1e-6))
+  ) {
+    return {
+      kind: "numeric",
+      reason: `价格/报价数值互斥（${pricesA[0]!.raw} vs ${pricesB[0]!.raw}）`,
+    };
+  }
+
+  const dpA = extractDownpaymentRatios(textA);
+  const dpB = extractDownpaymentRatios(textB);
+  if (dpA.length > 0 && dpB.length > 0 && !dpA.some((v) => dpB.includes(v))) {
+    return {
+      kind: "numeric",
+      reason: `首付比例互斥（${dpA[0]}% vs ${dpB[0]}%）`,
+    };
+  }
+
+  const scopedA = extractGenericScopedNumbers(textA, topicKey);
+  const scopedB = extractGenericScopedNumbers(textB, topicKey);
+  for (const sa of scopedA) {
+    const setA = new Set(sa.attrTokens);
+    for (const sb of scopedB) {
+      if (sa.unit !== sb.unit || Math.abs(sa.num - sb.num) < 1e-9) continue;
+      if (sb.attrTokens.some((t) => setA.has(t))) {
+        return {
+          kind: "numeric",
+          reason: `同属性「${sa.rawAttr}」数值互斥（${sa.num}${sa.unit} vs ${sb.num}${sb.unit}）`,
+        };
+      }
+    }
+  }
+
+  const topicTokenSet = topicKey ? new Set(tokenizeForSearch(topicKey)) : new Set<string>();
+  const polA = extractClausePolarityInfos(textA);
+  const polB = extractClausePolarityInfos(textB);
+  for (const ca of polA) {
+    for (const cb of polB) {
+      if (ca.polarity === cb.polarity) continue;
+      const postA = Array.from(ca.postCueTokens).filter((t) => !topicTokenSet.has(t));
+      const postB = Array.from(cb.postCueTokens).filter((t) => !topicTokenSet.has(t));
+      let sharedList: string[] = [];
+      if (postA.length > 0 && postB.length > 0) {
+        const setPostA = new Set(postA);
+        sharedList = postB.filter((t) => setPostA.has(t));
+      } else {
+        const remA = ca.tokens.filter((t) => !topicTokenSet.has(t));
+        const remB = cb.tokens.filter((t) => !topicTokenSet.has(t));
+        const poolA = remA.length > 0 && remB.length > 0 ? remA : ca.tokens;
+        const poolB = remA.length > 0 && remB.length > 0 ? remB : cb.tokens;
+        const setPoolA = new Set(poolA);
+        sharedList = poolB.filter((t) => setPoolA.has(t));
+      }
+      if (sharedList.length > 0) {
+        const label = Array.from(new Set(sharedList)).slice(0, 3).join("/");
+        return {
+          kind: "polarity",
+          reason: `指令极性互斥（围绕「${label}」一方禁止/关闭，另一方允许/放行）`,
+        };
+      }
+    }
+  }
+
+  return null;
+}
+
+function removeAtlasNoiseOrOrphanEdge(
+  atlas: StereoscopicAtlas,
+  edgeId: string,
+  nowIso: string,
+  nowMs: number,
+): boolean {
+  const edge = atlas.getEdge(edgeId);
+  if (!edge || edge.supersededAt) return false;
+
+  const preTo = atlas.getNode(edge.to);
+  const shouldPreserveTarget =
+    Boolean(preTo && !preTo.supersededAt && !preTo.archivedAt) &&
+    !(
+      preTo!.stratum === "raw_episodic" &&
+      Number.isFinite(Date.parse(preTo!.updatedAt)) &&
+      Number.isFinite(nowMs) &&
+      (nowMs - Date.parse(preTo!.updatedAt)) / MS_PER_DAY > 90
+    );
+  const snapshotTo =
+    shouldPreserveTarget && preTo
+      ? {
+          ...preTo,
+          tags: [...preTo.tags],
+          principalAcl: [...preTo.principalAcl],
+          ...(preTo.steps ? { steps: [...preTo.steps] } : {}),
+        }
+      : undefined;
+
+  const removed = atlas.removeEdge(edgeId, nowIso);
+  if (!removed) return false;
+
+  if (snapshotTo) {
+    const postTo = atlas.getNode(snapshotTo.id);
+    if (postTo?.supersededAt && !snapshotTo.supersededAt) {
+      atlas.applyDelta(
+        {
+          nodes: [
+            {
+              id: snapshotTo.id,
+              plane: snapshotTo.plane,
+              stratum: snapshotTo.stratum,
+              kind: snapshotTo.kind,
+              name: snapshotTo.name,
+              summary: snapshotTo.summary,
+              tags: snapshotTo.tags,
+              principalAcl: snapshotTo.principalAcl,
+              reinforcements: 0,
+              confidence: snapshotTo.confidence,
+              sourceTrust: snapshotTo.sourceTrust,
+              ...(snapshotTo.steps?.length ? { steps: snapshotTo.steps } : {}),
+              ...(snapshotTo.skillGateStatus ? { skillGateStatus: snapshotTo.skillGateStatus } : {}),
+            },
+          ],
+        },
+        snapshotTo.updatedAt,
+      );
+    }
+  }
+  return true;
+}
+
+export function runAtlasSleepConsolidation(params: {
+  atlas: StereoscopicAtlas;
+  mindLoop?: EpistemicDigestionLoop;
+  nowIso: string;
+  surpriseMomentum?: number;
+  weeklyCalibrationDue?: boolean;
+  force?: boolean;
+  sandboxExpiryDays?: number;
+}): SleepConsolidationOutput {
+  const momentum = params.surpriseMomentum ?? 0;
+  const triggerReason: SleepConsolidationOutput["triggerReason"] =
+    params.force === true
+      ? "forced"
+      : params.weeklyCalibrationDue === true
+        ? "weekly_calibration"
+        : momentum >= URGENT_SURPRISE_THRESHOLD
+          ? "surprise_momentum"
+          : "idle_skipped";
+
+  if (triggerReason === "idle_skipped") {
+    return {
+      triggered: false,
+      triggerReason: "idle_skipped",
+      crystallizedNodes: [],
+      synthesizedEdgesCount: 0,
+      disambiguationCards: [],
+      expiredSandboxIds: [],
+      archivedNoiseEdgeIds: [],
+    };
+  }
+
+  const nowIso = params.nowIso;
+  const nowMs = Date.parse(nowIso);
+  const expiryDays = params.sandboxExpiryDays ?? SANDBOX_EXPIRY_DAYS;
+
+  // Step C.1 (early): Expire >7d unconfirmed sandbox hypotheses so stale hypotheses don't pollute Step A/B
+  const expiredSet = new Set<string>(
+    params.mindLoop?.pruneExpiredSandboxEntries(expiryDays, nowIso) ?? [],
+  );
+  for (const node of params.atlas.allNodes({ includeSuperseded: false })) {
+    const isSandboxNode =
+      (node.kind === "hypothesis" || node.tags.includes("epistemic_sandbox")) &&
+      node.stratum !== "crystallized_wisdom";
+    if (!isSandboxNode || node.reinforcements >= SANDBOX_VALIDATION_THRESHOLD) continue;
+    const updatedMs = Date.parse(node.updatedAt);
+    if (Number.isFinite(nowMs) && Number.isFinite(updatedMs) && (nowMs - updatedMs) / MS_PER_DAY >= expiryDays) {
+      if (params.atlas.archiveNode(node.id, nowIso)) {
+        expiredSet.add(node.id);
+      }
+    }
+  }
+
+  // Step A: Same-plane topic clustering & pairwise contradiction scan
+  const eligibleForClustering = params.atlas.allNodes({ includeSuperseded: false }).filter((n) => {
+    if (n.kind === "episode_anchor" || n.tags.includes("episode_anchor") || n.id.startsWith("ep:")) return false;
+    if (n.tags.includes("sleep_consolidated") || n.id.startsWith("syn:")) return false;
+    return true;
+  });
+
+  const nodesByPlane = new Map<GraphPlaneId, AtlasNode[]>();
+  for (const node of eligibleForClustering) {
+    const list = nodesByPlane.get(node.plane) ?? [];
+    list.push(node);
+    nodesByPlane.set(node.plane, list);
+  }
+
+  const clusters = new Map<string, { plane: GraphPlaneId; topicKey: string; members: AtlasNode[] }>();
+  for (const [plane, planeNodes] of nodesByPlane.entries()) {
+    const tagFreq = new Map<string, number>();
+    for (const n of planeNodes) {
+      const seenOnNode = new Set<string>();
+      const explicitTopic = extractExplicitTopicTag(n.tags);
+      if (explicitTopic) seenOnNode.add(explicitTopic);
+      for (const tag of n.tags) {
+        if (isSpecificClusterTag(tag)) {
+          seenOnNode.add(tag.trim().toLowerCase());
+        }
+      }
+      for (const t of seenOnNode) {
+        tagFreq.set(t, (tagFreq.get(t) ?? 0) + 1);
+      }
+    }
+
+    for (const n of planeNodes) {
+      let topicKey = extractExplicitTopicTag(n.tags);
+      if (!topicKey) {
+        let bestTag: string | undefined;
+        let bestFreq = 1;
+        for (const tag of n.tags) {
+          if (!isSpecificClusterTag(tag)) continue;
+          const norm = tag.trim().toLowerCase();
+          const freq = tagFreq.get(norm) ?? 0;
+          if (freq >= 2 && freq > bestFreq) {
+            bestFreq = freq;
+            bestTag = norm;
+          }
+        }
+        topicKey =
+          bestTag ??
+          extractNameEntityPrefix(n.name) ??
+          n.tags.find(isSpecificClusterTag)?.trim().toLowerCase() ??
+          n.id;
+      }
+      const clusterKey = `${plane}::${topicKey}`;
+      const bucket = clusters.get(clusterKey) ?? { plane, topicKey, members: [] };
+      bucket.members.push(n);
+      clusters.set(clusterKey, bucket);
+    }
+  }
+
+  const disambiguationCards: MemoryDisambiguationCard[] = [];
+  const conflictedClusterKeys = new Set<string>();
+
+  for (const [clusterKey, cluster] of clusters.entries()) {
+    if (cluster.members.length < 2) continue;
+    const sorted = [...cluster.members].sort((x, y) =>
+      x.updatedAt === y.updatedAt ? x.id.localeCompare(y.id) : x.updatedAt.localeCompare(y.updatedAt),
+    );
+    for (let i = 0; i < sorted.length; i++) {
+      for (let j = i + 1; j < sorted.length; j++) {
+        const a = sorted[i]!;
+        const b = sorted[j]!;
+        const conflict = detectPairwiseMemoryConflict(a, b, cluster.topicKey);
+        if (!conflict) continue;
+        conflictedClusterKeys.add(clusterKey);
+        const pairHash = crypto
+          .createHash("sha256")
+          .update(`${cluster.plane}:${cluster.topicKey}:${[a.id, b.id].sort().join("|")}`)
+          .digest("hex")
+          .slice(0, 10);
+        disambiguationCards.push({
+          cardId: `disambig:${pairHash}`,
+          plane: cluster.plane,
+          topicKey: cluster.topicKey,
+          nodeA: { id: a.id, name: a.name, summary: a.summary, updatedAt: a.updatedAt },
+          nodeB: { id: b.id, name: b.name, summary: b.summary, updatedAt: b.updatedAt },
+          conflictReason: conflict.reason,
+          question: `检测到同平面（${cluster.plane} · ${cluster.topicKey}）存在互斥记忆：「${a.summary.slice(0, 48)}」 vs 「${b.summary.slice(0, 48)}」（${conflict.reason}），请确认保留哪一条？`,
+          options: [
+            `保留「${a.summary.slice(0, 36)}」并归档旧条`,
+            `保留「${b.summary.slice(0, 36)}」并归档旧条`,
+          ],
+        });
+      }
+    }
+  }
+
+  // Step B: Coherent cluster synthesis (>= 3 verified_fact / raw_episodic & 0 conflicts -> crystallized_wisdom)
+  const crystallizedNodes: AtlasNode[] = [];
+  let synthesizedEdgesCount = 0;
+
+  for (const [clusterKey, cluster] of clusters.entries()) {
+    if (conflictedClusterKeys.has(clusterKey)) continue;
+    const eligibleMembers = cluster.members
+      .filter(
+        (m) =>
+          (m.stratum === "verified_fact" || m.stratum === "raw_episodic") &&
+          !looksSecret(`${m.name}\n${m.summary}`),
+      )
+      .sort((x, y) =>
+        x.updatedAt === y.updatedAt ? x.id.localeCompare(y.id) : x.updatedAt.localeCompare(y.updatedAt),
+      );
+    if (eligibleMembers.length < 3) continue;
+
+    const topicSlug =
+      cluster.topicKey
+        .toLowerCase()
+        .replace(/[^a-z0-9\u4e00-\u9fff_-]+/g, "-")
+        .replace(/^-+|-+$/g, "") ||
+      crypto.createHash("sha256").update(cluster.topicKey).digest("hex").slice(0, 8);
+    const synId = `syn:${cluster.plane}:${topicSlug}`;
+
+    const existingSyn = params.atlas.getNode(synId);
+    const existingSynthTargets = new Set(
+      params.atlas
+        .activeEdges(cluster.plane)
+        .filter((e) => e.from === synId && e.relation === "synthesized_from")
+        .map((e) => e.to),
+    );
+    if (
+      existingSyn &&
+      !existingSyn.supersededAt &&
+      !existingSyn.archivedAt &&
+      eligibleMembers.every((m) => existingSynthTargets.has(m.id))
+    ) {
+      continue;
+    }
+
+    const firstAcl = eligibleMembers[0]!.principalAcl;
+    const intersectedAcl = firstAcl.filter((p) =>
+      eligibleMembers.every((m) => m.principalAcl.includes(p)),
+    );
+    const principalAcl: PrincipalId[] =
+      intersectedAcl.length > 0 ? Array.from(new Set(intersectedAcl)) : ["owner:M"];
+
+    const distinctSummaries = Array.from(
+      new Set(eligibleMembers.map((m) => m.summary.trim()).filter(Boolean)),
+    );
+    const summary = `【${cluster.topicKey} 归纳结晶（综合 ${eligibleMembers.length} 条互恰记忆）】${distinctSummaries.slice(0, 6).join("；")}`;
+    if (looksSecret(`${cluster.topicKey}\n${summary}`)) continue;
+
+    const reinfDelta = existingSyn
+      ? Math.max(0, eligibleMembers.length - existingSyn.reinforcements)
+      : eligibleMembers.length;
+    const nodeInput: AtlasNodeInput = {
+      id: synId,
+      plane: cluster.plane,
+      stratum: "crystallized_wisdom",
+      kind: "canon",
+      name: `${cluster.topicKey} 归纳结晶`,
+      summary,
+      tags: ["sleep_consolidated", `topic:${cluster.topicKey}`],
+      principalAcl,
+      confidence: 0.92,
+      sourceTrust: "deterministic_gate",
+      reinforcements: reinfDelta,
+    };
+
+    const missingMembers = eligibleMembers.filter((m) => !existingSynthTargets.has(m.id));
+    const edgeInputs: AtlasEdgeInput[] = missingMembers.map((m) => ({
+      plane: cluster.plane,
+      from: synId,
+      relation: "synthesized_from",
+      to: m.id,
+      weight: 1,
+      source: "gardener_sleep_consolidation",
+      principalAcl: ["owner:M"],
+    }));
+
+    params.atlas.applyDelta({ nodes: [nodeInput], edges: edgeInputs }, nowIso);
+    synthesizedEdgesCount += edgeInputs.length;
+    const written = params.atlas.getNode(synId);
+    if (written) {
+      crystallizedNodes.push(written);
+    }
+  }
+
+  // Step C.2: Archive orphan / low-weight / >90d raw_episodic noise edges
+  const archivedNoiseEdgeIds: string[] = [];
+  for (const edge of params.atlas.activeEdges()) {
+    const fromNode = params.atlas.getNode(edge.from);
+    const toNode = params.atlas.getNode(edge.to);
+    const isOrphanEndpoint = Boolean(
+      !fromNode ||
+        fromNode.archivedAt ||
+        fromNode.supersededAt ||
+        !toNode ||
+        toNode.archivedAt ||
+        toNode.supersededAt,
+    );
+    const isLowWeight = edge.weight < 0.2;
+    const validMs = Date.parse(edge.validFrom);
+    const isStaleRawEpisodic = Boolean(
+      toNode?.stratum === "raw_episodic" &&
+        Number.isFinite(nowMs) &&
+        Number.isFinite(validMs) &&
+        (nowMs - validMs) / MS_PER_DAY > 90,
+    );
+
+    if (isOrphanEndpoint || isLowWeight || isStaleRawEpisodic) {
+      if (removeAtlasNoiseOrOrphanEdge(params.atlas, edge.id, nowIso, nowMs)) {
+        archivedNoiseEdgeIds.push(edge.id);
+      }
+    }
+  }
+
+  return {
+    triggered: true,
+    triggerReason,
+    crystallizedNodes,
+    synthesizedEdgesCount,
+    disambiguationCards,
+    expiredSandboxIds: Array.from(expiredSet),
+    archivedNoiseEdgeIds,
+  };
+}
+
+
 export function applyGardenerEffects(
   output: GardenerCycleOutput,
   targets: {
     knowledgeGraph: SugentKnowledgeGraph;
     ledger: StewardshipLedger;
+    atlas?: StereoscopicAtlas;
+    mindLoop?: EpistemicDigestionLoop;
+    weeklyCalibrationDue?: boolean;
     onDemoteRule?: (ruleId: string) => void;
     nowIso?: string;
   },
-): { prunedEdges: number; updatedRelationships: number; writtenTombstones: number; demotedRules: number } {
+): {
+  prunedEdges: number;
+  updatedRelationships: number;
+  writtenTombstones: number;
+  demotedRules: number;
+  sleepConsolidation?: SleepConsolidationOutput;
+} {
   const nowIso = targets.nowIso ?? new Date().toISOString();
+  const nowMs = Date.parse(nowIso);
   let prunedEdges = 0;
   for (const edgeId of output.pruneEdgeIds ?? []) {
-    if (targets.knowledgeGraph.removeEdge(edgeId, nowIso)) {
+    const removedKg = targets.knowledgeGraph.removeEdge(edgeId, nowIso);
+    const removedAtlas = targets.atlas
+      ? removeAtlasNoiseOrOrphanEdge(targets.atlas, edgeId, nowIso, nowMs)
+      : false;
+    if (removedKg || removedAtlas) {
       prunedEdges += 1;
     }
   }
@@ -568,5 +1273,21 @@ export function applyGardenerEffects(
     }
   }
 
-  return { prunedEdges, updatedRelationships, writtenTombstones, demotedRules };
+  const sleepConsolidation = targets.atlas
+    ? runAtlasSleepConsolidation({
+        atlas: targets.atlas,
+        mindLoop: targets.mindLoop,
+        nowIso,
+        surpriseMomentum: output.driftReport.surpriseMomentum,
+        weeklyCalibrationDue: targets.weeklyCalibrationDue,
+      })
+    : undefined;
+
+  return {
+    prunedEdges,
+    updatedRelationships,
+    writtenTombstones,
+    demotedRules,
+    ...(sleepConsolidation ? { sleepConsolidation } : {}),
+  };
 }

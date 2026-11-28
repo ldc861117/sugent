@@ -149,11 +149,24 @@ export type DropzoneOutcome =
   | { intent: "delegate"; mode: "automated_trigger"; trigger: PersonalTrigger; selectedModel: string }
   | { intent: "delegate"; mode: "human_prep_bundle"; bundle: HumanPrepBundle; followupCommitmentId: string; selectedModel: string };
 
+export interface DropzoneAtlasRecalledNode {
+  id: string;
+  kind: string;
+  name: string;
+  summary: string;
+  plane?: string;
+  stratum?: string;
+  tags?: string[];
+}
+
 export interface UniversalDropzoneOptions {
   ledger: DropzoneLedgerPort;
   knowledgeGraph?: SugentKnowledgeGraph;
-  atlasRecall?: (query: string) => {
-    nodes: Array<{ id: string; kind: string; name: string; summary: string; plane?: string; stratum?: string }>;
+  atlasRecall?: (
+    query: string,
+    opts?: { planes?: string[]; maxNodes?: number },
+  ) => {
+    nodes: Array<DropzoneAtlasRecalledNode>;
   };
   gatewayConfig?: SugentGatewayConfig;
   ownerId?: string;
@@ -298,11 +311,140 @@ function collectAdviseWarnings(
   return warnings;
 }
 
+function matchesAllowedPlanePrefixes(
+  plane: string | undefined,
+  allowedPrefixes: readonly string[],
+  allowUnplanedFallback: boolean,
+): boolean {
+  if (!plane) return allowUnplanedFallback;
+  if (plane.startsWith("relational:duo:")) {
+    return allowedPrefixes.some((pf) => pf === "relational:duo" || plane === pf || plane.startsWith(`${pf}:`));
+  }
+  return allowedPrefixes.some((pf) => plane === pf || plane.startsWith(`${pf}:`));
+}
+
+function extractPeerTaboosFromNode(node: Pick<DropzoneAtlasRecalledNode, "summary" | "tags">): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const add = (val: string) => {
+    const clean = val.trim();
+    if (clean.length < 2 || seen.has(clean)) return;
+    seen.add(clean);
+    out.push(clean);
+  };
+
+  const summary = String(node.summary ?? "");
+  const explicitBlock = /(?:忌讳|禁忌|taboos?)\s*[:：]\s*([^；;\n]+?)(?=\s*[；;]?\s*(?:偏好|喜好|人情|preferences?)\s*[:：]|$)/i.exec(
+    summary,
+  );
+  if (explicitBlock?.[1]) {
+    for (const item of explicitBlock[1].split(/[/、，,；;]+/)) {
+      add(item);
+    }
+  }
+  const tabooClauses =
+    summary.match(
+      /(?:切忌提及|切忌|切勿|严禁|忌讳|禁忌|忌提|忌谈|忌口|忌|勿提|不要承诺|不要提|不要|别提|别|禁止提及|禁止|不谈|不提|讨厌|反感)[^；;，,。/\n（）()]{1,28}/g,
+    ) ?? [];
+  for (const clause of tabooClauses) {
+    add(clause);
+  }
+  if (out.length === 0 && node.tags?.some((t) => /^(?:taboo|忌讳|禁忌)$/i.test(t.trim()))) {
+    for (const seg of summary.split(/[；;。\n]+/)) {
+      add(seg);
+    }
+  }
+  return out;
+}
+
+function collectAtlasAdviseInsights(
+  nodes: readonly DropzoneAtlasRecalledNode[],
+  callerDomain: DropzoneCallerDomain,
+  existingWarnings: readonly string[],
+): { atlasWarnings: string[]; atlasReferences: string[] } {
+  const atlasWarnings: string[] = [];
+  const atlasReferences: string[] = [];
+  const seenWarn = new Set<string>(existingWarnings);
+  const seenRef = new Set<string>();
+
+  const pushWarn = (line: string, summaryCore?: string) => {
+    const trimmed = line.trim();
+    if (!trimmed || seenWarn.has(trimmed)) return;
+    if (summaryCore && summaryCore.length >= 6 && existingWarnings.some((w) => w.includes(summaryCore))) return;
+    seenWarn.add(trimmed);
+    atlasWarnings.push(trimmed);
+  };
+  const pushRef = (line: string) => {
+    const trimmed = line.trim();
+    if (!trimmed || seenRef.has(trimmed)) return;
+    seenRef.add(trimmed);
+    atlasReferences.push(trimmed);
+  };
+
+  for (const n of nodes) {
+    const plane = n.plane ?? "";
+    const isSelfCore = plane === "self_core" || (!plane && n.id.startsWith("self:"));
+    const isDomainWork =
+      plane === "domain_work" || plane.startsWith("domain_work:") || (!plane && n.id.startsWith("contract:review:"));
+    const isPeerRel =
+      plane === "relational:peer" ||
+      plane.startsWith("relational:peer:") ||
+      (!plane && (n.id.startsWith("peer:") || n.id.startsWith("rel:")));
+
+    if (isSelfCore) {
+      if (callerDomain !== "owner_private") continue;
+      const isTombstone =
+        n.kind === "tombstone" ||
+        n.id.startsWith("self:tombstone:") ||
+        Boolean(n.tags?.includes("epistemic_tombstone")) ||
+        /(?:已被证伪|避坑教训)/.test(n.summary);
+      if (isTombstone) {
+        pushWarn(`[图谱墓碑预警] ${n.name}：${n.summary}`, n.summary);
+      }
+      pushRef(`[self_core] ${n.name}：${n.summary}`);
+      continue;
+    }
+
+    if (isDomainWork) {
+      const isRiskReview =
+        n.kind === "tombstone" ||
+        n.kind === "guardrail" ||
+        n.id.startsWith("contract:review:") ||
+        /(?:block|拦截|超限|底价|红线|违约)/i.test(`${n.name} ${n.summary}`);
+      if (isRiskReview) {
+        pushWarn(`[历史审校预警] ${n.name}：${n.summary}`, n.summary);
+      }
+      pushRef(`[${plane || "domain_work"}] ${n.name}：${n.summary}`);
+      continue;
+    }
+
+    if (isPeerRel) {
+      if (callerDomain !== "owner_private") continue;
+      const peerTaboos = extractPeerTaboosFromNode(n);
+      if (peerTaboos.length > 0) {
+        const alreadyHasRel = existingWarnings.some((w) => w.startsWith(`[人脉禁忌提醒:${n.name}]`));
+        if (!alreadyHasRel) {
+          pushWarn(`[人脉禁忌提醒:${n.name}] ${peerTaboos.join("；")}`);
+        }
+      }
+      pushRef(`[relational:peer] ${n.name}：${n.summary}`);
+      continue;
+    }
+
+    if (callerDomain === "owner_private" && (n.kind === "tombstone" || n.kind === "guardrail")) {
+      pushWarn(`[图谱墓碑预警] ${n.name}：${n.summary}`, n.summary);
+    }
+  }
+
+  return { atlasWarnings, atlasReferences };
+}
+
 function buildDeterministicTradeOff(
   inputText: string,
   goals: Array<{ title: string; northStarCriterion: string; status: string }>,
   warnings: string[],
   softTastes: Array<{ statement: string }>,
+  atlasReferences: readonly string[] = [],
 ): string {
   const activeGoals = goals.filter((g) => g.status === "active");
   const goalLine = activeGoals.length
@@ -312,10 +454,11 @@ function buildDeterministicTradeOff(
     ? `风险与禁忌核对：${warnings.join(" | ")}。`
     : "风险与禁忌核对：未撞上已知硬红线或证伪墓碑。";
   const tasteLine = softTastes.length ? `偏好约束：${softTastes.map((t) => t.statement).join("；")}。` : "";
+  const atlasLine = atlasReferences.length ? `历史图谱参考：${atlasReferences.slice(0, 4).join(" | ")}。` : "";
   const actionLine = warnings.length
     ? `建议对策（针对「${summarizeTitle(inputText, 24)}」）：方案A守住上述红线明确拒绝或设前置条件；方案B给出等价替代范围（如分期或缩减交付），切勿口头退让。`
     : `建议对策（针对「${summarizeTitle(inputText, 24)}」）：方案A先用最小可控动作验证收益再投入；方案B若偏离当前主航道则排入延后清单。`;
-  return [goalLine, warnLine, tasteLine, actionLine].filter(Boolean).join("\n");
+  return [goalLine, warnLine, tasteLine, atlasLine, actionLine].filter(Boolean).join("\n");
 }
 const ANTIGRAVITY_RE =
   /(?:antigravity|ag\s*任务|派给\s*antigravity|特种兵团|swarm|深度调研|多文件重构|架构重构|重装研发)/i;
@@ -331,8 +474,8 @@ function sanitizeDraftAgainstTaboos(text: string, taboos: readonly string[]): st
   for (const raw of taboos) {
     const core = raw
       .trim()
-      .replace(/^(?:忌|勿|别|不要|不可|禁止|不谈|不提|不能|讨厌|反感|不接受)+/, "")
-      .replace(/^(?:提|谈|讲|问|说)+/, "")
+      .replace(/^(?:切忌|切勿|严禁|忌讳|禁忌|忌|勿|别|不要|不可|禁止|不谈|不提|不能|讨厌|反感|不接受)+/, "")
+      .replace(/^(?:提及|谈及|说起|承诺|提|谈|讲|问|说)+/, "")
       .trim();
     if (core.length >= 2 && out.includes(core)) {
       out = out.split(core).join("相关细节");
@@ -605,9 +748,45 @@ export class UniversalDropzone {
     const selectedModel = selectModelForRole(this.gatewayConfig, "steward");
     const ctx = this.ledger.queryContext(input.text, callerDomain);
     const snapshot = this.ledger.snapshotForCaller(callerDomain);
-    const guardrailWarnings = collectAdviseWarnings(input.text, ctx, snapshot);
+    const ledgerWarnings = collectAdviseWarnings(input.text, ctx, snapshot);
+
+    let recalledNodes: DropzoneAtlasRecalledNode[] = [];
+    if (callerDomain === "owner_private" || callerDomain === "work_project") {
+      const allowedPlanes =
+        callerDomain === "owner_private"
+          ? ["domain_work", "self_core", "relational:peer", "owner_life"]
+          : ["domain_work"];
+      if (this.atlasRecall) {
+        const raw = this.atlasRecall(input.text, { planes: allowedPlanes, maxNodes: 12 });
+        recalledNodes = (raw?.nodes ?? []).filter((n) =>
+          matchesAllowedPlanePrefixes(n.plane, allowedPlanes, callerDomain === "owner_private"),
+        );
+      } else if (callerDomain === "owner_private" && this.knowledgeGraph) {
+        const kgSub = this.knowledgeGraph.recallSubgraph(input.text, 2);
+        recalledNodes = kgSub.matchedNodes.map((n) => ({
+          id: n.id,
+          kind: n.kind,
+          name: n.name,
+          summary: n.summary,
+          tags: n.tags,
+        }));
+      }
+    }
+
+    const { atlasWarnings, atlasReferences } = collectAtlasAdviseInsights(
+      recalledNodes,
+      callerDomain,
+      ledgerWarnings,
+    );
+    const guardrailWarnings = [...ledgerWarnings, ...atlasWarnings];
     const softTastes = snapshot.guardrails.filter((g) => g.kind === "soft_taste");
-    const deterministic = buildDeterministicTradeOff(input.text, snapshot.goals, guardrailWarnings, softTastes);
+    const deterministic = buildDeterministicTradeOff(
+      input.text,
+      snapshot.goals,
+      guardrailWarnings,
+      softTastes,
+      atlasReferences,
+    );
 
     let tradeOffBrief = deterministic;
     if (this.adviseGenerator) {
@@ -616,6 +795,7 @@ export class UniversalDropzone {
     }
     return { intent: "advise", tradeOffBrief, guardrailWarnings, selectedModel };
   }
+
   private handleDelegate(
     input: DropzoneInput,
     partition: DropzonePartition,
@@ -627,6 +807,14 @@ export class UniversalDropzone {
     const localMaterials = this.collectLocalMaterials(input.text, template.archiveProbes, callerDomain);
     const contactMap = new Map<string, (typeof snapshot.relationships)[number]>();
     for (const r of [...snapshot.relationships, ...ctx.relationships]) contactMap.set(r.id, r);
+
+    const delegatePlanes = ["relational:peer", "domain_work", "self_core"];
+    const delegateAtlasNodes =
+      callerDomain === "owner_private" && this.atlasRecall
+        ? (this.atlasRecall(input.text, { planes: delegatePlanes, maxNodes: 8 })?.nodes ?? []).filter((n) =>
+            matchesAllowedPlanePrefixes(n.plane, delegatePlanes, true),
+          )
+        : [];
 
     const clar = evaluateClarificationAndFocus({
       text: input.text,
@@ -663,6 +851,7 @@ export class UniversalDropzone {
       const role = isComputerUse ? "computer_use" : "executor";
       const selectedModel = selectModelForRole(this.gatewayConfig, role);
       const sourceKind = (isAntigravity ? "antigravity" : "im_channel") as PersonalTrigger["sourceKind"];
+      const { atlasWarnings } = collectAtlasAdviseInsights(delegateAtlasNodes, callerDomain, []);
       const trigger: PersonalTrigger = {
         id: `drop-${input.inputId}`,
         sourceKind,
@@ -680,12 +869,13 @@ export class UniversalDropzone {
           recommendedRole: role,
           selectedModel,
           ...(input.filePaths?.length ? { filePaths: [...input.filePaths] } : {}),
+          ...(atlasWarnings.length ? { atlasWarnings } : {}),
         },
       };
       return { intent: "delegate", mode: "automated_trigger", trigger, selectedModel };
     }
 
-    return this.buildHumanPrepBundle(input, partition, callerDomain);
+    return this.buildHumanPrepBundle(input, partition, callerDomain, delegateAtlasNodes);
   }
 
   private collectLocalMaterials(
@@ -710,10 +900,12 @@ export class UniversalDropzone {
     }
     return materials;
   }
+
   private buildHumanPrepBundle(
     input: DropzoneInput,
     partition: DropzonePartition,
     callerDomain: DropzoneCallerDomain,
+    delegateAtlasNodes: readonly DropzoneAtlasRecalledNode[] = [],
   ): DropzoneOutcome {
     const selectedModel = selectModelForRole(this.gatewayConfig, "executor");
     const template = selectPrepTemplate(input.text);
@@ -724,11 +916,54 @@ export class UniversalDropzone {
       snapshot.relationships.find((r) => input.text.includes(r.name)) ??
       ctx.relationships[0] ??
       snapshot.relationships.find((r) => hasKeywordOverlap(input.text, r.name));
-    const taboos = matchedContact?.taboos ?? [];
-    const contactLabel = matchedContact?.name ?? "";
+
+    const peerNodes = delegateAtlasNodes.filter(
+      (n) =>
+        n.plane === "relational:peer" ||
+        Boolean(n.plane?.startsWith("relational:peer:")) ||
+        n.id.startsWith("peer:") ||
+        n.id.startsWith("rel:"),
+    );
+    const matchedPeerNode =
+      peerNodes.find((n) => input.text.includes(n.name)) ??
+      (matchedContact ? peerNodes.find((n) => n.name === matchedContact.name) : peerNodes[0]);
+
+    const atlasPeerTaboos: string[] = [];
+    for (const pn of peerNodes) {
+      if (
+        matchedContact
+          ? pn.name === matchedContact.name || input.text.includes(pn.name)
+          : !matchedPeerNode || pn.id === matchedPeerNode.id || input.text.includes(pn.name)
+      ) {
+        atlasPeerTaboos.push(...extractPeerTaboosFromNode(pn));
+      }
+    }
+
+    const taboos = Array.from(new Set([...(matchedContact?.taboos ?? []), ...atlasPeerTaboos]));
+    const contactLabel = matchedContact?.name ?? matchedPeerNode?.name ?? "";
     const taskTitle = summarizeTitle(input.text, 36);
     const safeTopic = sanitizeDraftAgainstTaboos(taskTitle, taboos);
     const draftText = sanitizeDraftAgainstTaboos(template.buildDraft(contactLabel, safeTopic), taboos);
+
+    const tombstoneNotes: string[] = [];
+    for (const n of delegateAtlasNodes) {
+      const plane = n.plane ?? "";
+      const isWorkOrSelf =
+        plane === "self_core" || plane === "domain_work" || plane.startsWith("domain_work:");
+      if (!isWorkOrSelf) continue;
+      const isTombstone =
+        n.kind === "tombstone" ||
+        n.id.startsWith("self:tombstone:") ||
+        Boolean(n.tags?.includes("epistemic_tombstone")) ||
+        (n.id.startsWith("contract:review:") && /(?:block|拦截|超限)/i.test(`${n.name} ${n.summary}`));
+      if (isTombstone) {
+        tombstoneNotes.push(`${n.name}（${summarizeTitle(n.summary, 44)}）`);
+      }
+    }
+    const checklist =
+      tombstoneNotes.length > 0
+        ? [...template.checklist.slice(0, 4), `历史避坑核对：${tombstoneNotes.slice(0, 2).join("；")}`]
+        : template.checklist;
 
     const localMaterials = this.collectLocalMaterials(input.text, template.archiveProbes, callerDomain);
     const dueAt = extractIsoDateHint(input.text) ?? addDaysIso(input.receivedAtIso, 3);
@@ -737,7 +972,7 @@ export class UniversalDropzone {
       direction: template.direction,
       status: "open",
       summary: `跟进办理：${taskTitle}`,
-      counterpartyOrRef: matchedContact?.name ?? `dropzone:${input.inputId}`,
+      counterpartyOrRef: contactLabel || `dropzone:${input.inputId}`,
       ...(dueAt ? { dueAt } : {}),
       remindLeadDays: 1,
     };
@@ -746,7 +981,7 @@ export class UniversalDropzone {
     const bundle: HumanPrepBundle = {
       taskTitle,
       missingAutomationReason: template.missingAutomationReason,
-      checklist: template.checklist,
+      checklist,
       localMaterials,
       readyToCopyDrafts: [{ channelHint: template.channelHint, text: draftText }],
       followupCommitment,

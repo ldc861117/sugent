@@ -97,3 +97,15 @@
 3. **本轮源码审计暴露的十大工程断流（Wave P4.1 优先止血）**：
    - `BotRuntime` P0.1 拦截微信/飞书主理人私聊后提前 `return` 导致绕过 `scheduleReview()`；`decideSkillCandidate` 写向孤岛 `<dataDir>/skills` 且 `skillName`/YAML 未转义被 DSH 静默拒载；`MemoryGardener` 返回的修剪/降级/品味更新全部丢弃未落盘；`SugentSIMStore` 运行时 0 调用；`SugentKnowledgeGraph.removeEdge` 不归档节点导致旧事实诈尸且 `query === ""` 绕过 `maxNodes`；`ConciergeChannelBridge` 查找不存在的 `peer:` 标签且全图变金丝雀；`p2-host-service.ts` E2EE 同步丢失 `skillGateStatus` 与 `edge.source` 且漏同步 `ledger.json`。
 
+## 2026-11-28 · Wave P5：原生五平面 E2EE v2 漫游、混合语义 RRF、M5 外事膜、睡眠重整与统计校准二元裁判
+
+1. **消除双图谱搬运税与 E2EE CRDT 粘性墓碑不变量（`P5.1`）**：
+   - `PostTurnDigester` 直写 `StereoscopicAtlas` 原生五平面并区分真实 `sourceTrust`（`owner_confirmed` vs `llm_inferred`），同时在同平面挂接 `principalAcl: ["owner:M"]` 的 `derived_from_episode` 原话锚点（规避跨平面 `ATLAS_RAW_MEMBRANE_FORBIDDEN`）。
+   - `SyncableAtlasSnapshotV2` 与 `createAtlasMindSyncPort` 将五平面属性、半透膜桥边与 `mind-journal.json` 纳入逐项单调 Lamport 时钟同步；合并规则强制 `supersededAt` / `archivedAt` 与 `falsified > superseded > crystallized` 终态单向粘性，杜绝旧设备离线缓存回推导致旧事实诈尸复活。
+2. **零原生扩展混合 RRF 检索与外事接待半透膜 `M5` 边界（`P5.2` / `P5.3`）**：
+   - 保持 `node:sqlite` 纯内置零 C++ 扩展约束，将 `Float32Array` 向量以对齐安全的 `BLOB` 存入同一 `atlas.db`，通过 `RRF(k=60)` 融合 BM25/中英同义词/Trigram 与可选 BYOK 向量排序，叠加认知阶半衰期（`S0` 14天 vs `S3`/墓碑近零衰减）。
+   - `concierge_envoy` 外事半透膜 `M5` 严格分离「当前对端自身无害沟通习惯透传」与「跨对端/`owner_life`/内部底价/非外事表面教训零泄露」：对端自身偏好细则须先过 `containsMembraneCanary` + 内部底价词过滤方可注入评估上下文，而外发拟稿与 `sendPeerDirectMessage` 强制执行 `assertZeroCanaryLeak` 拦截。
+3. **园丁「睡眠重整」互斥拦截、双人自动候选主权与统计校准二元 Judge（`P5.4`–`P5.6`）**：
+   - `runAtlasSleepConsolidation` 严守“同平面 `>= 3` 条且零冲突才自动合成 `crystallized_wisdom`”纪律：一旦 `detectPairwiseMemoryConflict` 检出数值（如 `30天 vs 60天`）或极性冲突，立即熔断自动合成并生成单问双选项消歧卡；清理低权重边时禁止连带归档仍有其它健康语义支撑的高阶节点。
+   - `duo/converse` 防抖自动提炼出的星晶硬性锁定 `status: "candidate"`（且对话自动累加 `reinforcements` 封顶 `< 3`），保留伴侣双方共阅点亮主权；`proactive-cadence.ts` 在纯函数内核（零 `fs`/网络/`Date.now`）内解析 ISO 时区偏移匹配 `M3` 共处护窗并顺延非紧急通知。
+   - 主观生成质量评测摒弃未经验证的 1–5 打分，采用 `train(4)/dev(6)/test(12)` 严格零重叠切分的独立二元（`PASS/FAIL`）裁判，并在 Held-out `test` 集上强制 `TPR >= 0.85`、`TNR >= 0.85` 及输出 Rogan-Gladen 偏差校正通过率与 Delta-Method 95% 置信区间。

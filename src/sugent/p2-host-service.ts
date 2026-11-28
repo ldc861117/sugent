@@ -12,12 +12,28 @@ import {
   type WorkloadPresetId,
 } from "./byok-diagnostics.js";
 import { buildByokSyncViewModel, type ByokSyncViewModel } from "./byok-sync-viewmodel.js";
-import type { SyncableKGEdge, SyncableKGNode, SyncableKnowledgeGraphSnapshot } from "./e2ee-sync.js";
+import type {
+  SyncableAtlasEdge,
+  SyncableAtlasNode,
+  SyncableAtlasSnapshotV2,
+  SyncableKGEdge,
+  SyncableKGNode,
+  SyncableKnowledgeGraphSnapshot,
+  SyncableMindJournalEntry,
+} from "./e2ee-sync.js";
 import type { EntityKind, KGEdge, KGNode, SkillGateStatus, SugentKnowledgeGraph } from "./knowledge-graph.js";
 import type { LocalBudgetLedger } from "./local-budget.js";
 import type { SugentModelCatalog } from "./model-catalog.js";
 import { createP2GatewayHandlers } from "./p2-gateway-routes.js";
 import type { ProviderRegistry } from "./provider-registry.js";
+import type { EpistemicJudgmentEntry } from "./silicon-identity-core.js";
+import type {
+  AtlasEdge,
+  AtlasEdgeInput,
+  AtlasNode,
+  AtlasNodeInput,
+  StereoscopicAtlas,
+} from "./stereoscopic-atlas.js";
 import type { LedgerSnapshot } from "./stewardship-ledger.js";
 
 type ProviderEntry = ReturnType<ProviderRegistry["listProviders"]>[number];
@@ -25,6 +41,13 @@ type ProviderEntry = ReturnType<ProviderRegistry["listProviders"]>[number];
 export interface StewardshipLedgerSyncPort {
   exportLedger: () => LedgerSnapshot;
   importLedger: (snap: LedgerSnapshot) => void;
+}
+
+export interface AtlasMindSyncPort {
+  exportAtlas: () => { nodes: AtlasNode[]; edges: AtlasEdge[] };
+  importAtlas: (snapshot: { nodes: AtlasNode[]; edges: AtlasEdge[] }) => void;
+  exportMindJournal?: () => EpistemicJudgmentEntry[];
+  importMindJournal?: (entries: EpistemicJudgmentEntry[]) => void;
 }
 
 export interface SyncMetaRecord {
@@ -43,6 +66,237 @@ export interface SugentP2HostServiceOptions {
   getDefaultModel: () => string;
   getFetch: () => FetchLike;
   ledgerPort?: StewardshipLedgerSyncPort;
+  atlasPort?: AtlasMindSyncPort;
+}
+
+function buildCalibratedLessonsFromEntries(entries: readonly EpistemicJudgmentEntry[], limit = 6): string[] {
+  const out: string[] = [];
+  for (let i = entries.length - 1; i >= 0 && out.length < limit; i--) {
+    const e = entries[i]!;
+    if (e.status === "falsified") {
+      const lastNote = e.evidenceNotes[e.evidenceNotes.length - 1];
+      out.push(
+        `[避坑/${e.topicKey}] 「${e.hypothesis}」已被证伪${lastNote ? `（${lastNote}）` : ""}`,
+      );
+    } else if (e.status === "crystallized") {
+      out.push(`[结晶/${e.topicKey}] ${e.hypothesis}`);
+    }
+  }
+  return out;
+}
+
+export function createAtlasMindSyncPort(params: {
+  atlas: StereoscopicAtlas;
+  mindJournalPath?: string;
+  onMindJournalImported?: () => void;
+}): AtlasMindSyncPort {
+  const { atlas, mindJournalPath, onMindJournalImported } = params;
+
+  const exportAtlas = (): { nodes: AtlasNode[]; edges: AtlasEdge[] } => {
+    const snap = atlas.snapshot();
+    return {
+      nodes: snap.nodes.map((n) => ({
+        ...n,
+        tags: [...n.tags],
+        principalAcl: [...n.principalAcl],
+        ...(n.steps ? { steps: [...n.steps] } : {}),
+      })),
+      edges: snap.edges.map((e) => ({
+        ...e,
+        ...(e.principalAcl ? { principalAcl: [...e.principalAcl] } : {}),
+      })),
+    };
+  };
+
+  const importAtlas = (snapshot: { nodes: AtlasNode[]; edges: AtlasEdge[] }): void => {
+    const maybeLossless = atlas as unknown as {
+      importLosslessSnapshot?: (snap: { nodes: AtlasNode[]; edges: AtlasEdge[] }) => void;
+    };
+    if (typeof maybeLossless.importLosslessSnapshot === "function") {
+      maybeLossless.importLosslessSnapshot(snapshot);
+      return;
+    }
+
+    const fallbackNow = new Date().toISOString();
+    const nodesByUpdatedAt = new Map<string, AtlasNode[]>();
+    for (const n of snapshot.nodes) {
+      const ts = n.updatedAt || fallbackNow;
+      const bucket = nodesByUpdatedAt.get(ts) ?? [];
+      bucket.push(n);
+      nodesByUpdatedAt.set(ts, bucket);
+    }
+
+    for (const [ts, batch] of nodesByUpdatedAt.entries()) {
+      const inputs: AtlasNodeInput[] = batch.map((n) => {
+        const existing = atlas.getNode(n.id);
+        const reinfDelta = Math.max(0, n.reinforcements - (existing?.reinforcements ?? 0));
+        return {
+          id: n.id,
+          plane: n.plane,
+          stratum: n.stratum,
+          kind: n.kind,
+          name: n.name,
+          summary: n.summary,
+          tags: [...n.tags],
+          principalAcl: [...n.principalAcl],
+          reinforcements: reinfDelta,
+          confidence: n.confidence,
+          sourceTrust: n.sourceTrust,
+          ...(n.steps?.length ? { steps: [...n.steps] } : {}),
+          ...(n.skillGateStatus ? { skillGateStatus: n.skillGateStatus } : {}),
+          ...(n.archivedAt ? { archivedAt: n.archivedAt } : {}),
+        };
+      });
+      atlas.applyDelta({ nodes: inputs }, ts);
+    }
+
+    const activeEdges = snapshot.edges.filter((e) => !e.supersededAt);
+    const supersededEdges = snapshot.edges.filter((e) => Boolean(e.supersededAt));
+
+    const toEdgeInput = (e: AtlasEdge): AtlasEdgeInput => ({
+      plane: e.plane,
+      from: e.from,
+      relation: e.relation,
+      to: e.to,
+      weight: e.weight,
+      source: e.source,
+      ...(e.isMembraneEdge ? { isMembraneEdge: true } : {}),
+      ...(e.membranePolicy ? { membranePolicy: e.membranePolicy } : {}),
+      ...(e.principalAcl?.length ? { principalAcl: [...e.principalAcl] } : {}),
+    });
+
+    for (const e of activeEdges) {
+      if (!atlas.getEdge(e.id) && e.validFrom && e.validFrom !== e.updatedAt) {
+        atlas.applyDelta({ edges: [toEdgeInput(e)] }, e.validFrom);
+      }
+    }
+
+    const edgesByUpdatedAt = new Map<string, AtlasEdgeInput[]>();
+    for (const e of activeEdges) {
+      const ts = e.updatedAt || e.validFrom || fallbackNow;
+      const bucket = edgesByUpdatedAt.get(ts) ?? [];
+      bucket.push(toEdgeInput(e));
+      edgesByUpdatedAt.set(ts, bucket);
+    }
+    for (const [ts, edgeBatch] of edgesByUpdatedAt.entries()) {
+      atlas.applyDelta({ edges: edgeBatch }, ts);
+    }
+
+    const nodeSnapById = new Map(snapshot.nodes.map((n) => [n.id, n]));
+    for (const se of supersededEdges) {
+      if (!atlas.getEdge(se.id)) {
+        try {
+          atlas.applyDelta({ edges: [toEdgeInput(se)] }, se.validFrom || se.supersededAt!);
+        } catch {
+          continue;
+        }
+      }
+      if (atlas.getEdge(se.id) && !atlas.getEdge(se.id)!.supersededAt) {
+        atlas.removeEdge(se.id, se.supersededAt!);
+        const targetSnap = nodeSnapById.get(se.to);
+        if (targetSnap && !targetSnap.supersededAt && atlas.getNode(se.to)?.supersededAt) {
+          atlas.applyDelta(
+            {
+              nodes: [
+                {
+                  id: targetSnap.id,
+                  plane: targetSnap.plane,
+                  stratum: targetSnap.stratum,
+                  kind: targetSnap.kind,
+                  name: targetSnap.name,
+                  summary: targetSnap.summary,
+                  tags: [...targetSnap.tags],
+                  principalAcl: [...targetSnap.principalAcl],
+                  reinforcements: 0,
+                  confidence: targetSnap.confidence,
+                  sourceTrust: targetSnap.sourceTrust,
+                  ...(targetSnap.steps?.length ? { steps: [...targetSnap.steps] } : {}),
+                  ...(targetSnap.skillGateStatus ? { skillGateStatus: targetSnap.skillGateStatus } : {}),
+                  ...(targetSnap.archivedAt ? { archivedAt: targetSnap.archivedAt } : {}),
+                },
+              ],
+            },
+            targetSnap.updatedAt || fallbackNow,
+          );
+        }
+      }
+    }
+
+    for (const n of snapshot.nodes) {
+      if (n.supersededAt) {
+        atlas.supersedeNode(n.id, n.supersededBy ?? undefined, n.supersededAt);
+      } else if (n.archivedAt && !atlas.getNode(n.id)?.archivedAt) {
+        atlas.archiveNode(n.id, n.archivedAt);
+      }
+    }
+  };
+
+  if (!mindJournalPath) {
+    return { exportAtlas, importAtlas };
+  }
+
+  const exportMindJournal = (): EpistemicJudgmentEntry[] => {
+    if (!fs.existsSync(mindJournalPath)) return [];
+    try {
+      const parsed = JSON.parse(fs.readFileSync(mindJournalPath, "utf8")) as {
+        entries?: EpistemicJudgmentEntry[];
+      };
+      if (!Array.isArray(parsed.entries)) return [];
+      return parsed.entries
+        .filter(
+          (e) => e && typeof e.id === "string" && typeof e.topicKey === "string" && typeof e.hypothesis === "string",
+        )
+        .map((e) => ({ ...e, evidenceNotes: Array.isArray(e.evidenceNotes) ? [...e.evidenceNotes] : [] }));
+    } catch {
+      return [];
+    }
+  };
+
+  const importMindJournal = (entries: EpistemicJudgmentEntry[]): void => {
+    const dir = path.dirname(mindJournalPath);
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const counts = { sandbox: 0, crystallized: 0, falsified: 0, superseded: 0 };
+    const cleanEntries = entries.map((e) => {
+      counts[e.status] = (counts[e.status] ?? 0) + 1;
+      return {
+        id: e.id,
+        topicKey: e.topicKey,
+        surface: e.surface,
+        hypothesis: e.hypothesis,
+        rationale: e.rationale,
+        status: e.status,
+        stratum: e.stratum,
+        confidence: e.confidence,
+        confirmations: e.confirmations,
+        contradictions: e.contradictions,
+        evidenceNotes: Array.isArray(e.evidenceNotes) ? [...e.evidenceNotes] : [],
+        createdAt: e.createdAt,
+        updatedAt: e.updatedAt,
+        ...(e.supersededBy ? { supersededBy: e.supersededBy } : {}),
+      };
+    });
+    const updatedAt =
+      cleanEntries[cleanEntries.length - 1]?.updatedAt ?? new Date().toISOString();
+    const payload = {
+      charterVersion: "1.0" as const,
+      updatedAt,
+      counts,
+      entries: cleanEntries,
+      calibratedLessons: buildCalibratedLessonsFromEntries(cleanEntries, 6),
+    };
+    const tmp = `${mindJournalPath}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`;
+    fs.writeFileSync(tmp, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
+    fs.chmodSync(tmp, 0o600);
+    fs.renameSync(tmp, mindJournalPath);
+    onMindJournalImported?.();
+  };
+
+  return {
+    exportAtlas,
+    importAtlas,
+    exportMindJournal,
+    importMindJournal,
+  };
 }
 
 const VALID_PROVIDER_IDS = new Set<SugentProviderId>([
@@ -119,14 +373,20 @@ export class SugentP2HostService {
   private lastDiagnostics: ByokDiagnosticsReport | null = null;
   private lastSimulation: CostSandboxSimulation | null = null;
   private ledgerPort?: StewardshipLedgerSyncPort;
+  private atlasPort?: AtlasMindSyncPort;
 
   constructor(private readonly opts: SugentP2HostServiceOptions) {
     this.metaPath = path.join(opts.dataDir, "sugent-kg", "sync-meta.json");
     this.ledgerPort = opts.ledgerPort;
+    this.atlasPort = opts.atlasPort;
   }
 
   attachStewardshipLedgerPort(port: StewardshipLedgerSyncPort): void {
     this.ledgerPort = port;
+  }
+
+  attachAtlasSyncPort(port: AtlasMindSyncPort): void {
+    this.atlasPort = port;
   }
 
   private readSyncMeta(): SyncMetaRecord {
@@ -177,6 +437,7 @@ export class SugentP2HostService {
       reinforcements: n.reinforcements,
       steps: n.steps ?? null,
       skillGateStatus: n.skillGateStatus ?? null,
+      ...(n.supersededAt ? { supersededAt: n.supersededAt } : {}),
       updatedAt: n.updatedAt,
     });
   }
@@ -196,6 +457,65 @@ export class SugentP2HostService {
     });
   }
 
+  private buildAtlasNodeDigest(n: AtlasNode): string {
+    return digestSyncPayload({
+      id: n.id,
+      plane: n.plane,
+      stratum: n.stratum,
+      kind: n.kind,
+      name: n.name,
+      summary: n.summary,
+      tags: n.tags,
+      principalAcl: n.principalAcl,
+      reinforcements: n.reinforcements,
+      confidence: n.confidence,
+      sourceTrust: n.sourceTrust,
+      steps: n.steps ?? null,
+      skillGateStatus: n.skillGateStatus ?? null,
+      updatedAt: n.updatedAt,
+      supersededAt: n.supersededAt ?? null,
+      supersededBy: n.supersededBy ?? null,
+      archivedAt: n.archivedAt ?? null,
+    });
+  }
+
+  private buildAtlasEdgeDigest(e: AtlasEdge): string {
+    return digestSyncPayload({
+      id: e.id,
+      plane: e.plane,
+      from: e.from,
+      relation: e.relation,
+      to: e.to,
+      weight: e.weight,
+      source: e.source,
+      isMembraneEdge: Boolean(e.isMembraneEdge),
+      membranePolicy: e.membranePolicy ?? null,
+      principalAcl: e.principalAcl ?? null,
+      validFrom: e.validFrom,
+      updatedAt: e.updatedAt,
+      supersededAt: e.supersededAt ?? null,
+    });
+  }
+
+  private buildMindEntryDigest(m: EpistemicJudgmentEntry): string {
+    return digestSyncPayload({
+      id: m.id,
+      topicKey: m.topicKey,
+      surface: m.surface,
+      hypothesis: m.hypothesis,
+      rationale: m.rationale,
+      status: m.status,
+      stratum: m.stratum,
+      confidence: m.confidence,
+      confirmations: m.confirmations,
+      contradictions: m.contradictions,
+      evidenceNotes: m.evidenceNotes,
+      createdAt: m.createdAt,
+      updatedAt: m.updatedAt,
+      supersededBy: m.supersededBy ?? null,
+    });
+  }
+
   private exportGraphSnapshot(): SyncableKnowledgeGraphSnapshot {
     const meta = this.readSyncMeta();
     const prevDigests = meta.itemDigests ?? {};
@@ -204,9 +524,32 @@ export class SugentP2HostService {
 
     const nodeSigs = rawNodes.map((n) => ({ n, key: `node:${n.id}`, sig: this.buildNodeDigest(n) }));
     const edgeSigs = rawEdges.map((e) => ({ e, key: `edge:${e.id}`, sig: this.buildEdgeDigest(e) }));
+
+    const exportedAtlas = this.atlasPort?.exportAtlas();
+    const exportedMind = this.atlasPort?.exportMindJournal?.();
+    const atlasNodeSigs = (exportedAtlas?.nodes ?? []).map((n) => ({
+      n,
+      key: `atlas:node:${n.id}`,
+      sig: this.buildAtlasNodeDigest(n),
+    }));
+    const atlasEdgeSigs = (exportedAtlas?.edges ?? []).map((e) => ({
+      e,
+      key: `atlas:edge:${e.id}`,
+      sig: this.buildAtlasEdgeDigest(e),
+    }));
+    const mindSigs = (exportedMind ?? []).map((m) => ({
+      m,
+      key: `mind:${m.id}`,
+      sig: this.buildMindEntryDigest(m),
+    }));
+
     const dirty =
       nodeSigs.some((x) => prevDigests[x.key]?.sig !== x.sig) ||
-      edgeSigs.some((x) => prevDigests[x.key]?.sig !== x.sig);
+      edgeSigs.some((x) => prevDigests[x.key]?.sig !== x.sig) ||
+      atlasNodeSigs.some((x) => prevDigests[x.key]?.sig !== x.sig) ||
+      atlasEdgeSigs.some((x) => prevDigests[x.key]?.sig !== x.sig) ||
+      mindSigs.some((x) => prevDigests[x.key]?.sig !== x.sig);
+
     const snapshotClock = dirty ? meta.lamportClock + 1 : meta.lamportClock;
     const nextDigests: Record<string, { clock: number; sig: string }> = {};
 
@@ -226,7 +569,7 @@ export class SugentP2HostService {
           ...(n.skillGateStatus ? { skillGateStatus: n.skillGateStatus } : {}),
         },
         validFrom: n.updatedAt,
-        supersededAt: null,
+        supersededAt: n.supersededAt ?? null,
         updatedAt: n.updatedAt,
         lamportClock: clock,
       };
@@ -251,6 +594,87 @@ export class SugentP2HostService {
       };
     });
 
+    let atlasSnapshot: SyncableAtlasSnapshotV2 | undefined;
+    if (this.atlasPort && exportedAtlas) {
+      const syncAtlasNodes: SyncableAtlasNode[] = atlasNodeSigs.map(({ n, key, sig }) => {
+        const prev = prevDigests[key];
+        const clock = prev && prev.sig === sig ? prev.clock : snapshotClock;
+        nextDigests[key] = { clock, sig };
+        return {
+          id: n.id,
+          plane: n.plane,
+          stratum: n.stratum,
+          kind: n.kind,
+          name: n.name,
+          summary: n.summary,
+          tags: [...n.tags],
+          principalAcl: [...n.principalAcl],
+          reinforcements: n.reinforcements,
+          confidence: n.confidence,
+          sourceTrust: n.sourceTrust,
+          ...(n.steps?.length ? { steps: [...n.steps] } : {}),
+          ...(n.skillGateStatus ? { skillGateStatus: n.skillGateStatus } : {}),
+          updatedAt: n.updatedAt,
+          supersededAt: n.supersededAt ?? null,
+          supersededBy: n.supersededBy ?? null,
+          archivedAt: n.archivedAt ?? null,
+          lamportClock: clock,
+        };
+      });
+
+      const syncAtlasEdges: SyncableAtlasEdge[] = atlasEdgeSigs.map(({ e, key, sig }) => {
+        const prev = prevDigests[key];
+        const clock = prev && prev.sig === sig ? prev.clock : snapshotClock;
+        nextDigests[key] = { clock, sig };
+        return {
+          id: e.id,
+          plane: e.plane,
+          from: e.from,
+          relation: e.relation,
+          to: e.to,
+          weight: e.weight,
+          source: e.source,
+          ...(e.isMembraneEdge ? { isMembraneEdge: true } : {}),
+          membranePolicy: e.membranePolicy ?? null,
+          ...(e.principalAcl?.length ? { principalAcl: [...e.principalAcl] } : {}),
+          validFrom: e.validFrom,
+          updatedAt: e.updatedAt,
+          supersededAt: e.supersededAt ?? null,
+          lamportClock: clock,
+        };
+      });
+
+      let mindJournal: SyncableAtlasSnapshotV2["mindJournal"] | undefined;
+      if (exportedMind !== undefined) {
+        const syncMindEntries: SyncableMindJournalEntry[] = mindSigs.map(({ m, key, sig }) => {
+          const prev = prevDigests[key];
+          const clock = prev && prev.sig === sig ? prev.clock : snapshotClock;
+          nextDigests[key] = { clock, sig };
+          return {
+            ...m,
+            evidenceNotes: [...m.evidenceNotes],
+            lamportClock: clock,
+          };
+        });
+        const maxUpdatedAt = syncMindEntries.reduce(
+          (acc, entry) => (entry.updatedAt > acc ? entry.updatedAt : acc),
+          "",
+        );
+        mindJournal = {
+          charterVersion: "1.0",
+          updatedAt: maxUpdatedAt || new Date().toISOString(),
+          entries: syncMindEntries,
+        };
+      }
+
+      atlasSnapshot = {
+        version: 2,
+        nodes: syncAtlasNodes,
+        edges: syncAtlasEdges,
+        ...(mindJournal ? { mindJournal } : {}),
+      };
+    }
+
     if (dirty) {
       this.writeSyncMeta({
         deviceId: meta.deviceId,
@@ -261,51 +685,63 @@ export class SugentP2HostService {
     }
     const stewardshipLedger = this.ledgerPort?.exportLedger();
     return {
+      ...(atlasSnapshot ? { schemaVersion: 2 as const } : {}),
       lamportClock: snapshotClock,
       deviceId: meta.deviceId,
       nodes,
       edges,
       ...(stewardshipLedger ? { stewardshipLedger } : {}),
+      ...(atlasSnapshot ? { atlasSnapshot } : {}),
     };
   }
 
   private applyGraphSnapshot(merged: SyncableKnowledgeGraphSnapshot): void {
     const itemDigests: Record<string, { clock: number; sig: string }> = {};
-    const restoredNodes: KGNode[] = merged.nodes
-      .filter((n) => !n.supersededAt)
-      .map((n) => {
-        const props = n.properties ?? {};
-        const kind: EntityKind = VALID_ENTITY_KINDS.has(n.type as EntityKind)
-          ? (n.type as EntityKind)
-          : "concept";
-        const tags = Array.isArray(props.tags) ? props.tags.map(String) : [];
-        const steps = Array.isArray(props.steps) ? props.steps.map(String) : undefined;
-        const reinforcements =
-          typeof props.reinforcements === "number" && Number.isFinite(props.reinforcements)
-            ? props.reinforcements
-            : 1;
-        const rawGate = props.skillGateStatus;
-        const skillGateStatus: SkillGateStatus | undefined =
-          rawGate === "candidate" || rawGate === "approved" || rawGate === "rejected"
-            ? rawGate
-            : undefined;
-        const node: KGNode = {
-          id: n.id,
-          kind,
-          name: n.label,
-          summary: typeof props.summary === "string" ? props.summary : "",
-          tags,
-          reinforcements,
-          ...(steps && steps.length > 0 ? { steps } : {}),
-          ...(skillGateStatus ? { skillGateStatus } : {}),
-          updatedAt: n.updatedAt,
-        };
-        itemDigests[`node:${node.id}`] = {
-          clock: typeof n.lamportClock === "number" && n.lamportClock > 0 ? n.lamportClock : merged.lamportClock,
-          sig: this.buildNodeDigest(node),
-        };
-        return node;
-      });
+    const atlasTombstonedIds = new Map<string, string>();
+    if (merged.atlasSnapshot) {
+      for (const an of merged.atlasSnapshot.nodes) {
+        const deadTs = an.supersededAt || an.archivedAt;
+        if (deadTs) {
+          atlasTombstonedIds.set(an.id, deadTs);
+        }
+      }
+    }
+
+    const restoredNodes: KGNode[] = merged.nodes.map((n) => {
+      const props = n.properties ?? {};
+      const kind: EntityKind = VALID_ENTITY_KINDS.has(n.type as EntityKind)
+        ? (n.type as EntityKind)
+        : "concept";
+      const tags = Array.isArray(props.tags) ? props.tags.map(String) : [];
+      const steps = Array.isArray(props.steps) ? props.steps.map(String) : undefined;
+      const reinforcements =
+        typeof props.reinforcements === "number" && Number.isFinite(props.reinforcements)
+          ? props.reinforcements
+          : 1;
+      const rawGate = props.skillGateStatus;
+      const skillGateStatus: SkillGateStatus | undefined =
+        rawGate === "candidate" || rawGate === "approved" || rawGate === "rejected"
+          ? rawGate
+          : undefined;
+      const effectiveSupersededAt = n.supersededAt || atlasTombstonedIds.get(n.id);
+      const node: KGNode = {
+        id: n.id,
+        kind,
+        name: n.label,
+        summary: typeof props.summary === "string" ? props.summary : "",
+        tags,
+        reinforcements,
+        ...(steps && steps.length > 0 ? { steps } : {}),
+        ...(skillGateStatus ? { skillGateStatus } : {}),
+        ...(effectiveSupersededAt ? { supersededAt: effectiveSupersededAt } : {}),
+        updatedAt: n.updatedAt,
+      };
+      itemDigests[`node:${node.id}`] = {
+        clock: typeof n.lamportClock === "number" && n.lamportClock > 0 ? n.lamportClock : merged.lamportClock,
+        sig: this.buildNodeDigest(node),
+      };
+      return node;
+    });
 
     const restoredEdges: KGEdge[] = merged.edges.map((e) => {
       const edge: KGEdge = {
@@ -329,6 +765,112 @@ export class SugentP2HostService {
     if (merged.stewardshipLedger && this.ledgerPort) {
       this.ledgerPort.importLedger(merged.stewardshipLedger);
     }
+
+    if (merged.atlasSnapshot && this.atlasPort) {
+      const nodeClocks = new Map<string, number>();
+      const restoredAtlasNodes: AtlasNode[] = merged.atlasSnapshot.nodes.map((sn) => {
+        const clock =
+          typeof sn.lamportClock === "number" && sn.lamportClock > 0
+            ? sn.lamportClock
+            : merged.lamportClock;
+        nodeClocks.set(sn.id, clock);
+        return {
+          id: sn.id,
+          plane: sn.plane,
+          stratum: sn.stratum,
+          kind: sn.kind,
+          name: sn.name,
+          summary: sn.summary,
+          tags: Array.isArray(sn.tags) ? sn.tags.map(String) : [],
+          principalAcl: Array.isArray(sn.principalAcl) && sn.principalAcl.length > 0
+            ? [...sn.principalAcl]
+            : ["sugent_self", "owner:M"],
+          reinforcements:
+            typeof sn.reinforcements === "number" && Number.isFinite(sn.reinforcements)
+              ? sn.reinforcements
+              : 1,
+          confidence:
+            typeof sn.confidence === "number" && Number.isFinite(sn.confidence)
+              ? sn.confidence
+              : 0.8,
+          sourceTrust: sn.sourceTrust || "owner_confirmed",
+          ...(sn.steps?.length ? { steps: [...sn.steps] } : {}),
+          ...(sn.skillGateStatus ? { skillGateStatus: sn.skillGateStatus } : {}),
+          updatedAt: sn.updatedAt,
+          ...(sn.supersededAt ? { supersededAt: sn.supersededAt } : {}),
+          ...(sn.supersededBy ? { supersededBy: sn.supersededBy } : {}),
+          ...(sn.archivedAt ? { archivedAt: sn.archivedAt } : {}),
+        };
+      });
+
+      const edgeClocks = new Map<string, number>();
+      const restoredAtlasEdges: AtlasEdge[] = merged.atlasSnapshot.edges.map((se) => {
+        const clock =
+          typeof se.lamportClock === "number" && se.lamportClock > 0
+            ? se.lamportClock
+            : merged.lamportClock;
+        edgeClocks.set(se.id, clock);
+        return {
+          id: se.id,
+          plane: se.plane,
+          from: se.from,
+          relation: se.relation,
+          to: se.to,
+          weight: typeof se.weight === "number" && Number.isFinite(se.weight) ? se.weight : 1,
+          source: se.source || "e2ee_sync",
+          ...(se.isMembraneEdge ? { isMembraneEdge: true } : {}),
+          ...(se.membranePolicy ? { membranePolicy: se.membranePolicy } : {}),
+          ...(se.principalAcl?.length ? { principalAcl: [...se.principalAcl] } : {}),
+          validFrom: se.validFrom,
+          updatedAt: se.updatedAt,
+          ...(se.supersededAt ? { supersededAt: se.supersededAt } : {}),
+        };
+      });
+
+      this.atlasPort.importAtlas({ nodes: restoredAtlasNodes, edges: restoredAtlasEdges });
+
+      const postImportAtlas = this.atlasPort.exportAtlas();
+      for (const n of postImportAtlas.nodes) {
+        itemDigests[`atlas:node:${n.id}`] = {
+          clock: nodeClocks.get(n.id) ?? merged.lamportClock,
+          sig: this.buildAtlasNodeDigest(n),
+        };
+      }
+      for (const e of postImportAtlas.edges) {
+        itemDigests[`atlas:edge:${e.id}`] = {
+          clock: edgeClocks.get(e.id) ?? merged.lamportClock,
+          sig: this.buildAtlasEdgeDigest(e),
+        };
+      }
+
+      if (merged.atlasSnapshot.mindJournal && this.atlasPort.importMindJournal) {
+        const mindClocks = new Map<string, number>();
+        const restoredMindEntries: EpistemicJudgmentEntry[] =
+          merged.atlasSnapshot.mindJournal.entries.map((me) => {
+            const clock =
+              typeof me.lamportClock === "number" && me.lamportClock > 0
+                ? me.lamportClock
+                : merged.lamportClock;
+            mindClocks.set(me.id, clock);
+            const { lamportClock: _ignoredClock, ...entry } = me;
+            return {
+              ...entry,
+              evidenceNotes: Array.isArray(entry.evidenceNotes) ? [...entry.evidenceNotes] : [],
+            };
+          });
+        this.atlasPort.importMindJournal(restoredMindEntries);
+        const postImportMind = this.atlasPort.exportMindJournal
+          ? this.atlasPort.exportMindJournal()
+          : restoredMindEntries;
+        for (const m of postImportMind) {
+          itemDigests[`mind:${m.id}`] = {
+            clock: mindClocks.get(m.id) ?? merged.lamportClock,
+            sig: this.buildMindEntryDigest(m),
+          };
+        }
+      }
+    }
+
     const cur = this.readSyncMeta();
     this.writeSyncMeta({
       deviceId: cur.deviceId,
