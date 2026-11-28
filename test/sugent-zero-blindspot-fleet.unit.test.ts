@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -11,6 +12,7 @@ import {
   SugentKnowledgeGraph,
   SugentStewardHostService,
   parseRepoRoadmapMarkdown,
+  parseRepoTasksMarkdown,
   readSanitizedGovernanceDocFromRepo,
   scanLocalProjectsForEdge,
 } from "../src/sugent/index.js";
@@ -255,5 +257,78 @@ describe("Zero-Blindspot Fleet Context, Dual-Source Recency Merge & DSH Bridge",
       await mgr.stop();
       store.close();
     }
+  });
+
+  it("extracts gitSync divergence + TASKS.md (#slug/AC) queue in edge pulse & synthesizes offline TASKS.md", async () => {
+    const tmp = makeTmp();
+    const bare = path.join(tmp, "origin.git");
+    const peer = path.join(tmp, "peer");
+    const localParent = path.join(tmp, "Projects");
+    const local = path.join(localParent, "demo-app");
+    fs.mkdirSync(localParent, { recursive: true });
+    const gitCfg = ["-c", "user.name=Test", "-c", "user.email=test@example.com"];
+    execFileSync("git", ["init", "--bare", "-b", "main", bare], { stdio: "ignore" });
+    execFileSync("git", ["clone", bare, peer], { stdio: "ignore" });
+    fs.writeFileSync(path.join(peer, "README.md"), "v1\n");
+    execFileSync("git", ["-C", peer, ...gitCfg, "add", "README.md"], { stdio: "ignore" });
+    execFileSync("git", ["-C", peer, ...gitCfg, "commit", "-m", "init"], { stdio: "ignore" });
+    execFileSync("git", ["-C", peer, "push", "-u", "origin", "main"], { stdio: "ignore" });
+    execFileSync("git", ["clone", bare, local], { stdio: "ignore" });
+
+    fs.writeFileSync(path.join(peer, "README.md"), "v2\n");
+    execFileSync("git", ["-C", peer, ...gitCfg, "commit", "-am", "remote update"], { stdio: "ignore" });
+    execFileSync("git", ["-C", peer, "push", "origin", "main"], { stdio: "ignore" });
+    execFileSync("git", ["-C", peer, "checkout", "-b", "feat/cloud-pr"], { stdio: "ignore" });
+    fs.writeFileSync(path.join(peer, "pr.txt"), "pr\n");
+    execFileSync("git", ["-C", peer, ...gitCfg, "add", "pr.txt"], { stdio: "ignore" });
+    execFileSync("git", ["-C", peer, ...gitCfg, "commit", "-m", "cloud pr"], { stdio: "ignore" });
+    execFileSync("git", ["-C", peer, "push", "-u", "origin", "feat/cloud-pr"], { stdio: "ignore" });
+
+    execFileSync("git", ["-C", local, "fetch", "origin", "--prune"], { stdio: "ignore" });
+    fs.writeFileSync(path.join(local, "ROADMAP.md"), "### 窗口 1（当前阶段）：核心底座\n- [/] W1.1 在途项\n- [-] W1.2 暂缓项\n");
+    fs.writeFileSync(
+      path.join(local, "TASKS.md"),
+      [
+        "# TASKS",
+        "## Phase 1 (P1)",
+        "- [/] [P1.1] 修复会话重连 #fix-session-reconnect",
+        "    AC: 断网重连后 3 秒恢复心跳且零消息丢失。",
+        "- [ ] [P1.2] 接入幂等网关 #add-idempotency-gate",
+        "    AC: 并发重复回调仅入账一次。",
+        "- [-] [P1.3] 暂缓次要重构 #defer-minor-refactor",
+      ].join("\n"),
+    );
+    fs.writeFileSync(path.join(local, "STATUS.md"), "---\nreview_state: pending_review\n---\n## 阶段目标\n完成 P1\n");
+    execFileSync("git", ["-C", local, ...gitCfg, "add", "ROADMAP.md", "TASKS.md", "STATUS.md"], { stdio: "ignore" });
+    execFileSync("git", ["-C", local, ...gitCfg, "commit", "-m", "local wip"], { stdio: "ignore" });
+    fs.writeFileSync(path.join(local, "dirty.txt"), "dirty\n");
+
+    const tk = parseRepoTasksMarkdown(fs.readFileSync(path.join(local, "TASKS.md"), "utf8"));
+    expect(tk.counts).toEqual({ todo: 1, inProgress: 1, done: 0, blocked: 0, backlog: 1 });
+    expect(tk.activeItems.map((x) => `${x.phaseCode}:${x.slug}`)).toEqual(["P1.1:fix-session-reconnect", "P1.2:add-idempotency-gate"]);
+    expect(tk.activeItems[1]?.ac).toContain("仅入账一次");
+
+    const scanned = scanLocalProjectsForEdge({ projectsRootDirs: [localParent], homeDir: tmp, nodeId: "local-mac", defaultTier: 2 });
+    const proj = scanned.find((p) => p.displayName === "demo-app")!;
+    expect(proj.roadmapSummary?.nodes?.[0]?.progress?.total).toBe(1);
+    expect(proj.gitSync?.aheadCount).toBe(1);
+    expect(proj.gitSync?.behindCount).toBe(1);
+    expect(proj.gitSync?.dirtyCount).toBeGreaterThanOrEqual(1);
+    expect(proj.gitSync?.unmergedRemoteBranches).toContain("origin/feat/cloud-pr");
+
+    const svc = new SugentStewardHostService({
+      dataDir: makeTmp(),
+      homeDir: makeTmp(),
+      knowledgeGraph: new SugentKnowledgeGraph(makeTmp()),
+      localBudgets: new LocalBudgetLedger(makeTmp()),
+      nowIso: () => "2026-11-28T19:05:00Z",
+    });
+    svc.ingestEdgeNodePulse({ nodeId: "local-mac", atIso: "2026-11-28T18:00:00Z", projects: [proj] });
+    const ov = await svc.executeDshStewardFleetOp({ op: "overview" });
+    expect((ov.gitSyncAlerts as any[])[0]?.aheadCount).toBe(1);
+    const offlineTasks = await svc.readProjectGovernanceDoc({ projectQuery: "demo-app", docPath: "TASKS.md", timeoutMs: 1100 });
+    expect(offlineTasks.ok).toBe(true);
+    expect(offlineTasks.source).toBe("synced_snapshot_fallback");
+    expect(String(offlineTasks.content)).toContain("#add-idempotency-gate");
   });
 });

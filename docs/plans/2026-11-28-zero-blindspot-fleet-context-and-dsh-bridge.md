@@ -26,3 +26,6 @@
    - 为 `manage_ops_fleet` 与 `buildOwnerAgentBrief()` 注入全量阶段感知与免盲翻指引。
 3. **DSH 原生回环工具 `steward_fleet`（`dsh-runtime/plugins/amb-steward-fleet.mjs`, `agent/bridge.ts`, `agent/manager.ts`, `agent/host.ts`, `app.ts`）**
    - 通过 `/dsh/steward-fleet` 暴露 `overview`、`read_doc`、`dispatch_coding`、`complete_todo`，在私聊场景直连 `StewardHostService`，群聊与只读观察规则强制拦截。
+4. **Git 同步防漏脉冲与 `TASKS.md` 工单池零延迟直出（阶段增补）**
+   - `edge-tentacle-hub.ts` 新增 `inspectRepoGitSyncForEdge`（单次 `git status --porcelain=v2 --branch` + `for-each-ref --no-merged=HEAD` 采集未提交、未 push、落后远端与近 14 天未合入 PR 分支）及 `parseRepoTasksMarkdown`（提取 `[PN.M]`、`#slug`、黑盒 `AC:` 与 `>150` 行归档信号，统一忽略 `[-]` Backlog 并兼容 `窗口 N` 标题）；
+   - `steward-host-service.ts`、`steward-llm-agent.ts` 与 `amb-steward-fleet.mjs` 同步透传 `gitSyncAlerts`、`tasksSummary` 与离线 `TASKS.md` 快照合成，使 Sugent 零轮询秒报“未合代码/未推仓库”并按 `#slug + AC` 精准派单。

@@ -123,6 +123,36 @@ export interface OpsRepoPlanDocSummary {
   updatedAtIso?: string;
 }
 
+export interface OpsRepoGitSyncSummary {
+  branch: string;
+  dirtyCount: number;
+  aheadCount: number;
+  behindCount: number;
+  unmergedRemoteBranches?: string[];
+  needsAttention: boolean;
+}
+
+export interface OpsRepoTaskQueueItem {
+  status: "in_progress" | "todo" | "blocked";
+  phaseCode?: string;
+  slug?: string;
+  title: string;
+  ac?: string;
+}
+
+export interface OpsRepoTasksSummary {
+  totalLines: number;
+  needsArchive: boolean;
+  counts: {
+    todo: number;
+    inProgress: number;
+    done: number;
+    blocked: number;
+    backlog: number;
+  };
+  activeItems: OpsRepoTaskQueueItem[];
+}
+
 export interface OpsStewardProjectItem {
   projectKey: string;
   displayName?: string;
@@ -201,6 +231,8 @@ export interface OpsStewardProjectItem {
     nodes?: OpsRoadmapNodeSummary[];
   };
   recentPlans?: OpsRepoPlanDocSummary[];
+  gitSync?: OpsRepoGitSyncSummary;
+  tasksSummary?: OpsRepoTasksSummary;
 }
 
 export interface OpsPublicConciergeItem {

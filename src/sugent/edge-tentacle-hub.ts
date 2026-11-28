@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -5,7 +6,10 @@ import path from "node:path";
 import type {
   OpsInboxItem,
   OpsRemoteCommand,
+  OpsRepoGitSyncSummary,
   OpsRepoPlanDocSummary,
+  OpsRepoTaskQueueItem,
+  OpsRepoTasksSummary,
   OpsRoadmapItemSummary,
   OpsRoadmapNodeSummary,
   OpsStewardPendingSnapshot,
@@ -401,6 +405,7 @@ const STAGE_HEADING_PATTERNS: readonly RegExp[] = [
   /(?:^|\s)(里程碑\s*(?:[A-Z]?\d+|[一二三四五六七八九十]+))(?=\s*[:：\-—（(]|$)/,
   /(?:^|\s)(第\s*(?:\d+|[一二三四五六七八九十]+)\s*阶段)(?=\s*[:：\-—（(]|$)/,
   /(?:^|\s)(阶段\s*(?:[A-Z]?\d+|[一二三四五六七八九十]+))(?=\s*[:：\-—（(]|$)/,
+  /(?:^|\s)(窗口\s*(?:[A-Z]?\d+|[一二三四五六七八九十]+))(?=\s*[:：\-—（(]|$)/,
 ];
 
 const DELIVERABLE_HEADER_RE = /^\*\*[^*]*(?:core deliverables|deliverables|核心交付|交付清单|关键任务)[^*]*\*\*/i;
@@ -458,7 +463,8 @@ function classifyRoadmapBulletItem(rawBody: string): "done" | "in_progress" | "b
     const mark = cb[1] ?? " ";
     body = (cb[2] ?? "").trim();
     if (mark === "x" || mark === "X") return "done";
-    if (mark === "/" || mark === "~" || mark === "-") return "in_progress";
+    if (mark === "-") return null;
+    if (mark === "/" || mark === "~") return "in_progress";
     if (mark === "!") return "blocked";
     if (/\bBLOCKED\b|阻塞|🔴/iu.test(body)) return "blocked";
     return "todo";
@@ -817,6 +823,74 @@ export function parseRepoRoadmapMarkdown(markdown: string): ParsedRepoRoadmap {
 const SECRET_DOC_PATTERNS = /(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9_]{16,}|Bearer\s+[A-Za-z0-9._-]{16,}|AKIA[0-9A-Z]{16})/g;
 const ALLOWED_ROOT_GOV_DOCS = new Set(["STATUS.md", "ROADMAP.md", "AGENTS.md", "README.md", "TOMBSTONES.md", "TASKS.md", "PHILOSOPHY.md"]);
 
+export function parseRepoTasksMarkdown(markdown: string, tier: EdgePrivacyTier = 2): OpsRepoTasksSummary {
+  const lines = markdown.replace(/^\uFEFF/, "").replace(/\r\n/g, "\n").split("\n");
+  let todo = 0;
+  let inProgress = 0;
+  let done = 0;
+  let blocked = 0;
+  let backlog = 0;
+  const urgent: OpsRepoTaskQueueItem[] = [];
+  const pending: OpsRepoTaskQueueItem[] = [];
+  let current: OpsRepoTaskQueueItem | undefined;
+  let inFence = false;
+
+  for (const raw of lines) {
+    if (/^\s{0,3}(?:```|~~~)/.test(raw)) {
+      inFence = !inFence;
+      continue;
+    }
+    if (inFence) continue;
+    const bm = /^\s*[-*+]\s+\[([ xX/~!-])\]\s+(.+)$/.exec(raw);
+    if (bm) {
+      current = undefined;
+      const mark = bm[1] ?? " ";
+      let rest = (bm[2] ?? "").trim();
+      if (mark === "x" || mark === "X") { done += 1; continue; }
+      if (mark === "-") { backlog += 1; continue; }
+      const st: "in_progress" | "blocked" | "todo" =
+        mark === "!" || /\bBLOCKED\b|阻塞|🔴/iu.test(rest)
+          ? "blocked"
+          : (mark === "/" || mark === "~" ? "in_progress" : "todo");
+      if (st === "blocked") blocked += 1;
+      else if (st === "in_progress") inProgress += 1;
+      else todo += 1;
+
+      if (tier >= 1) {
+        const slugMatch = /(?:^|\s)#([a-z0-9][a-z0-9_-]{1,63})\s*$/i.exec(rest);
+        const slug = slugMatch?.[1];
+        if (slugMatch) rest = rest.slice(0, slugMatch.index).trim();
+        const phaseMatch = /^\[([A-Z]{1,3}\d+(?:\.\d+)*)\]\s*/i.exec(rest);
+        const phaseCode = phaseMatch?.[1]?.toUpperCase();
+        if (phaseMatch?.[0]) rest = rest.slice(phaseMatch[0].length).trim();
+        const title = redactLocalPaths(rest.replace(/\*\*|__|[`*]/g, "").replace(/\s+/g, " ").trim()).slice(0, tier >= 2 ? 100 : 50);
+        const item: OpsRepoTaskQueueItem = {
+          status: st,
+          ...(phaseCode ? { phaseCode } : {}),
+          ...(slug ? { slug } : {}),
+          title: title || slug || "task",
+        };
+        current = item;
+        if (st !== "todo") urgent.push(item);
+        else pending.push(item);
+      }
+      continue;
+    }
+    if (current && tier >= 2 && !current.ac) {
+      const acm = /^\s+AC\s*[:：]\s*(.+)$/i.exec(raw);
+      if (acm?.[1]) {
+        current.ac = redactLocalPaths(acm[1].trim()).replace(SECRET_DOC_PATTERNS, "[REDACTED]").slice(0, 140);
+      }
+    }
+  }
+  return {
+    totalLines: lines.length,
+    needsArchive: lines.length > 150,
+    counts: { todo, inProgress, done, blocked, backlog },
+    activeItems: [...urgent, ...pending].slice(0, tier >= 2 ? 10 : 5),
+  };
+}
+
 export function scanRecentRepoPlans(repoDir: string, tier: EdgePrivacyTier): OpsRepoPlanDocSummary[] {
   if (tier <= 0) return [];
   const dirs = [path.join(repoDir, "docs", "plans"), path.join(repoDir, "docs", "superpowers", "plans")];
@@ -854,6 +928,83 @@ export function scanRecentRepoPlans(repoDir: string, tier: EdgePrivacyTier): Ops
   }
   collected.sort((a, b) => b.path.localeCompare(a.path) || b._mtimeMs - a._mtimeMs);
   return collected.slice(0, 8).map(({ _mtimeMs: _m, ...rest }) => rest);
+}
+
+export function inspectRepoGitSyncForEdge(repoDir: string, tier: EdgePrivacyTier): OpsRepoGitSyncSummary | undefined {
+  if (tier <= 0 || !repoDir || !fs.existsSync(path.join(repoDir, ".git"))) return undefined;
+  let branch = "main";
+  let aheadCount = 0;
+  let behindCount = 0;
+  let dirtyCount = 0;
+  try {
+    const out = execFileSync("git", ["-C", repoDir, "status", "--porcelain=v2", "--branch", "--untracked-files=normal"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 1200,
+    });
+    for (const ln of out.split("\n")) {
+      if (!ln) continue;
+      if (ln.startsWith("# branch.head ")) {
+        branch = ln.slice("# branch.head ".length).trim() || "main";
+      } else if (ln.startsWith("# branch.ab ")) {
+        const ab = /\+(\d+)\s+-(\d+)/.exec(ln);
+        if (ab) {
+          aheadCount = Number.parseInt(ab[1] ?? "0", 10) || 0;
+          behindCount = Number.parseInt(ab[2] ?? "0", 10) || 0;
+        }
+      } else if (!ln.startsWith("#")) {
+        dirtyCount += 1;
+      }
+    }
+  } catch {
+    return undefined;
+  }
+  if (aheadCount === 0 && behindCount === 0 && branch && branch !== "(detached)") {
+    try {
+      const abRaw = execFileSync("git", ["-C", repoDir, "rev-list", "--left-right", "--count", `HEAD...origin/${branch}`], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: 800,
+      }).trim();
+      const parts = abRaw.split(/\s+/);
+      if (parts.length === 2) {
+        aheadCount = Number.parseInt(parts[0] ?? "0", 10) || 0;
+        behindCount = Number.parseInt(parts[1] ?? "0", 10) || 0;
+      }
+    } catch {
+      // no origin/<branch> ref yet
+    }
+  }
+  const unmerged: string[] = [];
+  try {
+    const brOut = execFileSync(
+      "git",
+      ["-C", repoDir, "for-each-ref", "--no-merged=HEAD", "--sort=-committerdate", "--count=8", "--format=%(refname:short)|%(committerdate:unix)", "refs/remotes/origin"],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 800 },
+    );
+    const skip = new Set(["origin", "origin/HEAD", "origin/main", "origin/master", `origin/${branch}`]);
+    const cutoff = Math.floor(Date.now() / 1000) - 14 * 86_400;
+    for (const ln of brOut.split("\n")) {
+      const [refRaw, tsRaw] = ln.split("|");
+      const ref = (refRaw ?? "").trim();
+      const ts = Number.parseInt((tsRaw ?? "").trim(), 10);
+      if (!ref.startsWith("origin/") || skip.has(ref)) continue;
+      if (Number.isFinite(ts) && ts > 0 && ts < cutoff) continue;
+      unmerged.push(redactLocalPaths(ref).slice(0, 80));
+      if (unmerged.length >= 3) break;
+    }
+  } catch {
+    // empty repo or no origin refs
+  }
+  const needsAttention = dirtyCount > 0 || aheadCount > 0 || behindCount > 0 || unmerged.length > 0;
+  return {
+    branch: redactLocalPaths(branch).slice(0, 64),
+    dirtyCount,
+    aheadCount,
+    behindCount,
+    ...(tier >= 2 && unmerged.length > 0 ? { unmergedRemoteBranches: unmerged } : {}),
+    needsAttention,
+  };
 }
 
 export function readSanitizedGovernanceDocFromRepo(
@@ -1361,6 +1512,16 @@ export function scanLocalProjectsForEdge(opts: ScanLocalProjectsForEdgeOptions):
     });
 
     const recentPlans = scanRecentRepoPlans(repoDir, tier);
+    const gitSync = inspectRepoGitSyncForEdge(repoDir, tier);
+    let tasksSummary: OpsRepoTasksSummary | undefined;
+    const tasksMdPath = path.join(repoDir, "TASKS.md");
+    if (fs.existsSync(tasksMdPath)) {
+      try {
+        tasksSummary = parseRepoTasksMarkdown(fs.readFileSync(tasksMdPath, "utf8"), tier);
+      } catch {
+        tasksSummary = undefined;
+      }
+    }
     const sanitizedGoal = parsedStatus?.stageGoal
       ? redactLocalPaths(parsedStatus.stageGoal)
       : parsedRoadmap?.activeNode
@@ -1394,6 +1555,8 @@ export function scanLocalProjectsForEdge(opts: ScanLocalProjectsForEdgeOptions):
           : {}),
         ...(parsedRoadmap ? { roadmapSummary: parsedRoadmap } : {}),
         ...(recentPlans.length > 0 ? { recentPlans } : {}),
+        ...(gitSync ? { gitSync } : {}),
+        ...(tasksSummary ? { tasksSummary } : {}),
       });
       continue;
     }
@@ -1453,6 +1616,8 @@ export function scanLocalProjectsForEdge(opts: ScanLocalProjectsForEdgeOptions):
         : {}),
       ...(parsedRoadmap ? { roadmapSummary: parsedRoadmap } : {}),
       ...(recentPlans.length > 0 ? { recentPlans } : {}),
+      ...(gitSync ? { gitSync } : {}),
+      ...(tasksSummary ? { tasksSummary } : {}),
       ...(runningSessions.length > 0
         ? {
             runningSessions: runningSessions.slice(0, 6).map((s) => ({
@@ -1673,6 +1838,8 @@ export class EdgeTentacleHub {
         const mergedNodes = baseRm?.nodes?.length ? baseRm.nodes : (normProj.roadmapSummary?.nodes ?? existing.roadmapSummary?.nodes);
         const mergedRoadmap = baseRm ? { ...baseRm, ...(mergedNodes?.length ? { nodes: mergedNodes } : {}) } : undefined;
         const mergedPlans = normProj.recentPlans?.length ? normProj.recentPlans : existing.recentPlans;
+        const mergedGitSync = useIncomingBase ? (normProj.gitSync ?? existing.gitSync) : (existing.gitSync ?? normProj.gitSync);
+        const mergedTasks = useIncomingBase ? (normProj.tasksSummary ?? existing.tasksSummary) : (existing.tasksSummary ?? normProj.tasksSummary);
 
         mergedByKey.set(key, {
           ...(useIncomingBase ? { ...existing, ...normProj } : { ...normProj, ...existing }),
@@ -1682,6 +1849,8 @@ export class EdgeTentacleHub {
             : existing.executiveSummary ?? normProj.executiveSummary,
           ...(mergedRoadmap ? { roadmapSummary: mergedRoadmap } : {}),
           ...(mergedPlans?.length ? { recentPlans: mergedPlans } : {}),
+          ...(mergedGitSync ? { gitSync: mergedGitSync } : {}),
+          ...(mergedTasks ? { tasksSummary: mergedTasks } : {}),
           nodeId: useIncomingBase ? nodeId : existing.nodeId,
           nodes: combinedNodes,
           status: isRunning ? "running" : (useIncomingBase ? normProj.status : existing.status),

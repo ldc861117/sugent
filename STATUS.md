@@ -3,19 +3,20 @@ status_version: 1
 project: sugent
 review_state: pending_review
 updated_by: agent@local-mac
-updated_at: "2026-11-28T19:00:00+08:00"
+updated_at: "2026-11-28T19:08:00+08:00"
 confirmed_by: ""
 confirmed_at: ""
 ---
 
 ## 阶段目标
 
-Wave P5 全量合龙并消除云端 Sugent 全域项目视野与工具盲区
+Wave P5 合龙并打通全域 Git 预警与 TASKS 视野
 
 ## 最近完成
 
 - 按两梯队六泳道完成 [`Wave P5`](./docs/plans/2026-11-28-p5-holistic-memory-elevation-and-calibrated-evals.md)（`P5.1–P5.6`）并建成 L1/L2/L3 三层记忆校准评测飞轮。
-- 落地「零盲区全量路线图与 DSH 桥接」：同步全量 `nodes[].items[]` 与 `recentPlans[]`、新增 `ops-remote-snapshot.json` 持久化与双源时序合并（清除离线僵死 `running`）、新增防外泄 `read_repo_doc` 跨端只读拉取，以及 `amb-steward-fleet.mjs` 原生 `steward_fleet` DSH 工具（`verify:sugent` 第 1–30 节全绿）。
+- 落地「零盲区全量路线图与 DSH 桥接」：同步全量 `nodes[].items[]` 与 `recentPlans[]`、新增 `ops-remote-snapshot.json` 持久化与双源时序合并、`read_repo_doc` 跨端只读拉取及原生 `steward_fleet` 工具。
+- 增补「15 秒脉冲 Git 同步防漏与 `TASKS.md` 工单池直出」：边缘扫描直接输出 `gitSync`（未提交/未 push/落后远端/待合 PR 分支）与 `tasksSummary`（`[PN.M]` + `#slug` + `AC:` + 离线合成），对齐 `[-]` Backlog 与 `窗口 N` 解析。
 
 ## 在途
 
@@ -23,8 +24,8 @@ Wave P5 全量合龙并消除云端 Sugent 全域项目视野与工具盲区
 
 ## 下一步
 
-1. [我·2026-12-02] 养号满期当天拿备用手机扫一次二维码确认登录助理微信号（关联 P3.7）
-2. [AI] 待主理人审阅确认 Wave P5 交付后推送至 `origin/main` 触发 `gce-hub` 自动滚动换新
+1. [AI] 待主理人审阅确认后提交推送 `sugent` 至 `origin/main`（触发云端 `gce-hub` 自动滚动换新）并重启本机 `edge-tentacle` 加载新脉冲字段
+2. [我·2026-12-02] 养号满期当天拿备用手机扫一次二维码确认登录助理微信号（关联 P3.7）
 
 ## 卡点
 

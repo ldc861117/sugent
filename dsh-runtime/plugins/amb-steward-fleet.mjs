@@ -29,7 +29,7 @@ export function apply(ctx) {
   ctx.tools.register(defineTool({
     name: 'steward_fleet',
     description:
-      'Query real-time /ops + edge project status, full roadmap stages/items (nodes[].items[]), and recent plan docs; read full sanitized ROADMAP.md / STATUS.md / docs/plans/*.md from local or online edge nodes; mark human todos complete; or dispatch Antigravity coding tasks. Always prefer this over raw JSON inspection.',
+      'Query real-time /ops + edge project status, gitSyncAlerts (uncommitted/unpushed/behind/unmerged PR branches), TASKS.md queue (tasksSummary with #slug & AC), full roadmap stages/items (nodes[].items[]), and recent plans; read sanitized ROADMAP.md / TASKS.md / STATUS.md / docs/plans/*.md; mark human todos complete; or dispatch coding tasks by #slug & AC. Always prefer this over raw JSON inspection.',
     parameters: {
       action: {
         type: 'string',
@@ -43,7 +43,7 @@ export function apply(ctx) {
       },
       docPath: {
         type: 'string',
-        description: 'Relative markdown path for read_doc (default ROADMAP.md; also STATUS.md, docs/plans/<file>.md).',
+        description: 'Relative markdown path for read_doc (default ROADMAP.md; also TASKS.md, STATUS.md, AGENTS.md, docs/plans/<file>.md).',
       },
       todoQuery: {
         type: 'string',

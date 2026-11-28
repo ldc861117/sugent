@@ -445,13 +445,13 @@ const LLM_TOOLS = [
     type: "function",
     function: {
       name: "manage_ops_fleet",
-      description: "实时查询运营总控台 (/ops) 与边缘触手的跨节点项目全量态势（含 STATUS.md 状态卡、阶段目标、路线图全量阶段与条目明细 nodes[].items[]、recentPlans 计划索引）、跨端只读拉取指定项目的 ROADMAP.md / STATUS.md / docs/plans/*.md 原文，或生成排期/派单草案写入待签批收件箱。当主人询问任意项目的最新进展、状态或某编号之前的待办时，优先调用 action='overview' 或 action='read_doc'。",
+      description: "实时查询运营总控台 (/ops) 与边缘触手的跨节点项目全量态势（含 STATUS.md 状态卡、gitSync 未提交/未push/落后远端/待合PR分支、tasksSummary 工单池 #slug 与 AC、路线图全量阶段 nodes[].items[]、recentPlans 计划索引）、跨端只读拉取指定项目的 ROADMAP.md / TASKS.md / STATUS.md / docs/plans/*.md 原文，或生成排期/派单草案写入待签批收件箱。",
       parameters: {
         type: "object",
         properties: {
           action: { type: "string", enum: ["overview", "read_doc", "propose_inbox"] },
           projectQuery: { type: "string", description: "按项目名称或关键词筛选项目（如 airtoken、sugent、Andy-web、self-a-web）" },
-          docPath: { type: "string", description: "action='read_doc' 时的治理文档相对路径，默认 ROADMAP.md，也可为 STATUS.md 或 docs/plans/*.md" },
+          docPath: { type: "string", description: "action='read_doc' 时的治理文档相对路径，默认 ROADMAP.md，也可为 TASKS.md、STATUS.md、AGENTS.md 或 docs/plans/*.md" },
           title: { type: "string", description: "排期或派单草案标题" },
           summary: { type: "string", description: "草案具体内容与验收要点" },
           targetNodeId: { type: "string", description: "目标执行节点，默认 local-mac" },
@@ -652,8 +652,12 @@ function buildSystemPrompt(wb: StewardWorkbenchLike): string {
                 const landed = p.statusCard?.landed?.[0] || p.executiveSummary?.progressText || p.sanitizedSummary || "";
                 const rm = p.roadmapSummary?.activeNode;
                 const rmTag = rm?.code ? `[${rm.code}${rm.progress?.total ? ` ${rm.progress.done ?? 0}/${rm.progress.total}` : ""}]` : "";
+                const gs = p.gitSync;
+                const gsTag = gs?.needsAttention
+                  ? `[Git:${[gs.aheadCount ? `未推${gs.aheadCount}` : "", gs.behindCount ? `落后${gs.behindCount}` : "", gs.dirtyCount ? `脏${gs.dirtyCount}` : "", gs.unmergedRemoteBranches?.length ? `待合PR${gs.unmergedRemoteBranches.length}` : ""].filter(Boolean).join("/")}]`
+                  : "";
                 const lane = p.status === "running" ? "实时运行" : (laneLabel[p.boardStatus ?? ""] || p.boardStatus || p.status || "静默");
-                const summary = [lane, rmTag, goal, landed].filter(Boolean).join(" · ");
+                const summary = [lane, rmTag, gsTag, goal, landed].filter(Boolean).join(" · ");
                 const nodeTag = (p.nodes?.length ? p.nodes.join(",") : p.nodeId) || "";
                 return `${p.displayName || shortProj(p.projectKey)}${nodeTag ? `[${nodeTag}]` : ""}：${summary}`;
               })
@@ -1099,6 +1103,8 @@ export class StewardLlmAgent<TWorkbench extends StewardWorkbenchLike = StewardWo
         lastActiveAt: pr.lastActiveAt || pr.updatedAtIso,
         statusCard: pr.statusCard,
         roadmapSummary: pr.roadmapSummary,
+        ...(pr.tasksSummary ? { tasksSummary: pr.tasksSummary } : {}),
+        ...(pr.gitSync ? { gitSync: pr.gitSync } : {}),
         ...(pr.recentPlans?.length ? { recentPlans: pr.recentPlans } : {}),
         executiveSummary: pr.executiveSummary,
       });

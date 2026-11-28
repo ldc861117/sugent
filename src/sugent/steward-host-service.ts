@@ -2593,6 +2593,8 @@ export class SugentStewardHostService {
       const mergedNodes = baseRm?.nodes?.length ? baseRm.nodes : (ep.roadmapSummary?.nodes ?? prev.roadmapSummary?.nodes);
       const mergedRoadmap = baseRm ? { ...baseRm, ...(mergedNodes?.length ? { nodes: mergedNodes } : {}) } : undefined;
       const mergedPlans = ep.recentPlans?.length ? ep.recentPlans : prev.recentPlans;
+      const mergedGitSync = epNodeOnline ? (ep.gitSync ?? prev.gitSync) : (prev.gitSync ?? ep.gitSync);
+      const mergedTasks = ep.tasksSummary ?? prev.tasksSummary;
       byKey.set(ep.projectKey, {
         ...prev,
         ...ep,
@@ -2610,6 +2612,8 @@ export class SugentStewardHostService {
         statusCard: chosenCard,
         ...(mergedRoadmap ? { roadmapSummary: mergedRoadmap } : {}),
         ...(mergedPlans?.length ? { recentPlans: mergedPlans } : {}),
+        ...(mergedGitSync ? { gitSync: mergedGitSync } : {}),
+        ...(mergedTasks ? { tasksSummary: mergedTasks } : {}),
         executiveSummary: preferPrevCard ? (prev.executiveSummary ?? ep.executiveSummary) : (ep.executiveSummary ?? prev.executiveSummary),
       });
     }
@@ -3601,7 +3605,25 @@ export class SugentStewardHostService {
   private synthesizeSyncedGovernanceDoc(proj: OpsStewardProjectItem, requestedPath: string): string | undefined {
     const lines: string[] = [];
     const wantStatus = /status\.md$/i.test(requestedPath);
+    const wantTasks = /tasks\.md$/i.test(requestedPath);
     const title = proj.displayName || proj.projectKey;
+    if (wantTasks && proj.tasksSummary) {
+      const c = proj.tasksSummary.counts;
+      lines.push(
+        `# ${title} TASKS (synced snapshot)`,
+        `- 统计：进行中 ${c.inProgress} · 待办 ${c.todo} · 阻塞 ${c.blocked} · 已完成 ${c.done} · 暂缓 ${c.backlog}${proj.tasksSummary.needsArchive ? `（共 ${proj.tasksSummary.totalLines} 行，建议归档已完成阶段）` : ""}`,
+        "",
+        "## Active & Dispatchable Queue",
+      );
+      for (const it of proj.tasksSummary.activeItems) {
+        const box = it.status === "in_progress" ? "[/]" : it.status === "blocked" ? "[!]" : "[ ]";
+        const ph = it.phaseCode ? `[${it.phaseCode}] ` : "";
+        const sl = it.slug ? ` #${it.slug}` : "";
+        lines.push(`- ${box} ${ph}${it.title}${sl}`);
+        if (it.ac) lines.push(`    AC: ${it.ac}`);
+      }
+      return lines.join("\n");
+    }
     if (wantStatus && proj.statusCard) {
       lines.push(`# ${title} STATUS (synced snapshot)`, `- review_state: ${proj.statusCard.reviewState ?? "unknown"}`, `- updated_at: ${proj.statusCard.updatedAt ?? proj.lastActiveAt ?? ""}`);
       if (proj.statusCard.stageGoal) lines.push("", `## 阶段目标`, proj.statusCard.stageGoal);
@@ -3749,6 +3771,18 @@ export class SugentStewardHostService {
           })
         : allProjects.filter((pr) => pr.status === "running" || ((pr.boardStatus ?? "idle_untracked") !== "idle_untracked" && pr.stage !== "archived"));
       const list = (filtered.length > 0 ? filtered : allProjects).slice(0, q ? 8 : 20);
+      const gitSyncAlerts = allProjects
+        .filter((pr) => pr.gitSync?.needsAttention)
+        .slice(0, 12)
+        .map((pr) => ({
+          projectKey: pr.projectKey,
+          displayName: pr.displayName || pr.projectKey,
+          branch: pr.gitSync!.branch,
+          dirtyCount: pr.gitSync!.dirtyCount,
+          aheadCount: pr.gitSync!.aheadCount,
+          behindCount: pr.gitSync!.behindCount,
+          ...(pr.gitSync!.unmergedRemoteBranches?.length ? { unmergedRemoteBranches: pr.gitSync!.unmergedRemoteBranches } : {}),
+        }));
       const commitments = this.ledger.snapshotForCaller("owner_private").commitments.filter((c) => c.status === "open" || c.status === "snoozed");
       return {
         ok: true,
@@ -3756,6 +3790,7 @@ export class SugentStewardHostService {
         edgeNodes: this.edgeHub.listNodes(),
         totalProjects: allProjects.length,
         matchedCount: list.length,
+        gitSyncAlerts,
         projects: list,
         openCommitments: commitments,
         pendingInbox: fleet?.pendingInbox ?? [],
@@ -3812,18 +3847,27 @@ export class SugentStewardHostService {
     if (domainNodes.length) parts.push(`【工程与武器包沉淀 (domain_work)】\n${domainNodes.map((n) => `- [${n.plane}] ${n.name}：${n.summary}`).join("\n")}`);
     const fleet = this.getMergedOpsFleetSnapshot();
     const focusLines = (fleet?.projects ?? [])
-      .filter((p) => p.stage === "focus" || p.status === "running" || p.boardStatus === "pending_review")
-      .slice(0, 6)
+      .filter((p) => p.stage === "focus" || p.status === "running" || p.boardStatus === "pending_review" || p.gitSync?.needsAttention)
+      .slice(0, 8)
       .map((p) => {
         const rm = p.roadmapSummary?.overallProgress ?? p.roadmapSummary?.totals;
         const rmStr = rm?.total ? ` · 路线图 ${rm.done ?? 0}/${rm.total}` : "";
+        const tk = p.tasksSummary?.counts;
+        const tkStr = tk && (tk.inProgress + tk.todo) > 0 ? ` · 工单 ${tk.inProgress}在途/${tk.todo}待派` : "";
+        const gs = p.gitSync;
+        const gsParts: string[] = [];
+        if (gs?.aheadCount) gsParts.push(`未push:${gs.aheadCount}`);
+        if (gs?.behindCount) gsParts.push(`落后origin:${gs.behindCount}`);
+        if (gs?.dirtyCount) gsParts.push(`未提交:${gs.dirtyCount}`);
+        if (gs?.unmergedRemoteBranches?.length) gsParts.push(`待合PR分支:${gs.unmergedRemoteBranches.join(",")}`);
+        const gsStr = gsParts.length ? ` · ⚠️Git(${gsParts.join(" ")})` : "";
         const goal = p.statusCard?.stageGoal ? `：${p.statusCard.stageGoal.slice(0, 60)}` : "";
-        return `- ${p.displayName || p.projectKey} [${p.boardStatus || p.status || "idle"}${rmStr}]${goal}`;
+        return `- ${p.displayName || p.projectKey} [${p.boardStatus || p.status || "idle"}${rmStr}${tkStr}${gsStr}]${goal}`;
       });
     parts.push([
       "【全域项目脉冲与零盲区工具指引】",
       ...(focusLines.length ? focusLines : ["- 暂无本地脉冲快照，可调用 steward_fleet(action='overview') 实时拉取。"]),
-      "- 凡主理人询问任意项目进展、路线图前序/未完成明细、STATUS.md、或跨端派单/销账，务必优先调用 `steward_fleet` 工具（`overview` / `read_doc` / `dispatch_coding` / `complete_todo`），严禁去 /data 手翻 JSON 盲猜或让主人手工粘贴文档。",
+      "- 凡主理人询问任意项目进展、哪些代码未合入/未同步、路线图或 TASKS.md 工单队列（#slug 与 AC），或需跨端派单/销账，务必优先调用 `steward_fleet`（`overview` 含 `gitSyncAlerts` 与 `tasksSummary`；`read_doc` 支持 `ROADMAP.md` / `TASKS.md` / `STATUS.md` / `docs/plans/*.md`；派单优先引用 `#slug` 与 `AC:`）。",
     ].join("\n"));
     return parts.join("\n\n");
   }
