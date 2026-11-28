@@ -78,3 +78,12 @@
    - `compose.yml` 新增 `64m` `sugent-updater`（强制 `WATCHTOWER_LABEL_ENABLE=true` 仅升级带标签的 `sugent-gce-hub` 并自动清理悬空旧镜像），推 `main` 后云端 5 分钟内自动换新；`App.pushToOwner` 正式接入 `WeixinAdaptiveQuotaGuard`，低水位缓冲合并常规通知，耗尽平滑转飞书。
 3. **人机职责边界硬约束**：
    - 严禁在 `STATUS.md` / `ROADMAP.md` 中将推代码、拉镜像、改配置等数字环境工作标记为 `[我]`；`[我]` 仅限实体卡实名、真机摄像头扫码与资金/承诺最终拍板，且每条待办必须保持单一原子动作。
+
+## 2026-11-27 · 双人关系幕僚与记忆晶化引擎（`DuoStewardCrystallizer`）物理隔离与双保险联邦
+
+1. **公私域绝对物理隔离（零 `owner_private` 串味泄露）**：
+   - 双人关系试点（`bigfive-duo-site` Andy & Gillna）严禁直接读写主理人个人的 `StewardshipLedger`（含商业底价、合同与工作记录）。`DuoStewardCrystallizer` 将各 `spaceId` 独立落盘于 `<dataDir>/duo-spaces/<safeSpaceId>/`（`0o700` 目录 + 独立 `SugentKnowledgeGraph`），且 `SUGENT_DUO_BRIDGE_TOKEN` 经 SHA-256 `timingSafeEqual` 校验仅放行 `/amb/api/steward/duo/*`，请求 `/amb/api/steward/workbench` 一律返回 `401`。
+2. **时效排他晶化（不翻旧账）与联邦同构双保险**：
+   - 关系星晶通过 `topicKey` 绑定语义议题：当新阶段星晶经双方共鸣确认或满 3 次印证晋升为 `crystallized` 时，自动将同 `topicKey` 旧星晶置为 `superseded`（图谱侧写入 `exclusive: true`），提示词构建器强制过滤 `superseded` 与 `archived` 节点，杜绝反复翻炒已化解摩擦。
+   - `bigfive-duo-site` 采用「优先调用 `SUGENT_DUO_HUB_URL` 中枢 + 异常/未配时无缝降级站内同构晶化内核」双保险架构，兼顾统一幕僚大脑演进与 Cloud Run 独立高可用。
+

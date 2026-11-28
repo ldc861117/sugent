@@ -318,9 +318,15 @@ export class App {
     const opsCfg = resolveOpsBridgeConfig(this.opsEnv);
     const edgeToken = String(this.opsEnv.SUGENT_EDGE_TOKEN ?? "").trim();
     const envoyToken = String(this.opsEnv.SUGENT_WECHAT_ENVOY_TOKEN ?? "").trim();
+    const duoBridgeToken = String(this.opsEnv.SUGENT_DUO_BRIDGE_TOKEN ?? "").trim();
+    const duoAllowedGroups = String(this.opsEnv.SUGENT_DUO_ENVOY_GROUPS ?? "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
     if (opsCfg.nodeToken) registerSecret(opsCfg.nodeToken);
     if (edgeToken) registerSecret(edgeToken);
     if (envoyToken) registerSecret(envoyToken);
+    if (duoBridgeToken) registerSecret(duoBridgeToken);
     this.opsBridge = new OpsBridgeClient({
       baseUrl: opsCfg.baseUrl,
       nodeToken: opsCfg.nodeToken,
@@ -339,6 +345,8 @@ export class App {
       opsBridge: this.opsBridge,
       chatRecall,
       edgeTokens: [edgeToken, opsCfg.nodeToken].filter(Boolean),
+      duoBridgeTokens: [duoBridgeToken].filter(Boolean),
+      allowedDuoEnvoyGroupIds: duoAllowedGroups,
       wechatEnvoyEnv: this.opsEnv,
       knowledgeGraph: this.knowledgeGraph,
       localBudgets: this.localBudgets,

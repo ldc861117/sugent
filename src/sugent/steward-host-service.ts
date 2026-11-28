@@ -93,6 +93,7 @@ import { SugentModelCatalog, type ModelTier } from "./model-catalog.js";
 import { ModelPoolSyncer, type ProviderSyncResult } from "./model-pool-sync.js";
 import { RoutingExperienceStore, type RoutingOperatingMode, type RoutingPolicyState, type RoutingStrategyPreset, type TaskArchetype } from "./routing-experience-store.js";
 import { AdaptiveModelRouter, type AdaptiveRoutingDashboardSnapshot } from "./adaptive-router.js";
+import { DuoStewardCrystallizer } from "./duo-steward-crystallizer.js";
 import {
   OpsBridgeClient,
   type OpsCommitmentStatusUpdate,
@@ -192,6 +193,8 @@ export interface SugentStewardHostServiceOptions {
   opsBridge?: OpsBridgeClient;
   chatRecall?: ChatTranscriptRecallService;
   edgeTokens?: readonly string[];
+  duoBridgeTokens?: readonly string[];
+  allowedDuoEnvoyGroupIds?: readonly string[];
   manifestPath?: string;
   workspaceRoot?: string;
   powerSaveBlockerDriver?: PowerSaveBlockerDriver;
@@ -466,6 +469,7 @@ export class SugentStewardHostService {
   readonly wechatEnvoyPoller: WeChatEnvoyPoller;
   readonly groupScribe: GroupChatScribe;
   readonly airtokenOpsClient: AirTokenOpsBridgeClient;
+  readonly duoCrystallizer: DuoStewardCrystallizer;
   private readonly airtokenOpsMethods: ReturnType<typeof buildAirTokenBridgeMethods>;
   private readonly homeDir: string;
   private lastBootNotice?: PostBootNotice;
@@ -755,20 +759,33 @@ export class SugentStewardHostService {
         ...(opts.conciergeBridge ? { executeConciergeCommand: (cmd, ch) => opts.conciergeBridge!.executeOwnerCommand(cmd, ch) } : {}),
       },
     });
+    this.duoCrystallizer = new DuoStewardCrystallizer({
+      dataDir: opts.dataDir,
+      getGatewayConfig: opts.getGatewayConfig,
+      resolveRoleEndpoint: (role) => this.resolveLiveRoleEndpoint(role),
+      fetchImpl: opts.llmFetch,
+      ...(opts.duoBridgeTokens ? { bridgeTokens: opts.duoBridgeTokens } : {}),
+      ...(opts.allowedDuoEnvoyGroupIds ? { allowedEnvoyGroupIds: opts.allowedDuoEnvoyGroupIds } : {}),
+      nowIso: this.nowIsoFn,
+    });
   }
 
   hasLiveLlmEndpoint(): boolean {
     return Boolean(this.resolveLiveLlmEndpoint());
   }
 
-  private resolveLiveLlmEndpoint(): StewardLlmEndpoint | undefined {
+  private resolveLiveRoleEndpoint(role: "assessor" | "executor" | "computer_use" | "steward"): StewardLlmEndpoint | undefined {
     const gw = this.opts.getGatewayConfig?.() ?? resolveSugentGatewayConfig(undefined, {});
-    if (gw.baseUrl && gw.apiKey) return { baseUrl: gw.baseUrl, apiKey: gw.apiKey, model: selectModelForRole(gw, "steward") };
+    if (gw.baseUrl && gw.apiKey) return { baseUrl: gw.baseUrl, apiKey: gw.apiKey, model: selectModelForRole(gw, role) };
     const def = this.opts.providerRegistry?.getDefaultProvider();
     if (def?.enabled && def.baseUrl) {
-      return { baseUrl: def.baseUrl, apiKey: def.apiKey, model: def.defaultModel || def.models?.[0] || selectModelForRole(gw, "steward") };
+      return { baseUrl: def.baseUrl, apiKey: def.apiKey, model: def.defaultModel || def.models?.[0] || selectModelForRole(gw, role) };
     }
     return undefined;
+  }
+
+  private resolveLiveLlmEndpoint(): StewardLlmEndpoint | undefined {
+    return this.resolveLiveRoleEndpoint("steward");
   }
 
   async comprehendSession(input: ArtifactComprehensionInput): Promise<ArtifactComprehensionResult> {

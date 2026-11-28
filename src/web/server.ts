@@ -297,6 +297,14 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
         return true;
       }
     }
+    if (url.pathname.startsWith("/amb/api/steward/duo/")) {
+      const bearer = String(req.headers.authorization || "").replace(/^Bearer\s+/i, "").trim();
+      const duoHdr = String(req.headers["x-sugent-duo-token"] || "").trim();
+      const candidate = bearer || duoHdr;
+      if (candidate && app.stewardService.duoCrystallizer.verifyBridgeToken(candidate)) {
+        return true;
+      }
+    }
     if (!token) return true;
     const cookie = String(req.headers.cookie || "");
     const ok = cookie.split(/;\s*/).includes(`amb_token=${token}`) || req.headers["x-amb-token"] === token;
@@ -742,6 +750,86 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
             ...(typeof b.branchDraft === "string" ? { branchDraft: b.branchDraft } : {}),
           }),
         );
+      }
+      if (sub === "duo/vault" && m === "GET") {
+        const spaceId = url.searchParams.get("spaceId") ?? undefined;
+        const q = url.searchParams.get("q") ?? "";
+        return send(res, 200, {
+          ok: true,
+          vault: app.stewardService.duoCrystallizer.getVaultSnapshot(spaceId, q),
+        });
+      }
+      if (sub === "duo/crystallize" && m === "POST") {
+        const b = await readJson(req);
+        const result = await app.stewardService.duoCrystallizer.crystallizeAndSynthesize(b ?? {});
+        return send(res, 200, { ok: true, ...result });
+      }
+      if (seg[1] === "duo" && seg[2] === "crystals" && seg[4] === "review" && seg.length === 5 && m === "POST") {
+        const crystalId = decodeURIComponent(seg[3] ?? "").trim();
+        const b = await readJson(req);
+        const actor = b?.actor === "W" ? "W" : "M";
+        if (b?.action !== "endorse" && b?.action !== "crystallize" && b?.action !== "dismiss") {
+          throw new HttpError(400, "action must be endorse, crystallize, or dismiss");
+        }
+        const crystal = app.stewardService.duoCrystallizer.reviewCrystal({
+          ...(typeof b.spaceId === "string" ? { spaceId: b.spaceId } : {}),
+          crystalId,
+          actor,
+          action: b.action,
+          ...(typeof b.supersedeCrystalId === "string" ? { supersedeCrystalId: b.supersedeCrystalId } : {}),
+        });
+        return send(res, 200, {
+          ok: true,
+          crystal,
+          vault: app.stewardService.duoCrystallizer.getVaultSnapshot(b.spaceId),
+        });
+      }
+      if (seg[1] === "duo" && seg[2] === "commitments" && seg[4] === "echo" && seg.length === 5 && m === "POST") {
+        const commitmentId = decodeURIComponent(seg[3] ?? "").trim();
+        const b = await readJson(req);
+        if (b?.action !== "echo" && b?.action !== "fulfill" && b?.action !== "archive") {
+          throw new HttpError(400, "action must be echo, fulfill, or archive");
+        }
+        const commitment = app.stewardService.duoCrystallizer.updateCommitment({
+          ...(typeof b.spaceId === "string" ? { spaceId: b.spaceId } : {}),
+          commitmentId,
+          action: b.action,
+          ...(typeof b.echoNote === "string" ? { echoNote: b.echoNote } : {}),
+        });
+        return send(res, 200, {
+          ok: true,
+          commitment,
+          vault: app.stewardService.duoCrystallizer.getVaultSnapshot(b.spaceId),
+        });
+      }
+      if (sub === "duo/converse" && m === "POST") {
+        const b = await readJson(req);
+        if (!Array.isArray(b?.messages) || b.messages.length === 0) {
+          throw new HttpError(400, "messages array is required");
+        }
+        const speaker = b.speaker === "W" ? "W" : "M";
+        const out = await app.stewardService.duoCrystallizer.converseAsDuoSteward({
+          ...(typeof b.spaceId === "string" ? { spaceId: b.spaceId } : {}),
+          speaker,
+          messages: b.messages,
+          ...(b.partnerLabels && typeof b.partnerLabels === "object" ? { partnerLabels: b.partnerLabels } : {}),
+          ...(typeof b.baselineContext === "string" ? { baselineContext: b.baselineContext } : {}),
+          ...(typeof b.episodicContext === "string" ? { episodicContext: b.episodicContext } : {}),
+          ...(typeof b.retrievedContext === "string" ? { retrievedContext: b.retrievedContext } : {}),
+        });
+        return send(res, 200, out);
+      }
+      if (sub === "duo/envoy-group" && m === "POST") {
+        const b = await readJson(req);
+        if (typeof b?.groupId !== "string" || !Array.isArray(b?.messages)) {
+          throw new HttpError(400, "groupId and messages array are required");
+        }
+        const out = await app.stewardService.duoCrystallizer.ingestEnvoyDuoGroupSlice({
+          ...(typeof b.spaceId === "string" ? { spaceId: b.spaceId } : {}),
+          groupId: b.groupId,
+          messages: b.messages,
+        });
+        return send(res, 200, { ok: true, ...out });
       }
       if (sub === "preferences" && m === "POST") {
         const b = await readJson(req);

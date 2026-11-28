@@ -158,6 +158,8 @@ import {
   assertSafeEnvoyTransportUrl,
   GroupChatScribe,
   sanitizeGroupMessageText,
+  DuoStewardCrystallizer,
+  buildDuoStewardSystemPrompt,
 } from "../dist/src/sugent/index.js";
 import { normalizeSettings } from "../dist/src/agent/settings.js";
 import { extractForwardedRecordText, weixinParts } from "../dist/src/channels/weixin/channel.js";
@@ -1714,6 +1716,55 @@ import { extractForwardedRecordText, weixinParts } from "../dist/src/channels/we
   }
 }
 
+// ---------------------------------------------------------------------------
+// 30. 双人关系幕僚与记忆晶化引擎（DuoStewardCrystallizer）物理隔离与时效更替契约
+// ---------------------------------------------------------------------------
+{
+  const s30Dir = fs.mkdtempSync(path.join(os.tmpdir(), "verify-sugent-s30-"));
+  try {
+    const duo = new DuoStewardCrystallizer({
+      dataDir: s30Dir,
+      bridgeTokens: ["duo-verify-scoped-token-2026"],
+      nowIso: () => "2026-11-27T12:00:00Z",
+    });
+    assert.equal(duo.verifyBridgeToken("duo-verify-scoped-token-2026"), true);
+    assert.equal(duo.verifyBridgeToken("wrong-token"), false);
+
+    const oldC = duo.upsertCrystal({
+      spaceId: "andy-gillna",
+      topicKey: "silence-window",
+      kind: "friction_antidote",
+      title: "旧阶段静默摩擦观察",
+      summary: "遇到过载时直接失联易引发不安",
+      forceCrystallize: true,
+    });
+    assert.equal(oldC.status, "crystallized");
+
+    const newC = duo.upsertCrystal({
+      spaceId: "andy-gillna",
+      topicKey: "silence-window",
+      kind: "consensus_tacit",
+      title: "新阶段微光报备默契",
+      summary: "忙碌前先发一句安心信标，既保专注又护安全感",
+      forceCrystallize: true,
+    });
+    const vault = duo.getVaultSnapshot("andy-gillna", "silence-window");
+    assert.equal(vault.crystals.crystallized.length, 1);
+    assert.equal(vault.crystals.crystallized[0]?.id, newC.id);
+    assert.equal(vault.crystals.supersededCount, 1);
+
+    const prompt = buildDuoStewardSystemPrompt({
+      speaker: "M",
+      activeCrystals: vault.crystals.crystallized,
+      activeCommitments: [],
+    });
+    assert.equal(prompt.includes("新阶段微光报备默契"), true);
+    assert.equal(prompt.includes("旧阶段静默摩擦观察"), false);
+  } finally {
+    fs.rmSync(s30Dir, { recursive: true, force: true });
+  }
+}
+
 console.log(
-  "verify:sugent — 全部核心契约断言通过 (M1.1–M1.6 / M2.1 / Cowork 联邦 / P0 Broker + P1 幕僚耳麦 + P2 BYOK 诊断与零知识加密同步 / Sprint 1–3 / M1–M4 Vibe Coding 闭环 / 能力自感知与全文读取 / 形象工坊与桌宠契约 / M-Auto 1–4 双环自治与 SIM 演进 / M1–M3 全量模型同步与经验驱动自适应路由 / L0–L3 分层热启动与热更新 / Wave P0 双脑归一与宿主主循环合龙 / GCE 常驻中枢与微信单持有者舰队桥接 / Wave P1 零填表冷启动、ACP 编码军团与隐藏快照防呆 / Wave P2 合盖离线韧性、微信 3 秒转发参谋与端-边联邦标杆武器包 / 云端唯一大脑、跨天全渠道对话记忆与多节点边缘触手中枢 / Wave P3 双微信号前店后厂、助理无头边车与项目群静默纪要 / 人机混合项目规划与现实待办闭环)",
+  "verify:sugent — 全部核心契约断言通过 (M1.1–M1.6 / M2.1 / Cowork 联邦 / P0 Broker + P1 幕僚耳麦 + P2 BYOK 诊断与零知识加密同步 / Sprint 1–3 / M1–M4 Vibe Coding 闭环 / 能力自感知与全文读取 / 形象工坊与桌宠契约 / M-Auto 1–4 双环自治与 SIM 演进 / M1–M3 全量模型同步与经验驱动自适应路由 / L0–L3 分层热启动与热更新 / Wave P0 双脑归一与宿主主循环合龙 / GCE 常驻中枢与微信单持有者舰队桥接 / Wave P1 零填表冷启动、ACP 编码军团与隐藏快照防呆 / Wave P2 合盖离线韧性、微信 3 秒转发参谋与端-边联邦标杆武器包 / 云端唯一大脑、跨天全渠道对话记忆与多节点边缘触手中枢 / Wave P3 双微信号前店后厂、助理无头边车与项目群静默纪要 / 人机混合项目规划与现实待办闭环 / Duo 双人关系幕僚与记忆晶化隔离契约)",
 );
