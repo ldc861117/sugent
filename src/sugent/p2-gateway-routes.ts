@@ -82,12 +82,36 @@ export function createP2GatewayHandlers(deps: P2GatewayDependencies) {
       GatewayJsonResponse<{ uploadedAtIso: string; keyFingerprint: string; lamportClock: number }>
     > {
       try {
-        const snapshot = await deps.getKnowledgeGraphSnapshot();
+        const localSnapshot = await deps.getKnowledgeGraphSnapshot();
+        let snapshotToPush = localSnapshot;
+        try {
+          const pulled = await syncClient.pullAndMergeKnowledgeGraph({
+            claims: req.claims,
+            bearerToken: req.bearerToken,
+            passphrase: req.passphrase,
+            localSnapshot,
+          });
+          if (pulled.remoteFound) {
+            await deps.applyKnowledgeGraphSnapshot(pulled.mergedSnapshot);
+            snapshotToPush = pulled.mergedSnapshot;
+          }
+        } catch (pullErr) {
+          const pullMsg = pullErr instanceof Error ? pullErr.message : "";
+          if (
+            pullMsg.includes("SYNC_PLAN_UPGRADE_REQUIRED") ||
+            pullMsg.includes("SYNC_AUTH_TOKEN_EXPIRED") ||
+            pullMsg.includes("SYNC_ENDPOINT_MISSING") ||
+            pullMsg.includes("Invalid E2EE passphrase") ||
+            pullMsg.includes("E2EE envelope AAD/authentication verification failed")
+          ) {
+            throw pullErr;
+          }
+        }
         const result = await syncClient.pushKnowledgeGraph({
           claims: req.claims,
           bearerToken: req.bearerToken,
           passphrase: req.passphrase,
-          snapshot,
+          snapshot: snapshotToPush,
         });
         return { statusCode: 200, body: { ok: true, data: result } };
       } catch (err) {

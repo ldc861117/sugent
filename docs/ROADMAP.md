@@ -32,9 +32,9 @@ Sugent 按「外环私人幕僚（[`docs/PHILOSOPHY.md`](./PHILOSOPHY.md)）× �
 
 ---
 
-## 二、四大核心演进战役（收敛堵点 · 削平门槛 · 商业打样 · 前店后厂）
+## 二、五大核心演进战役（收敛堵点 · 削平门槛 · 商业打样 · 前店后厂 · 硅基心智）
 
-针对实盘代码批判审计（[`2026-11-23 批判报告`](../research/2026-11-23-t3code-landscape-and-sugent-critical-review.md)）识别出的工程堵点与云端常驻主脑演进诉求，严格按 **Wave P0 → Wave P1 → Wave P2 → Wave P3** 顺序收敛推进：
+针对实盘代码批判审计（[`2026-11-23 批判报告`](../research/2026-11-23-t3code-landscape-and-sugent-critical-review.md)）及记忆全景与硅基个体审计（[`2026-11-28 记忆全景审计`](../research/2026-11-28-memory-panorama-and-silicon-individuality-audit.md)）识别出的工程堵点与架构演进诉求，严格按 **Wave P0 → Wave P1 → Wave P2 → Wave P3 → Wave P4** 顺序收敛推进：
 
 ### Wave P0（第 1–2 周）：内核止血、双脑归一与主循环合龙（零新概念）
 
@@ -112,6 +112,31 @@ Sugent 按「外环私人幕僚（[`docs/PHILOSOPHY.md`](./PHILOSOPHY.md)）× �
 - [ ] **P3.7 [我·2026-12-02] 养号满期拿备用手机扫二维码确认登录助理微信号**：无头边车容器与项目群白名单由 AI 及编排脚本自动就绪，仅需主理人真机扫码一次完成合龙。
 
 **Wave P3 验收门禁（Exit / Profit Gate）**：主号微信转发记录 3 秒出红线参谋与双拟稿；公域访客与助理微信号入站 100% 经 `0o400` 安全信封物理隔离且零 `owner_private` 泄露；群聊非 `@` 消息 100% 零误发外溢；`npm run typecheck`、全量 Vitest 单测与 `npm run verify:sugent`（第 1–29 节 + `docs:check`）全绿。
+
+---
+
+### Wave P4（第 11–14 周 · ✅ 全量合龙）：硅基个体心智、五维立体关联图谱与全链路记忆合龙
+
+**战役目标**：彻底打通审计识别的记忆十大断点，把 Sugent 从“多套无状态提示词 + 单平面扁平图谱 + 机械切脑隔离”升维为**拥有统一自我宪章、认知消化闭环与五平面立体关联图谱的硅基个体**，并完成前端立体星图可视化与多平面无损 E2EE 漫游合龙。完整审计与设计方案见 [`2026-11-28 记忆全景审计`](../research/2026-11-28-memory-panorama-and-silicon-individuality-audit.md) 与 [`2026-11-28 立体图谱与硅基个体方案`](./plans/2026-11-28-stereoscopic-memory-and-silicon-individuality.md)。
+
+- [x] **P4.1 [AI] 记忆底座止血与全渠道回合后回路合龙**
+  - 新增 `PostTurnDigester`：打通微信/飞书 `OwnerChannelStewardRouter`、桌宠 `/steward/converse`（补齐多轮上下文回填）与 `BotRuntime`/DSH 的双向记忆互通与回合后统一异步消化。
+  - 修复 `MemoryGardener` 真正落盘执行 `removeEdge`、规则退回 `observe`、`LanguageProfiler` 软品味写入、假说沙盒持久化与校准卡推送；激活 `SugentSIMStore` 记录 `VibeCoding`/技能演化与 BYOK 切模型重验及单件外科隔离。
+  - 统一 `SKILL.md` 结晶写入路径至 DSH 真实加载目录（`<dataDir>/dsh/<botId>/skills` 与 `.dsh/skills`）并修复非法 `skillName` 与 YAML 引号转义；补齐 `GroupChatScribe` 自动提炼脉搏与外部耳麦 `peer:` 标签对齐及实时 LLM 评估器接线。
+- [x] **P4.2 [AI] `Sugent Atlas v2` 五维立体关联图谱引擎**
+  - 实现 `self_core`、`owner_life`、`relational`、`domain_work`、`meta_evolution` 五平面 × 四认知阶（`S0–S3`）× `principalAcl` 多主体权限模型，支持节点与边同步归档（`supersededAt`/`archivedAt` 根除旧事实诈尸）。
+  - 接入 Node 22 内置 `node:sqlite` FTS5 混合相关性召回，修复空查询绕过 `maxNodes` 缺陷，向模型与工作台返回完整关联边结构；同步沉淀 Vibe Coding / Antigravity / 武器包工程决策回 `domain_work` 平面。
+- [x] **P4.3 [AI] `SiliconIdentityCore` 硅基个体宪章与认知消化闭环**
+  - 废除 `src/agent/steward.ts:107` 禁止记助手自身回答的硬限制，建立 `SiliconCharter` 统一内核（贯穿 Web、微信、编码与双人空间）及 `EpistemicDigestionLoop`（判断假设 → 现实印证/证伪 → 沙盒 3 次转正 / 证伪立碑）。
+  - 赋予 `StewardLlmAgent` 与外部通道“忠诚但不盲从”的目标/承诺镜像提醒能力，避免在不同入口呈现割裂人格。
+- [x] **P4.4 [AI] 双人及多方关系半透认知膜、对称隐私口袋与流式联邦合龙**
+  - 落地 `CognitiveMembrane` 四条有界映射：`M1`（`owner_life`/`domain_work` → 去名词 `PartnerWeatherCapsule` 传入 `duo`）、`M2`（`pocket:M_private`/`pocket:W_private` 对称加密口袋 → 共鸣转正进共享池）、`M3`（共认星晶与微约定只读回链 `owner_life` 保护留白窗）、`M4`（去敏经验回流 `self_core`）。
+  - 打通 `bigfive-duo-site` 流式对话经由 `POST /amb/api/steward/duo/converse` 接入 Sugent 中枢（保留离线同构降级），并增加跨平面 Canary 金丝雀泄漏回归测试。
+- [x] **P4.5 [AI] 立体记忆星图可视化画布、全维度工作台与多平面无损 E2EE 同步**
+  - 在前端新增零第三方重依赖的交互式「立体记忆星图」视图（`#/atlas`：五平面切换、认知阶层级环、实线活跃边与虚线 `superseded` 更替链、半透膜跨平面连线、点击审视证据链与一键废止/立碑）。
+  - 补齐 `#/steward` 缺失的人脉/红线墓碑/群纪要/双人星晶卡片与内联对话投递栏，挂载 `concierge-drawer.js`，并增加「Sugent 心智日志」抽屉；修复 `p2-host-service.ts` + `e2ee-sync.ts` 保留 `skillGateStatus`/`edge.source`、修正单调 Lamport 时钟并纳入 `StewardshipLedger` 全量加密同步。
+
+**Wave P4 验收门禁（DoD）**：十大审计断点 100% 清零；微信/桌宠/Web/双人四端共享统一硅基自我认知且任意渠道均能沉淀立体图谱；半透膜 `PartnerWeatherCapsule` 经 Canary 压测 `0` 原文/项目/金额泄露；`SugentSIMStore` 与 `MemoryGardener` 真实闭环运行；前端 `#/atlas` 与 `#/steward` 可视化完整交互；`npm run typecheck`、全量 Vitest 与 `npm run verify:sugent` 全绿。
 
 ---
 

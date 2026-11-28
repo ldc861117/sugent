@@ -762,6 +762,7 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
       if (sub === "duo/crystallize" && m === "POST") {
         const b = await readJson(req);
         const result = await app.stewardService.duoCrystallizer.crystallizeAndSynthesize(b ?? {});
+        app.stewardService.syncDuoMembraneToAtlas(b?.spaceId);
         return send(res, 200, { ok: true, ...result });
       }
       if (seg[1] === "duo" && seg[2] === "crystals" && seg[4] === "review" && seg.length === 5 && m === "POST") {
@@ -778,6 +779,7 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
           action: b.action,
           ...(typeof b.supersedeCrystalId === "string" ? { supersedeCrystalId: b.supersedeCrystalId } : {}),
         });
+        app.stewardService.syncDuoMembraneToAtlas(b?.spaceId);
         return send(res, 200, {
           ok: true,
           crystal,
@@ -796,6 +798,7 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
           action: b.action,
           ...(typeof b.echoNote === "string" ? { echoNote: b.echoNote } : {}),
         });
+        app.stewardService.syncDuoMembraneToAtlas(b?.spaceId);
         return send(res, 200, {
           ok: true,
           commitment,
@@ -807,8 +810,8 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
         if (!Array.isArray(b?.messages) || b.messages.length === 0) {
           throw new HttpError(400, "messages array is required");
         }
-        const speaker = b.speaker === "W" ? "W" : "M";
-        const out = await app.stewardService.duoCrystallizer.converseAsDuoSteward({
+        const speaker: "M" | "W" = b.speaker === "W" ? "W" : "M";
+        const baseParams = {
           ...(typeof b.spaceId === "string" ? { spaceId: b.spaceId } : {}),
           speaker,
           messages: b.messages,
@@ -816,8 +819,71 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
           ...(typeof b.baselineContext === "string" ? { baselineContext: b.baselineContext } : {}),
           ...(typeof b.episodicContext === "string" ? { episodicContext: b.episodicContext } : {}),
           ...(typeof b.retrievedContext === "string" ? { retrievedContext: b.retrievedContext } : {}),
-        });
-        return send(res, 200, out);
+        };
+        const wantsSse = b.stream === true || String(req.headers.accept ?? "").includes("text/event-stream");
+        if (wantsSse) {
+          res.writeHead(200, { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache", connection: "keep-alive" });
+          const out = await app.stewardService.streamConverseDuoWithMembrane({
+            ...baseParams,
+            onDelta: (delta) => res.write(`data: ${JSON.stringify({ type: "delta", delta })}\n\n`),
+          });
+          res.write(`data: ${JSON.stringify({ type: "done", ...out })}\n\ndata: [DONE]\n\n`);
+          res.end();
+          return;
+        }
+        return send(res, 200, await app.stewardService.converseDuoWithMembrane(baseParams));
+      }
+      if (sub === "duo/pockets" && m === "GET") {
+        const spaceId = url.searchParams.get("spaceId") ?? undefined;
+        const viewer = url.searchParams.get("viewer") === "W" ? "W" : "M";
+        const targetOwner = url.searchParams.get("targetOwner");
+        const passphrase = url.searchParams.get("passphrase") ?? undefined;
+        try {
+          const notes = app.stewardService.duoCrystallizer.pockets.listPocketNotes({
+            spaceId,
+            viewer,
+            ...(targetOwner === "M" || targetOwner === "W" ? { targetOwner } : {}),
+            ...(passphrase ? { passphrase } : {}),
+          });
+          return send(res, 200, { ok: true, viewer, notes });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          throw new HttpError(msg.includes("MEMBRANE_PRINCIPAL_DENIED") ? 403 : 400, msg);
+        }
+      }
+      if (sub === "duo/pockets" && m === "POST") {
+        const b = await readJson(req);
+        const actor = b?.actor === "W" ? "W" : "M";
+        try {
+          if (b?.action === "promote") {
+            const promoted = app.stewardService.duoCrystallizer.pockets.promoteNoteToSharedCandidate({
+              ...(typeof b.spaceId === "string" ? { spaceId: b.spaceId } : {}),
+              actor,
+              noteId: String(b.noteId ?? ""),
+              title: String(b.title ?? ""),
+              summary: String(b.summary ?? ""),
+              ...(typeof b.topicKey === "string" ? { topicKey: b.topicKey } : {}),
+              duo: app.stewardService.duoCrystallizer,
+            });
+            app.stewardService.syncDuoMembraneToAtlas(b?.spaceId);
+            return send(res, 200, { ok: true, ...promoted });
+          }
+          if (b?.targetOwner && b.targetOwner !== actor) {
+            throw new HttpError(403, "MEMBRANE_PRINCIPAL_DENIED: Cross-partner pocket write forbidden");
+          }
+          const note = app.stewardService.duoCrystallizer.pockets.putPrivateNote({
+            ...(typeof b.spaceId === "string" ? { spaceId: b.spaceId } : {}),
+            actor,
+            content: String(b?.content ?? ""),
+            ...(typeof b?.topicHint === "string" ? { topicHint: b.topicHint } : {}),
+            ...(typeof b?.passphrase === "string" ? { passphrase: b.passphrase } : {}),
+          });
+          return send(res, 200, { ok: true, note });
+        } catch (err) {
+          if (err instanceof HttpError) throw err;
+          const msg = err instanceof Error ? err.message : String(err);
+          throw new HttpError(msg.includes("MEMBRANE_PRINCIPAL_DENIED") ? 403 : 400, msg);
+        }
       }
       if (sub === "duo/envoy-group" && m === "POST") {
         const b = await readJson(req);
@@ -846,6 +912,53 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
       }
       if (sub === "commitments" && m === "POST") {
         return send(res, 200, app.stewardService.mutateCommitment(await readJson(req)));
+      }
+      if (sub === "guardrails" && m === "POST") {
+        return send(res, 200, app.stewardService.mutateGuardrail(await readJson(req)));
+      }
+      if (sub === "relationships" && m === "POST") {
+        return send(res, 200, app.stewardService.mutateRelationship(await readJson(req)));
+      }
+      if (sub === "atlas" && m === "GET") {
+        const q = url.searchParams.get("q") ?? "";
+        const planesRaw = url.searchParams.get("planes") ?? "";
+        const planes = planesRaw ? planesRaw.split(",").map((s) => s.trim()).filter(Boolean) : undefined;
+        const maxN = Number(url.searchParams.get("maxNodes") ?? "20");
+        const includeSuperseded = url.searchParams.get("includeSuperseded") === "1";
+        const includeGraph = url.searchParams.get("includeGraph") === "1";
+        return send(
+          res,
+          200,
+          app.stewardService.queryAtlas({
+            q,
+            ...(planes?.length ? { planes } : {}),
+            ...(Number.isFinite(maxN) && maxN > 0 ? { maxNodes: maxN } : {}),
+            includeSuperseded,
+            includeGraph,
+          }),
+        );
+      }
+      if (sub === "atlas/mutate" && m === "POST") {
+        const b = await readJson(req);
+        if (b?.action !== "promote_stratum" && b?.action !== "supersede_node" && b?.action !== "tombstone_node") {
+          throw new HttpError(400, "action must be promote_stratum, supersede_node, or tombstone_node");
+        }
+        return send(res, 200, app.stewardService.mutateAtlasNode({ action: b.action, nodeId: String(b.nodeId ?? ""), ...(typeof b.reason === "string" ? { reason: b.reason } : {}) }));
+      }
+      if (sub === "mind-journal" && m === "GET") {
+        const limit = Number(url.searchParams.get("limit") ?? "30");
+        return send(res, 200, app.stewardService.getMindJournal(Number.isFinite(limit) && limit > 0 ? limit : 30));
+      }
+      if (sub === "mind-journal/reconcile" && m === "POST") {
+        const b = await readJson(req);
+        if (b?.outcome !== "confirmed" && b?.outcome !== "falsified") {
+          throw new HttpError(400, "outcome must be confirmed or falsified");
+        }
+        return send(res, 200, app.stewardService.reconcileMindJudgment(b));
+      }
+      if (sub === "gardener/run" && m === "POST") {
+        const b = await readJson(req);
+        return send(res, 200, { ok: true, gardener: app.stewardService.runGardener(b ?? {}), workbench: app.stewardService.getWorkbench(domain) });
       }
       if (sub === "cadence/scan" && m === "POST") {
         return send(res, 200, app.stewardService.scanCadence(await readJson(req)));

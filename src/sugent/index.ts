@@ -72,5 +72,9 @@ export * from "./wechat-envoy-sidecar.js";
 export * from "./group-chat-scribe.js";
 export * from "./airtoken-ops-bridge.js";
 export * from "./duo-steward-crystallizer.js";
+export * from "./post-turn-digester.js";
+export * from "./stereoscopic-atlas.js";
+export * from "./silicon-identity-core.js";
+export * from "./cognitive-membrane.js";
 
 

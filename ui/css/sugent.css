@@ -424,4 +424,239 @@
     color: var(--fg-2);
     cursor: pointer;
   }
+
+  .sg-head-actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-2);
+  }
+}
+@layer app {
+  .sg-atlas-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-3);
+  }
+
+  .sg-atlas-pills {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-1-5);
+  }
+
+  .sg-atlas-controls {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-2-5);
+    flex: 1;
+    justify-content: flex-end;
+  }
+
+  .sg-atlas-search {
+    max-width: 280px;
+    min-width: 180px;
+  }
+
+  .sg-atlas-layout {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 320px;
+    gap: var(--space-4);
+    align-items: start;
+  }
+
+  @media (max-width: 960px) {
+    .sg-atlas-layout {
+      grid-template-columns: minmax(0, 1fr);
+    }
+  }
+
+  .sg-atlas-stage {
+    background: var(--well);
+    border-radius: var(--r-well);
+    padding: var(--card-pad);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+  }
+
+  .sg-atlas-svg {
+    width: 100%;
+    height: auto;
+    display: block;
+    background: var(--surface);
+    border-radius: var(--r-lg);
+  }
+
+  .sg-atlas-orbit {
+    fill: none;
+    stroke: var(--line);
+    stroke-width: 1;
+    stroke-dasharray: 4 4;
+  }
+
+  .sg-atlas-sector-label {
+    fill: var(--muted);
+    font-size: var(--fs-2xs);
+    font-weight: var(--fw-semibold);
+    pointer-events: none;
+  }
+
+  .sg-atlas-edge-active {
+    stroke: var(--accent-line);
+    stroke-width: 1.5;
+  }
+
+  .sg-atlas-edge-superseded {
+    stroke: var(--faint);
+    stroke-width: 1;
+    stroke-dasharray: 3 4;
+    opacity: 0.7;
+  }
+
+  .sg-atlas-edge-membrane {
+    stroke: var(--amber);
+    stroke-width: 1.75;
+    stroke-dasharray: 6 3;
+  }
+
+  .sg-atlas-node {
+    cursor: pointer;
+  }
+
+  .sg-atlas-node circle {
+    fill: var(--surface-solid);
+    stroke: var(--accent);
+    stroke-width: 2;
+    transition: fill var(--t-fast), stroke var(--t-fast), transform var(--t-fast);
+  }
+
+  .sg-atlas-node.s3 circle {
+    fill: var(--accent-solid);
+  }
+
+  .sg-atlas-node.superseded circle {
+    fill: var(--well);
+    stroke: var(--faint);
+  }
+
+  .sg-atlas-node.sel circle {
+    fill: var(--accent);
+    stroke: var(--fg);
+    stroke-width: 2.5;
+  }
+
+  .sg-atlas-label {
+    fill: var(--fg-2);
+    font-size: var(--fs-2xs);
+    pointer-events: none;
+  }
+
+  .sg-atlas-legend {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-3);
+    font-size: var(--fs-xs);
+    color: var(--muted);
+  }
+
+  .sg-atlas-legend-item {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-1-5);
+  }
+
+  .sg-atlas-swatch-active {
+    width: 16px;
+    height: 2px;
+    background: var(--accent);
+  }
+
+  .sg-atlas-swatch-superseded {
+    width: 16px;
+    border-top: 1px dashed var(--faint);
+  }
+
+  .sg-atlas-swatch-membrane {
+    width: 16px;
+    border-top: 1px dashed var(--amber);   /* 描边：半透膜图例线条 */
+  }
+
+  .sg-atlas-meta-row {
+    display: flex;
+    justify-content: space-between;
+    gap: var(--space-2);
+    padding: var(--space-1-5) 0;
+    border-top: var(--hairline) solid var(--line-2);
+    font-size: var(--fs-xs);
+  }
+
+  .sg-atlas-meta-row:first-of-type {
+    border-top: 0;
+  }
+
+  dialog.sg-mind-dialog {
+    margin: auto;
+    padding: var(--sheet-pad);
+    border: var(--hairline) solid var(--glass-edge);   /* 描边：浮层玻璃的细边 */
+    border-radius: var(--r-pane);
+    background: var(--grain), var(--glass-sheet);
+    backdrop-filter: var(--glass-filter-lg);
+    box-shadow: var(--shadow-pop);
+    color: var(--fg);
+    width: min(640px, calc(100% - 2 * var(--float-inset)));
+    max-height: calc(100vh - 2 * var(--float-inset));
+    overflow: hidden;
+    gap: var(--space-3);
+  }
+
+  dialog.sg-mind-dialog[open] {
+    display: flex;
+    flex-direction: column;
+  }
+
+  dialog.sg-mind-dialog:modal {
+    overscroll-behavior: contain;
+  }
+
+  dialog.sg-mind-dialog::backdrop {
+    overflow: hidden;
+    overscroll-behavior: contain;
+    background: var(--scrim);
+  }
+
+  .sg-mind-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: var(--space-3);
+  }
+
+  .sg-mind-title {
+    font-size: var(--fs-xl);
+    font-weight: var(--fw-semibold);
+    letter-spacing: var(--tracking-tight);
+    color: var(--fg);
+  }
+
+  .sg-mind-meta {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-2);
+  }
+
+  .sg-mind-body {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2-5);
+  }
 }

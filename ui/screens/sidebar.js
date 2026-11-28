@@ -59,7 +59,7 @@ function LowBalance({ account }) {
   </a>`;
 }
 
-export function Sidebar({ bots, botsError, reloadBots, selectedId, view, previews, pending, working, needs = { n: 0, bots: {} }, username, account, onNew, onSelect, onNeeds, onSteward, onStudio, onDeleted, onOpenSettings, onBotSettings, onGuide }) {
+export function Sidebar({ bots, botsError, reloadBots, selectedId, view, previews, pending, working, needs = { n: 0, bots: {} }, username, account, onNew, onSelect, onNeeds, onSteward, onAtlas, onStudio, onDeleted, onOpenSettings, onBotSettings, onGuide }) {
   const studio = useAvatarStudio(false);
   const [q, setQ] = useState("");
   const [ctx, setCtx] = useState(null); // 行的操作菜单：右键 { bot, x, y }，或者"更多"按钮 { bot, el }
@@ -146,6 +146,9 @@ export function Sidebar({ bots, botsError, reloadBots, selectedId, view, preview
         </button>
         <button type="button" class=${`nav-item${view === "steward" ? " sel" : ""}`} onClick=${onSteward}>
           <${Icon} name="pulse" size="md" /><span>${t("steward.nav.hub")}</span>
+        </button>
+        <button type="button" class=${`nav-item${view === "atlas" ? " sel" : ""}`} onClick=${onAtlas}>
+          <${Icon} name="globe" size="md" /><span>${t("steward.nav.atlas")}</span>
         </button>
         <button type="button" class=${`nav-item${view === "studio" ? " sel" : ""}`} onClick=${onStudio}>
           <${Icon} name="palette" size="md" /><span>${t("steward.nav.studio")}</span>

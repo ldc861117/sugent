@@ -892,4 +892,54 @@ export class StewardshipLedger {
       ...(budgetStatus ? { budgetStatus } : {}),
     };
   }
+
+  /** 导出供 E2EE 跨端同步的脱敏快照（剥离与本机 OS 绑定的本地路径）。 */
+  exportSnapshotForSync(): LedgerSnapshot {
+    const snap = this.snapshotForCaller("owner_private");
+    return {
+      ...snap,
+      resources: snap.resources.map((r) => {
+        const { localUriOrPath: _strip, ...rest } = r;
+        return { ...rest, metadata: { ...rest.metadata } };
+      }),
+    };
+  }
+
+  /** 合并远端同步来的五维生命账本快照并原子落盘，同步增量至知识图谱。 */
+  mergeRemoteSnapshot(remote: LedgerSnapshot, nowIso = new Date().toISOString()): { merged: boolean } {
+    if (!remote || remote.version !== 1) return { merged: false };
+    const ts = (x: { updatedAt?: string; createdAt?: string; lastProgressAt?: string }): string =>
+      String(x.updatedAt ?? x.createdAt ?? x.lastProgressAt ?? "");
+    const mergeMap = <T extends { id: string }>(map: Map<string, T>, list: readonly T[] | undefined, cloneFn: (v: T) => T): void => {
+      for (const item of list ?? []) {
+        if (!item?.id) continue;
+        const cur = map.get(item.id);
+        if (!cur || ts(item as Record<string, string>) >= ts(cur as Record<string, string>)) {
+          map.set(item.id, cloneFn(item));
+        }
+      }
+    };
+    mergeMap(this.relationships, remote.relationships, cloneRelationship);
+    mergeMap(this.goals, remote.goals, (g) => ({ ...g }));
+    mergeMap(this.guardrails, remote.guardrails, (v) => ({ ...v }));
+    mergeMap(this.commitments, remote.commitments, (c) => ({ ...c }));
+    for (const r of remote.resources ?? []) {
+      if (!r?.id) continue;
+      const cur = this.resources.get(r.id);
+      if (!cur) this.resources.set(r.id, { ...r, metadata: { ...r.metadata } });
+    }
+    const activeGoals = Array.from(this.goals.values()).filter((g) => g.status === "active").sort((a, b) => b.lastProgressAt.localeCompare(a.lastProgressAt));
+    for (const extra of activeGoals.slice(MAX_ACTIVE_GOALS)) {
+      this.goals.set(extra.id, { ...extra, status: "paused" });
+    }
+    const delta: KGDelta = { nodes: [], edges: [] };
+    for (const r of this.relationships.values()) {
+      const d = this.buildRelationshipDelta(r);
+      delta.nodes!.push(...(d.nodes ?? []));
+      delta.edges!.push(...(d.edges ?? []));
+    }
+    for (const g of this.goals.values()) this.appendGoalDelta(delta, g, false);
+    this.persist(nowIso, { op: "merge_remote_snapshot", remoteUpdatedAt: remote.updatedAt }, delta);
+    return { merged: true };
+  }
 }

@@ -11,7 +11,9 @@ import { BotSettingsScreen } from "./screens/bot-settings.js";
 import { NewBotScreen } from "./screens/new-bot.js";
 import { NeedsYouScreen } from "./screens/needs-you.js";
 import { BotAvatar, MAIN_CHAR, charOf, useAvatarStudio } from "./components/avatar.js";
+import "./components/concierge-drawer.js";
 import { StewardHubScreen, CoolingUndoBanner } from "./components/jarvis-workbench.js";
+import { MemoryAtlasScreen } from "./components/memory-atlas-view.js";
 import { AvatarStudioScreen } from "./components/avatar-studio.js";
 import { Onboarding } from "./screens/onboarding.js";
 import { CoachMark } from "./components/guide.js";
@@ -29,6 +31,7 @@ function parseHash() {
   if (kind === "settings") return { view: "settings", tab: TABS.some(([t]) => t === a) ? a : "general", row: b || "" };
   if (kind === "bot" && a && b === "settings") return { view: "bot-settings", botId: a, section: c || "" };
   if (kind === "steward") return { view: "steward" };
+  if (kind === "atlas") return { view: "atlas" };
   if (kind === "studio") return { view: "studio" };
   if (kind === "new") return { view: "new" };
   if (kind === "needs") return { view: "needs" };
@@ -289,6 +292,7 @@ function App() {
   };
   const openNeeds = () => go("/needs");
   const openSteward = () => go("/steward");
+  const openAtlas = () => go("/atlas");
   const openStudio = () => go("/studio");
   useEffect(() => {
     window.__openSugentJarvisWorkbench = () => go("/steward");
@@ -355,6 +359,9 @@ function App() {
       } else if (mod(e) && e.key.toLowerCase() === "j") {
         e.preventDefault();
         route.view === "steward" ? openChat() : openSteward();
+      } else if (mod(e) && e.shiftKey && e.key.toLowerCase() === "m") {
+        e.preventDefault();
+        route.view === "atlas" ? openSteward() : openAtlas();
       } else if (mod(e) && !e.shiftKey && e.key.toLowerCase() === "n") {
         e.preventDefault();
         newBot();
@@ -362,7 +369,7 @@ function App() {
         const t = e.target;
         const typing = t && (t.tagName === "TEXTAREA" || t.tagName === "INPUT");
         if (route.view === "bot-settings" && !typing) openChat(route.botId);
-        else if ((route.view === "steward" || route.view === "studio") && !typing) openChat();
+        else if ((route.view === "steward" || route.view === "atlas" || route.view === "studio") && !typing) openChat();
         else if (route.view === "new" && !typing && bots && bots.length) openChat();
         else if (route.view === "settings" && !typing) openChat();
         else if (route.view === "needs" && !typing) openChat();
@@ -377,6 +384,7 @@ function App() {
   const setLang = (l) => changeLang(l).then(() => toast(t("common.saved"))).catch(failed);
   const commands = [
     { label: t("steward.cmd.hub"), kbd: isMac ? "⌘J" : "Ctrl+J", keys: t("steward.cmd.hubKeys"), run: openSteward },
+    { label: t("steward.cmd.atlas"), kbd: isMac ? "⌘⇧M" : "Ctrl+Shift+M", keys: t("steward.cmd.atlasKeys"), run: openAtlas },
     { label: t("steward.cmd.studio"), keys: t("steward.cmd.studioKeys"), run: openStudio },
     { label: t("app.cmd.settings"), kbd: isMac ? "⌘," : "Ctrl+,", keys: t("app.cmd.settingsKeys"), run: () => openSettings() },
     { label: t("app.cmd.newBot"), kbd: isMac ? "⌘N" : "Ctrl+N", keys: t("app.cmd.newBotKeys"), run: newBot },
@@ -418,7 +426,7 @@ function App() {
   const routedBot = view === "bot-settings" && bots ? bots.find((b) => b.id === route.botId) : null;
   // 环境光的色相跟着当前机器人角色的主色（主助手与管家/工坊视图跟随形象工坊当前皮肤）
   const auraBot = view === "chat" ? bot : view === "bot-settings" ? routedBot : null;
-  const useStudioHue = view === "steward" || view === "studio" || (auraBot && auraBot.id === "default");
+  const useStudioHue = view === "steward" || view === "atlas" || view === "studio" || (auraBot && auraBot.id === "default");
   const auraHue = (useStudioHue && studio?.activePack?.auraHue) || (auraBot && AURA_HUE[charOf(auraBot)]) || 84;
   return html`<div class=${`app${panelBot ? " with-panel" : ""}`} ref=${appRef} style=${{ "--aura-hue": String(auraHue) }}>
     ${view === "settings"
@@ -426,13 +434,14 @@ function App() {
           username=${status && status.username} account=${managed ? account : null} />`
       : html`<${Sidebar} bots=${bots} botsError=${botsErr} reloadBots=${reloadBots} selectedId=${bot && bot.id} view=${view === "chat" && bots && !bots.length ? "new" : view}
           previews=${previews} pending=${pending} working=${working} needs=${needs} username=${status && status.username} account=${managed ? account : null}
-          onNew=${newBot} onSelect=${openChat} onNeeds=${openNeeds} onSteward=${openSteward} onStudio=${openStudio} onDeleted=${onDeleted} onOpenSettings=${(tab) => openSettings(tab)} onBotSettings=${openBotSettings} onGuide=${startGuide} />`}
+          onNew=${newBot} onSelect=${openChat} onNeeds=${openNeeds} onSteward=${openSteward} onAtlas=${openAtlas} onStudio=${openStudio} onDeleted=${onDeleted} onOpenSettings=${(tab) => openSettings(tab)} onBotSettings=${openBotSettings} onGuide=${startGuide} />`}
     <${Splitter} class="split-side" size="--side-w" label=${t("app.resizeSide")} value=${sideW} room=${room("--panel-track")} onCommit=${(v) => setPrefs({ sideW: v })} />
     <main class="main">
       ${view === "chat" && bot && html`<${ChatScreen} key=${bot.id} bot=${bot} models=${models} modelsError=${modelsError} reloadModels=${reloadModels}
         defaultModel=${settings && settings.defaultModel} infoOpen=${infoOpen} onToggleInfo=${() => setInfoOpen((v) => !v)}
         onWorking=${onWorking} pending=${pending[bot.id] || 0} serverBusy=${!!agentWorking[bot.id]} onOpenSettings=${openSettings} onOpenBotSettings=${openBotSettings} onBotUpdated=${onBotUpdated} />`}
       ${view === "steward" && html`<${StewardHubScreen} />`}
+      ${view === "atlas" && html`<${MemoryAtlasScreen} />`}
       ${view === "studio" && html`<${AvatarStudioScreen} />`}
       ${(view === "new" || (view === "chat" && bots && !bots.length)) && html`<${NewBotScreen} first=${!!bots && !bots.length}
         onCreated=${(b) => { reloadBots(); openChat(b.id); }} onCancel=${bots && bots.length ? () => openChat() : null} />`}

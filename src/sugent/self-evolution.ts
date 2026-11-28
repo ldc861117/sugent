@@ -281,6 +281,7 @@ export function ensureSelfEvolutionOverlay(dataDir: string, appRoot = findAppRoo
     );
   }
   installSelfDevSkill(path.join(overlayDir, "skills"));
+  mirrorSkillsToDshDir(path.join(overlayDir, "skills"), path.join(overlayDir, ".dsh", "skills"));
 
   // Never expose a writable source-repo symlink from the packaged workspace.
   const linkPath = path.join(overlayDir, "source-repo");
@@ -709,6 +710,23 @@ description: Autonomous Skills and compatible plugin extensions, full-source sel
 3. **原子提交与远端同步**：通过后可执行 \`git commit\` 与 \`git push origin main\`。
 `;
 
+function mirrorSkillsToDshDir(skillsRootDir: string, dshSkillsDir: string): void {
+  if (!fs.existsSync(skillsRootDir)) return;
+  fs.mkdirSync(dshSkillsDir, { recursive: true, mode: 0o700 });
+  for (const entry of fs.readdirSync(skillsRootDir, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const srcSkill = path.join(skillsRootDir, entry.name, "SKILL.md");
+    if (!fs.existsSync(srcSkill)) continue;
+    const destDir = path.join(dshSkillsDir, entry.name);
+    fs.mkdirSync(destDir, { recursive: true, mode: 0o700 });
+    const destSkill = path.join(destDir, "SKILL.md");
+    const content = fs.readFileSync(srcSkill, "utf8");
+    if (!fs.existsSync(destSkill) || fs.readFileSync(destSkill, "utf8") !== content) {
+      fs.writeFileSync(destSkill, content, { mode: 0o600 });
+    }
+  }
+}
+
 /**
  * 将 `sugent-self-dev` 技能写入指定技能目录，使智能体开机即具备自我迭代 SOP
  */
@@ -717,6 +735,12 @@ export function installSelfDevSkill(skillsRootDir: string): string {
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   const file = path.join(dir, "SKILL.md");
   fs.writeFileSync(file, SUGENT_SELF_DEV_SKILL, { mode: 0o600 });
+  const parentDir = path.dirname(path.resolve(skillsRootDir));
+  if (path.basename(path.resolve(skillsRootDir)) === "skills" && path.basename(parentDir) === "extensions") {
+    const mirrorDir = path.join(parentDir, ".dsh", "skills", "sugent-self-dev");
+    fs.mkdirSync(mirrorDir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(mirrorDir, "SKILL.md"), SUGENT_SELF_DEV_SKILL, { mode: 0o600 });
+  }
   return file;
 }
 

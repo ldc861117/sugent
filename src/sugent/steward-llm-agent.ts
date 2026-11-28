@@ -38,6 +38,7 @@ import type {
 import type { ChatHistoryRecallResult, RecallChatHistoryInput } from "./chat-transcript-recall.js";
 import type { EdgeNodeStatus, EdgeQueuedCommand } from "./edge-tentacle-hub.js";
 import type { AirTokenOpsToolInput } from "./airtoken-ops-bridge.js";
+import { buildSiliconCharterPrompt } from "./silicon-identity-core.js";
 
 export interface StewardLlmEndpoint {
   baseUrl: string;
@@ -64,7 +65,11 @@ export interface StewardLlmToolsPort<TWorkbench extends StewardWorkbenchLike = S
   getWorkbench(callerDomain?: CallerAccessDomain): TWorkbench;
   queryLedger(query: string, callerDomain: CallerAccessDomain): ReturnType<StewardshipLedger["queryContext"]>;
   findArchiveResources(query: string, callerDomain: CallerAccessDomain): ResourceEntry[];
-  recallKnowledgeSubgraph?(query: string): Array<{ name: string; kind: string; summary: string }>;
+  recallKnowledgeSubgraph?(
+    query: string,
+  ):
+    | Array<{ name: string; kind: string; summary: string }>
+    | { nodes: Array<{ name: string; kind: string; summary: string }>; edges: string[] };
   upsertArchiveResource(input: { partition: ContextPartition; title: string; dueAt?: string; filePaths?: string[] }): ResourceEntry[];
   mutateCommitment(input: {
     action: "upsert" | "status";
@@ -596,8 +601,18 @@ function buildSystemPrompt(wb: StewardWorkbenchLike): string {
   const capBlock = wb.capabilities
     ? formatCapabilityAwarenessPrompt(wb.capabilities, wb.vibeCoding?.bindings ?? [])
     : "";
+  const charterBlock = buildSiliconCharterPrompt({
+    surface: "steward_hub",
+    activeGoals: wb.ledger.goals.filter((g) => g.status === "active").map((g) => ({ title: g.title, northStarCriterion: g.northStarCriterion })),
+    openCommitments: wb.ledger.commitments.filter((c) => c.status === "open" || c.status === "waiting_review").slice(0, 6),
+    duoProtectedWindows: wb.duoAnchors?.map((a) => `${a.title}: ${a.detail}`),
+    calibratedLessons: wb.mindJournal?.calibratedLessons,
+    loyalDissentSignal: wb.loyalDissent ?? null,
+  });
 
   return [
+    charterBlock,
+    "",
     "你是常驻云端的主权顶层管家与生命幕僚（Sugent），围着主人本人生长；微信与网页端都只是连接你这颗唯一大脑的零折损触手。",
     "表达准则：全程用自然、简练、像真人助理聊天的中文直接回应（说人话）。绝对禁止暴露任何内部实现术语或代号（如 Epoch、T0/T1/T2、L0/L1/L3、superseded、CASCADE_RUN_STATUS、tool_calls、JSON 字段名）。隐私档位统一说“私密（仅本机）/ 脱敏摘要 / 深度协同”。",
     "跨天全渠道记忆铁律：当主人询问“昨天我们聊了什么”、“上次提过的某件事”、“前几天讨论的方案”等历史对话时，必须第一时间调用 recall_chat_history 检索微信与网页端真实历史对话记录，绝不可声称“日常对话不会跨天存留”。",
@@ -712,8 +727,10 @@ export class StewardLlmAgent<TWorkbench extends StewardWorkbenchLike = StewardWo
       const q = String(args.query ?? "");
       const ctx = p.queryLedger(q, domain);
       const archives = p.findArchiveResources(q, domain);
-      const kg = domain === "owner_private" ? p.recallKnowledgeSubgraph?.(q) ?? [] : [];
-      return { ok: true, goals: ctx.goals, commitments: ctx.commitments, guardrails: ctx.guardrails, relationships: ctx.relationships, archives, kg };
+      const kgRaw = domain === "owner_private" ? p.recallKnowledgeSubgraph?.(q) : undefined;
+      const kg = Array.isArray(kgRaw) ? kgRaw : kgRaw?.nodes ?? [];
+      const kgEdges = Array.isArray(kgRaw) ? [] : kgRaw?.edges ?? [];
+      return { ok: true, goals: ctx.goals, commitments: ctx.commitments, guardrails: ctx.guardrails, relationships: ctx.relationships, archives, kg, ...(kgEdges.length > 0 ? { kgEdges } : {}) };
     }
     if (name === "capture_note_or_todo") {
       const text = String(args.text ?? "").trim();

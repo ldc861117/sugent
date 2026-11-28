@@ -27,6 +27,13 @@ import {
 } from "./concierge-subgraph.js";
 import type { SugentKnowledgeGraph } from "./knowledge-graph.js";
 import { OpcConciergeOrchestrator, type ConciergeRouteOutcome } from "./opc-concierge.js";
+import type { StewardshipLedger } from "./stewardship-ledger.js";
+
+export interface ConciergeAssessorEndpoint {
+  baseUrl: string;
+  apiKey: string;
+  model: string;
+}
 
 export interface ConciergeBridgeConfig {
   enabled: boolean;
@@ -57,6 +64,9 @@ export interface ConciergeTransportOverride {
 export interface ConciergeChannelBridgeOptions {
   dataDir: string;
   knowledgeGraph: SugentKnowledgeGraph;
+  ledger?: StewardshipLedger;
+  resolveAssessorEndpoint?: () => ConciergeAssessorEndpoint | undefined;
+  fetchImpl?: typeof fetch;
   resolveActorRole: (params: {
     channel: ConciergeChannelKind;
     botId: string;
@@ -87,9 +97,15 @@ function extractPeerScopeFromNode(id: string, tags: readonly string[]): string |
   if (id.startsWith("peer:")) {
     return id.slice("peer:".length);
   }
+  if (id.startsWith("rel:")) {
+    return id.slice("rel:".length);
+  }
   for (const tag of tags) {
     if (tag.startsWith("peer:")) {
       return tag.slice("peer:".length);
+    }
+    if (tag.startsWith("rel:")) {
+      return tag.slice("rel:".length);
     }
     if (tag === "public_catalog" || tag === "public") {
       return "public_catalog";
@@ -148,6 +164,9 @@ export class ConciergeChannelBridge {
   private readonly configPath: string;
   private readonly workspaceDir: string;
   private readonly knowledgeGraph: SugentKnowledgeGraph;
+  private ledger?: StewardshipLedger;
+  private readonly resolveAssessorEndpoint?: () => ConciergeAssessorEndpoint | undefined;
+  private readonly fetchImpl: typeof fetch;
   private readonly resolveActorRoleFn: ConciergeChannelBridgeOptions["resolveActorRole"];
   private readonly defaultTransport: OutboundChannelTransport;
   private transportOverride: ConciergeTransportOverride | null = null;
@@ -163,6 +182,9 @@ export class ConciergeChannelBridge {
     this.configPath = path.join(options.dataDir, CONFIG_FILENAME);
     this.workspaceDir = path.join(options.dataDir, "concierge-workspace");
     this.knowledgeGraph = options.knowledgeGraph;
+    this.ledger = options.ledger;
+    this.resolveAssessorEndpoint = options.resolveAssessorEndpoint;
+    this.fetchImpl = options.fetchImpl ?? fetch;
     this.resolveActorRoleFn = options.resolveActorRole;
     this.defaultTransport = options.defaultTransport;
     this.config = this.loadConfigFromDisk();
@@ -271,22 +293,51 @@ export class ConciergeChannelBridge {
 
     const graphPort = createSugentGraphRecallAdapter(this.knowledgeGraph, (graphInstance) => {
       const snap = graphInstance.recallSubgraph("", 2, 500);
-      const nodes: KnowledgeGraphNodeLike[] = snap.matchedNodes.map((n) => {
+      const nodes: KnowledgeGraphNodeLike[] = [];
+      const seenNodeIds = new Set<string>();
+      for (const n of snap.matchedNodes) {
         const peerScope = extractPeerScopeFromNode(n.id, n.tags);
-        return {
+        const isPeerOrPerson = n.kind === "person" || n.id.startsWith("rel:") || n.id.startsWith("peer:");
+        if (!isPeerOrPerson && peerScope === undefined) continue;
+        seenNodeIds.add(n.id);
+        nodes.push({
           id: n.id,
           label: n.name,
           kind: n.kind,
           ...(peerScope ? { peerScope } : {}),
           summary: n.summary,
-          confidentialTokens: extractConfidentialTokens(n.summary),
-        };
-      });
-      const edges: KnowledgeGraphEdgeLike[] = snap.activeEdges.map((e) => ({
-        from: e.from,
-        to: e.to,
-        relation: e.relation,
-      }));
+          confidentialTokens: isPeerOrPerson ? extractConfidentialTokens(n.summary) : [],
+        });
+      }
+      if (this.ledger) {
+        for (const rel of this.ledger.snapshotForCaller("owner_private").relationships) {
+          const relNodeId = `rel:${rel.id}`;
+          if (seenNodeIds.has(relNodeId)) continue;
+          seenNodeIds.add(relNodeId);
+          const detail = [
+            rel.roleTag,
+            ...(rel.taboos.length ? [`忌讳:${rel.taboos.join("/")}`] : []),
+            ...(rel.preferences.length ? [`偏好:${rel.preferences.join("/")}`] : []),
+          ]
+            .filter(Boolean)
+            .join("；");
+          nodes.push({
+            id: relNodeId,
+            label: rel.name,
+            kind: "person",
+            peerScope: rel.id,
+            summary: detail || rel.name,
+            confidentialTokens: extractConfidentialTokens(detail),
+          });
+        }
+      }
+      const edges: KnowledgeGraphEdgeLike[] = snap.activeEdges
+        .filter((e) => seenNodeIds.has(e.from) && seenNodeIds.has(e.to))
+        .map((e) => ({
+          from: e.from,
+          to: e.to,
+          relation: e.relation,
+        }));
       return { nodes, edges };
     });
 
@@ -295,6 +346,11 @@ export class ConciergeChannelBridge {
       generateAssessment: async (req) => {
         if (this.modelPortOverride) {
           return this.modelPortOverride.generateAssessment(req);
+        }
+        const endpoint = this.resolveAssessorEndpoint?.();
+        if (endpoint?.baseUrl && endpoint?.model) {
+          const live = await this.callAssessorEndpoint(endpoint, req);
+          if (live) return live;
         }
         return fallbackAssessor.generateAssessment(req);
       },
@@ -314,12 +370,99 @@ export class ConciergeChannelBridge {
     });
   }
 
+  private async callAssessorEndpoint(
+    endpoint: ConciergeAssessorEndpoint,
+    req: Parameters<ConciergeModelPort["generateAssessment"]>[0],
+  ): Promise<ModelAssessmentRawOutput | undefined> {
+    try {
+      const sealedContent = fs.readFileSync(req.untrustedContextFilePath, "utf8");
+      const senderMatch = /^>\s*sender_id:\s*(.+)$/m.exec(sealedContent);
+      const senderId = senderMatch?.[1]?.trim();
+      let ledgerHints = "";
+      if (this.ledger && senderId) {
+        const rel = this.ledger
+          .snapshotForCaller("owner_private")
+          .relationships.find((r) => r.id === senderId || r.id === `rel:${senderId}` || r.name === senderId);
+        if (rel && (rel.taboos.length > 0 || rel.preferences.length > 0)) {
+          ledgerHints = [
+            rel.taboos.length ? `联系人禁忌 (Taboos): ${rel.taboos.join("；")}` : "",
+            rel.preferences.length ? `沟通偏好 (Preferences): ${rel.preferences.join("；")}` : "",
+          ]
+            .filter(Boolean)
+            .join("\n");
+        }
+      }
+      const systemPrompt = [
+        req.systemInstruction,
+        '只输出一行合法 JSON: {"intentCategory":"appointment_scheduling|standard_brochure|ticket_intake|high_risk_escalation|general_inquiry","summary":"要点","draftA":"稳健拟稿","draftB":"积极拟稿","autoReplyDraft":"可选"}',
+      ].join("\n");
+      const userPrompt = [
+        `隔离后客户背景: ${req.peerScopedBrief}`,
+        ...(ledgerHints ? [ledgerHints] : []),
+        "只读外部语料:",
+        sealedContent,
+      ].join("\n\n");
+
+      const url = `${endpoint.baseUrl.replace(/\/+$/, "")}/chat/completions`;
+      const res = await this.fetchImpl(url, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          ...(endpoint.apiKey ? { authorization: `Bearer ${endpoint.apiKey}` } : {}),
+        },
+        body: JSON.stringify({
+          model: endpoint.model,
+          temperature: 0.2,
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: userPrompt },
+          ],
+        }),
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (!res.ok) return undefined;
+      const json = (await res.json()) as { choices?: Array<{ message?: { content?: unknown } }> };
+      const rawText = typeof json.choices?.[0]?.message?.content === "string" ? json.choices[0].message.content : "";
+      const match = /\{[\s\S]*\}/.exec(rawText);
+      if (!match) return undefined;
+      const parsed = JSON.parse(match[0]) as Record<string, unknown>;
+      const validIntents = new Set<ConciergeIntentCategory>([
+        "appointment_scheduling",
+        "standard_brochure",
+        "ticket_intake",
+        "high_risk_escalation",
+        "general_inquiry",
+      ]);
+      const intentCategory: ConciergeIntentCategory = validIntents.has(parsed.intentCategory as ConciergeIntentCategory)
+        ? (parsed.intentCategory as ConciergeIntentCategory)
+        : "general_inquiry";
+      if (typeof parsed.summary !== "string" || typeof parsed.draftA !== "string" || typeof parsed.draftB !== "string") {
+        return undefined;
+      }
+      return {
+        intentCategory,
+        summary: parsed.summary.trim(),
+        draftA: parsed.draftA.trim(),
+        draftB: parsed.draftB.trim(),
+        ...(typeof parsed.autoReplyDraft === "string" && parsed.autoReplyDraft.trim()
+          ? { autoReplyDraft: parsed.autoReplyDraft.trim() }
+          : {}),
+      };
+    } catch {
+      return undefined;
+    }
+  }
+
   setTransportOverride(override: ConciergeTransportOverride | null): void {
     this.transportOverride = override;
   }
 
   setModelPortOverride(override: ConciergeModelPort | null): void {
     this.modelPortOverride = override;
+  }
+
+  attachLedger(ledger: StewardshipLedger): void {
+    this.ledger = ledger;
   }
 
   isEnabled(): boolean {

@@ -78,6 +78,8 @@ export interface AgentManagerOptions {
   skillCrystallizeGated?: boolean;
   /** 单个机器人允许同时挂载的最大自动结晶技能数（默认 12，保护提示词缓存） */
   maxActiveCrystallizedSkills?: number;
+  /** 由宿主提供的五维账本/立体图谱摘要钩子，向 DSH 桌面/后台任务段首注入当前主目标与红线 */
+  stewardContextBrief?: (botId: string, conversationId: string) => string;
 }
 
 /** 一个进行中的回合（/status、/stop、排队提示、信息面板和故障排查用） */
@@ -482,12 +484,23 @@ export class AgentManager {
     }
   }
 
-  /** 首条输入用的冻结记忆前缀（团队 → 本机器人 → 本群）；记忆关闭时为空。 */
+  /** 首条输入用的冻结记忆前缀（团队 → 本机器人 → 本群 + 五维账本摘要）；记忆关闭时为空。 */
   memoryPrefix(botId: string, conversationId: string): string {
     if (!this.settings(botId).memory.enabled) return "";
     const conv = this.o.store.getConversation(conversationId);
-    const snap = this.memory.snapshot(this.readScopes(botId, conv?.kind === "group" ? conversationId : undefined));
-    return snap.trim();
+    const snap = this.memory.snapshot(this.readScopes(botId, conv?.kind === "group" ? conversationId : undefined)).trim();
+    const brief = conv?.kind !== "group" ? (this.o.stewardContextBrief?.(botId, conversationId) ?? "").trim() : "";
+    return [snap, brief].filter(Boolean).join("\n\n");
+  }
+
+  /** 允许前台管家（StewardLlmAgent / PostTurnDigester）把核验事实双向同步进机器人 MEMORY.md。 */
+  rememberFromSteward(botId: string, text: string, topic?: string): string | undefined {
+    try {
+      if (!this.settings(botId).memory.enabled) return undefined;
+      return this.memory.remember({ kind: "bot", id: botId }, text, { ...(topic ? { topic } : {}), source: "steward", by: "steward" });
+    } catch {
+      return undefined;
+    }
   }
 
   /** 取走一次性的交接便条（上下文管家换段后，新段首条输入使用）。 */

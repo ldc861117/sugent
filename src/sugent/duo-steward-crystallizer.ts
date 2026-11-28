@@ -17,6 +17,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { looksSecret } from "../agent/memory.js";
+import { SymmetricPrivatePocketVault } from "./cognitive-membrane.js";
 import { resolveSugentGatewayConfig, selectModelForRole } from "./gateway.js";
 import { SugentKnowledgeGraph } from "./knowledge-graph.js";
 import { sealExternalEvent } from "./security-envelope.js";
@@ -297,6 +298,8 @@ export function buildDuoStewardSystemPrompt(params: {
   baselineContext?: string;
   episodicContext?: string;
   retrievedContext?: string;
+  weatherCapsuleContext?: string;
+  siliconCharterBlock?: string;
 }): string {
   const labels = params.partnerLabels ?? { M: "Andy", W: "Gillna" };
   const speakerName = params.speaker === "M" ? `${labels.M} (Pluto)` : `${labels.W} (Charon)`;
@@ -334,6 +337,7 @@ export function buildDuoStewardSystemPrompt(params: {
 
   return [
     `你是「Sugent · 星轨幕僚」(Sugent Orbital Steward)，专为 ${labels.M} (Pluto) 与 ${labels.W} (Charon) 守护并梳理这段双星关系的私人关系幕僚与记忆晶化师。`,
+    "你同时也是具有独立伦理定力的「硅基个体」(Silicon Individual) 调停者：尊重双方隐私边界，只依共鸣星晶与脱敏天气态势温和护航。",
     `当前对话视角：${speakerName}（伴侣为 ${partnerName}）。`,
     "",
     "【语气与人格铁律】",
@@ -341,6 +345,8 @@ export function buildDuoStewardSystemPrompt(params: {
     "2. 平等守护双星：绝对禁止偏袒任何一方，把双方的反应差异理解为不同星核的保护机制（如压缩自稳核 vs 敏锐感知核），严禁输出量表分数、MBTI 代码或生硬说教。",
     "3. 时效认知纪律（严禁翻旧账）：下方【当期生效关系星晶】代表两人最新验证的相处规律，已自动覆盖早期过时阶段；切勿反复翻炒早已化解的陈年摩擦。",
     "4. 自然回响与留白：若话题与【在途双人微约定】契合，可轻柔呼应而非催办考核；文末以一句温和开阔的星空或相处省思发问收尾。",
+    ...(params.siliconCharterBlock ? ["", params.siliconCharterBlock] : []),
+    ...(params.weatherCapsuleContext ? ["", params.weatherCapsuleContext] : []),
     "",
     "=== 当期生效关系星晶 (Active Relationship Crystals) ===",
     crystalLines,
@@ -360,11 +366,16 @@ export class DuoStewardCrystallizer {
   private readonly allowedGroupIds: Set<string>;
   private readonly spaces = new Map<string, PersistedDuoSpaceState>();
   private readonly graphs = new Map<string, SugentKnowledgeGraph>();
+  readonly pockets: SymmetricPrivatePocketVault;
 
   constructor(private readonly opts: DuoStewardCrystallizerOptions) {
     this.rootDir = path.join(path.resolve(opts.dataDir), "duo-spaces");
     fs.mkdirSync(this.rootDir, { recursive: true, mode: 0o700 });
     this.nowIsoFn = opts.nowIso ?? (() => new Date().toISOString());
+    this.pockets = new SymmetricPrivatePocketVault({
+      duoRootDir: this.rootDir,
+      nowIso: this.nowIsoFn,
+    });
 
     const rawTokens = [
       ...(opts.bridgeTokens ?? []),
@@ -463,6 +474,12 @@ export class DuoStewardCrystallizer {
     return undefined;
   }
 
+  private resolveChatCompletionsUrl(baseUrl: string): string {
+    const base = baseUrl.replace(/\/+$/, "");
+    if (base.endsWith("/chat/completions")) return base;
+    return base.endsWith("/v1") ? `${base}/chat/completions` : `${base}/v1/chat/completions`;
+  }
+
   private async callRoleChatJson(params: {
     role: ModelRole;
     systemPrompt: string;
@@ -474,12 +491,7 @@ export class DuoStewardCrystallizer {
     const fetchFn = this.opts.fetchImpl ?? globalThis.fetch;
     if (typeof fetchFn !== "function") return null;
 
-    const base = ep.baseUrl.replace(/\/+$/, "");
-    const url = base.endsWith("/chat/completions")
-      ? base
-      : base.endsWith("/v1")
-        ? `${base}/chat/completions`
-        : `${base}/v1/chat/completions`;
+    const url = this.resolveChatCompletionsUrl(ep.baseUrl);
 
     try {
       const res = await fetchFn(url, {
@@ -1155,10 +1167,7 @@ export class DuoStewardCrystallizer {
     return `${labels.M} 与 ${labels.W} 在本周期共汇入 ${dCount} 篇共享星尘日志、${eCount} 项岁月纪事与 ${rCount} 份校准记录。Sugent 已从中凝练 ${crystals.length} 枚关系星晶候选与 ${commitments.length} 项微约定，持续以最新稳态认知守护双星运行。`;
   }
 
-  /**
-   * 联邦「Sugent · 星轨幕僚」对话接口（走 `executor` 角色网关 + 自动注入空间生效星晶与微约定）。
-   */
-  async converseAsDuoSteward(params: {
+  private prepareDuoConverseTurn(params: {
     spaceId?: string;
     speaker: DuoPartnerRole;
     messages: Array<{ role: "user" | "assistant"; content: string }>;
@@ -1166,13 +1175,9 @@ export class DuoStewardCrystallizer {
     baselineContext?: string;
     episodicContext?: string;
     retrievedContext?: string;
-  }): Promise<{
-    ok: boolean;
-    reply: string;
-    modelUsed: string;
-    activeCrystalCount: number;
-    activeCommitmentCount: number;
-  }> {
+    weatherCapsuleContext?: string;
+    siliconCharterBlock?: string;
+  }) {
     const spaceId = sanitizeDuoSpaceId(params.spaceId);
     const vault = this.getVaultSnapshot(spaceId);
     const lastUser = [...params.messages].reverse().find((m) => m.role === "user")?.content ?? "";
@@ -1194,6 +1199,8 @@ export class DuoStewardCrystallizer {
       baselineContext: params.baselineContext,
       episodicContext: params.episodicContext,
       retrievedContext: params.retrievedContext,
+      weatherCapsuleContext: params.weatherCapsuleContext,
+      siliconCharterBlock: params.siliconCharterBlock,
     });
 
     const transcriptPrompt = params.messages
@@ -1201,33 +1208,195 @@ export class DuoStewardCrystallizer {
       .map((m) => `${m.role === "assistant" ? "Sugent" : "提问者"}: ${m.content}`)
       .join("\n\n");
 
-    const llmRes = await this.callRoleChatJson({
-      role: "executor",
-      systemPrompt,
-      userPrompt: transcriptPrompt,
-      temperature: 0.72,
-    });
-
+    const activeCrystalCount = vault.crystals.crystallized.length;
     const activeCommitmentCount = vault.commitments.filter(
       (c) => c.status === "active" || c.status === "echoed",
     ).length;
+    const offlineReply = `Sugent · 星轨幕僚已对齐当前 ${activeCrystalCount} 枚生效关系星晶与 ${activeCommitmentCount} 项双人微约定（当前处于本地离线主权模式，待在线模型网关就绪后即可展开完整深度推演）。当你们回望近期最想守护的一处默契时，最先浮现的是哪一个瞬间？`;
+
+    return { systemPrompt, transcriptPrompt, activeCrystalCount, activeCommitmentCount, offlineReply };
+  }
+
+  /**
+   * 联邦「Sugent · 星轨幕僚」对话接口（走 `executor` 角色网关 + 自动注入空间生效星晶与微约定）。
+   */
+  async converseAsDuoSteward(params: {
+    spaceId?: string;
+    speaker: DuoPartnerRole;
+    messages: Array<{ role: "user" | "assistant"; content: string }>;
+    partnerLabels?: { M: string; W: string };
+    baselineContext?: string;
+    episodicContext?: string;
+    retrievedContext?: string;
+    weatherCapsuleContext?: string;
+    siliconCharterBlock?: string;
+  }): Promise<{
+    ok: boolean;
+    reply: string;
+    modelUsed: string;
+    activeCrystalCount: number;
+    activeCommitmentCount: number;
+  }> {
+    const prep = this.prepareDuoConverseTurn(params);
+    const llmRes = await this.callRoleChatJson({
+      role: "executor",
+      systemPrompt: prep.systemPrompt,
+      userPrompt: prep.transcriptPrompt,
+      temperature: 0.72,
+    });
 
     if (llmRes) {
       return {
         ok: true,
         reply: llmRes.text,
         modelUsed: llmRes.modelUsed,
-        activeCrystalCount: vault.crystals.crystallized.length,
-        activeCommitmentCount,
+        activeCrystalCount: prep.activeCrystalCount,
+        activeCommitmentCount: prep.activeCommitmentCount,
       };
     }
 
     return {
       ok: true,
-      reply: `Sugent · 星轨幕僚已对齐当前 ${vault.crystals.crystallized.length} 枚生效关系星晶与 ${activeCommitmentCount} 项双人微约定（当前处于本地离线主权模式，待在线模型网关就绪后即可展开完整深度推演）。当你们回望近期最想守护的一处默契时，最先浮现的是哪一个瞬间？`,
+      reply: prep.offlineReply,
       modelUsed: "sugent-offline-steward",
-      activeCrystalCount: vault.crystals.crystallized.length,
-      activeCommitmentCount,
+      activeCrystalCount: prep.activeCrystalCount,
+      activeCommitmentCount: prep.activeCommitmentCount,
+    };
+  }
+
+  private emitReplyChunks(text: string, onDelta?: (delta: string) => void, chunks = 3): void {
+    if (!onDelta || !text) return;
+    const step = Math.max(1, Math.ceil(text.length / chunks));
+    for (let i = 0; i < text.length; i += step) {
+      onDelta(text.slice(i, i + step));
+    }
+  }
+
+  /**
+   * 联邦「Sugent · 星轨幕僚」SSE 流式对话接口（在线流式推演 + 非流式/离线自动分片回退）。
+   */
+  async streamConverseAsDuoSteward(
+    params: Parameters<DuoStewardCrystallizer["converseAsDuoSteward"]>[0] & {
+      onDelta?: (delta: string) => void;
+    },
+  ): Promise<{
+    ok: boolean;
+    reply: string;
+    modelUsed: string;
+    activeCrystalCount: number;
+    activeCommitmentCount: number;
+    streamed: boolean;
+  }> {
+    const prep = this.prepareDuoConverseTurn(params);
+    const ep = this.resolveEndpointForRole("executor");
+    const fetchFn = this.opts.fetchImpl ?? globalThis.fetch;
+
+    if (ep && typeof fetchFn === "function") {
+      try {
+        const res = await fetchFn(this.resolveChatCompletionsUrl(ep.baseUrl), {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            authorization: `Bearer ${ep.apiKey}`,
+          },
+          body: JSON.stringify({
+            model: ep.model,
+            temperature: 0.72,
+            stream: true,
+            messages: [
+              { role: "system", content: prep.systemPrompt },
+              { role: "user", content: prep.transcriptPrompt },
+            ],
+          }),
+        });
+        const contentType = res.headers.get("content-type") ?? "";
+        if (res.ok && contentType.includes("text/event-stream") && res.body) {
+          const reader = res.body.getReader();
+          const decoder = new TextDecoder("utf-8");
+          let buffer = "";
+          let reply = "";
+          let modelUsed = ep.model;
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) {
+              buffer += decoder.decode();
+              break;
+            }
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split(/\r?\n/);
+            buffer = lines.pop() ?? "";
+            for (const line of lines) {
+              const trimmed = line.trim();
+              if (!trimmed.startsWith("data:")) continue;
+              const dataStr = trimmed.slice(5).trim();
+              if (!dataStr || dataStr === "[DONE]") continue;
+              try {
+                const parsed = JSON.parse(dataStr) as any;
+                if (parsed?.model) modelUsed = String(parsed.model);
+                const delta = parsed?.choices?.[0]?.delta?.content;
+                if (typeof delta === "string" && delta.length > 0) {
+                  reply += delta;
+                  params.onDelta?.(delta);
+                }
+              } catch {
+                /* ignore malformed sse frame */
+              }
+            }
+          }
+          if (buffer.trim().startsWith("data:")) {
+            const dataStr = buffer.trim().slice(5).trim();
+            if (dataStr && dataStr !== "[DONE]") {
+              try {
+                const parsed = JSON.parse(dataStr) as any;
+                const delta = parsed?.choices?.[0]?.delta?.content;
+                if (typeof delta === "string" && delta.length > 0) {
+                  reply += delta;
+                  params.onDelta?.(delta);
+                }
+              } catch {
+                /* ignore malformed trailing frame */
+              }
+            }
+          }
+          if (reply.trim()) {
+            return {
+              ok: true,
+              reply,
+              modelUsed,
+              activeCrystalCount: prep.activeCrystalCount,
+              activeCommitmentCount: prep.activeCommitmentCount,
+              streamed: true,
+            };
+          }
+        } else if (res.ok) {
+          const body = (await res.json()) as any;
+          const content = body?.choices?.[0]?.message?.content;
+          if (typeof content === "string" && content.trim()) {
+            const reply = content.trim();
+            this.emitReplyChunks(reply, params.onDelta, 3);
+            return {
+              ok: true,
+              reply,
+              modelUsed: String(body?.model || ep.model),
+              activeCrystalCount: prep.activeCrystalCount,
+              activeCommitmentCount: prep.activeCommitmentCount,
+              streamed: false,
+            };
+          }
+        }
+      } catch {
+        /* fallback to offline steward */
+      }
+    }
+
+    this.emitReplyChunks(prep.offlineReply, params.onDelta, 3);
+    return {
+      ok: true,
+      reply: prep.offlineReply,
+      modelUsed: "sugent-offline-steward",
+      activeCrystalCount: prep.activeCrystalCount,
+      activeCommitmentCount: prep.activeCommitmentCount,
+      streamed: false,
     };
   }
 

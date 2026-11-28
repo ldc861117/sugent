@@ -16,6 +16,7 @@ function CompanionApp() {
   const [prompt, setPrompt] = useState("");
   const [lastPrompt, setLastPrompt] = useState("");
   const [reply, setReply] = useState("");
+  const [turnHistory, setTurnHistory] = useState([]);
   const [notice, setNotice] = useState("");
   const [donePill, setDonePill] = useState(null);
   const [dropHandoff, setDropHandoff] = useState(null);
@@ -192,9 +193,18 @@ function CompanionApp() {
     if (!text || busy) return;
     setBusy(true);
     try {
-      const res = await api("/steward/converse", { method: "POST", body: { text, channel: "desktop_companion", callerDomain: "owner_private" } });
+      const res = await api("/steward/converse", {
+        method: "POST",
+        body: { text, history: turnHistory, channel: "desktop_companion", callerDomain: "owner_private" },
+      });
+      const replyText = res.reply || "";
       setLastPrompt(text);
-      setReply(res.reply || "");
+      setReply(replyText);
+      setTurnHistory((prev) => [
+        ...prev,
+        { role: "user", content: text },
+        ...(replyText ? [{ role: "assistant", content: replyText }] : []),
+      ].slice(-10));
       setPrompt("");
       await refresh();
     } catch (err) {

@@ -7,9 +7,12 @@
  * 3. Titans 意外度动量与 AdaptiveCoherentizer 三档成本控制（<0.2 / 0.2-0.5 / >=0.5）；
  * 4. LanguageProfiler 零 LLM 软品味提取与 MergeGuard（>= 2 强证据）跨端合号门禁。
  */
+import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
 import type { RoundTraceProjection } from "./causal-ledger.js";
-import type { KGDelta, KGEdge } from "./knowledge-graph.js";
-import type { ContextPartition, LedgerSnapshot } from "./stewardship-ledger.js";
+import type { KGDelta, KGEdge, SugentKnowledgeGraph } from "./knowledge-graph.js";
+import type { ContextPartition, LedgerSnapshot, StewardshipLedger } from "./stewardship-ledger.js";
 
 export const URGENT_SURPRISE_THRESHOLD = 0.7;
 export const SANDBOX_INITIAL_CONFIDENCE = 0.3;
@@ -247,13 +250,27 @@ export function runGardenerCycle(input: GardenerCycleInput): GardenerCycleOutput
 
   const nowMs = Date.parse(input.nowIso);
   const pruneEdgeIds: string[] = [];
+  const prunedEdges: KGEdge[] = [];
   for (const edge of input.activeEdges ?? []) {
     if (edge.supersededAt) continue;
     const validMs = Date.parse(edge.validFrom);
     if (edge.weight < 0.2 || (Number.isFinite(validMs) && Number.isFinite(nowMs) && (nowMs - validMs) / MS_PER_DAY > 90)) {
       pruneEdgeIds.push(edge.id);
+      prunedEdges.push(edge);
     }
   }
+  const kgPruningDelta: KGDelta =
+    prunedEdges.length > 0
+      ? {
+          edges: prunedEdges.map((e) => ({
+            from: e.from,
+            relation: e.relation,
+            to: e.to,
+            weight: 0,
+            source: "memory_gardener_prune",
+          })),
+        }
+      : {};
 
   const driftReport: GoalActionDriftReport = {
     windowDays: input.windowDays ?? 7,
@@ -268,5 +285,288 @@ export function runGardenerCycle(input: GardenerCycleInput): GardenerCycleOutput
     `沙盒与图谱：待晋升 ${promotedProposals.length} 项 · 退回 observe ${demotedRuleIds.length} 条 · 清理旧边 ${pruneEdgeIds.length} 条`,
     urgentTriggered ? "触发原因：异常动量越线，建议立即核对证伪墓碑" : "回复 1 采纳建议，或回复 2 保持现状",
   ];
-  return { costTier, tokenBudgetApplied, driftReport, nextHypotheses, promotedProposals, discardedProposalIds, demotedRuleIds, tasteUpdates, pruneEdgeIds, kgPruningDelta: {}, calibrationCardLines };
+  return { costTier, tokenBudgetApplied, driftReport, nextHypotheses, promotedProposals, discardedProposalIds, demotedRuleIds, tasteUpdates, pruneEdgeIds, kgPruningDelta, calibrationCardLines };
+}
+
+
+export interface GardenerSandboxState {
+  version: 1;
+  updatedAtIso: string;
+  surpriseMomentum: number;
+  lastRunAtIso: string;
+  hypotheses: GardenerSandboxHypothesis[];
+  lastReport?: GoalActionDriftReport;
+  lastCalibrationLines?: [string, string, string];
+}
+
+export class GardenerStateStore {
+  readonly filePath: string;
+  private state: GardenerSandboxState;
+
+  constructor(stewardDir: string) {
+    this.filePath = path.join(path.resolve(stewardDir), "gardener-sandbox.json");
+    this.state = this.load();
+  }
+
+  load(): GardenerSandboxState {
+    const fallback: GardenerSandboxState = {
+      version: 1,
+      updatedAtIso: new Date(0).toISOString(),
+      surpriseMomentum: 0,
+      lastRunAtIso: new Date(0).toISOString(),
+      hypotheses: [],
+    };
+    if (!fs.existsSync(this.filePath)) {
+      this.state = fallback;
+      return { ...fallback, hypotheses: [] };
+    }
+    try {
+      const raw = JSON.parse(fs.readFileSync(this.filePath, "utf8")) as Partial<GardenerSandboxState>;
+      const loaded: GardenerSandboxState = {
+        version: 1,
+        updatedAtIso: typeof raw.updatedAtIso === "string" ? raw.updatedAtIso : fallback.updatedAtIso,
+        surpriseMomentum:
+          typeof raw.surpriseMomentum === "number" && Number.isFinite(raw.surpriseMomentum) ? raw.surpriseMomentum : 0,
+        lastRunAtIso: typeof raw.lastRunAtIso === "string" ? raw.lastRunAtIso : fallback.lastRunAtIso,
+        hypotheses: Array.isArray(raw.hypotheses) ? raw.hypotheses : [],
+        ...(raw.lastReport ? { lastReport: raw.lastReport } : {}),
+        ...(Array.isArray(raw.lastCalibrationLines) && raw.lastCalibrationLines.length === 3
+          ? { lastCalibrationLines: raw.lastCalibrationLines as [string, string, string] }
+          : {}),
+      };
+      this.state = loaded;
+      return { ...loaded, hypotheses: loaded.hypotheses.map((h) => ({ ...h })) };
+    } catch {
+      this.state = fallback;
+      return { ...fallback, hypotheses: [] };
+    }
+  }
+
+  save(state: GardenerSandboxState): GardenerSandboxState {
+    const dir = path.dirname(this.filePath);
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    fs.chmodSync(dir, 0o700);
+    const normalized: GardenerSandboxState = {
+      version: 1,
+      updatedAtIso: state.updatedAtIso,
+      surpriseMomentum: state.surpriseMomentum,
+      lastRunAtIso: state.lastRunAtIso,
+      hypotheses: state.hypotheses.map((h) => ({ ...h })),
+      ...(state.lastReport ? { lastReport: { ...state.lastReport } } : {}),
+      ...(state.lastCalibrationLines
+        ? { lastCalibrationLines: [...state.lastCalibrationLines] as [string, string, string] }
+        : {}),
+    };
+    const tmp = `${this.filePath}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`;
+    fs.writeFileSync(tmp, `${JSON.stringify(normalized, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+    fs.chmodSync(tmp, 0o600);
+    fs.renameSync(tmp, this.filePath);
+    this.state = normalized;
+    return this.getState();
+  }
+
+  getState(): GardenerSandboxState {
+    return {
+      ...this.state,
+      hypotheses: this.state.hypotheses.map((h) => ({ ...h })),
+      ...(this.state.lastReport ? { lastReport: { ...this.state.lastReport } } : {}),
+      ...(this.state.lastCalibrationLines
+        ? { lastCalibrationLines: [...this.state.lastCalibrationLines] as [string, string, string] }
+        : {}),
+    };
+  }
+
+  getHypotheses(): GardenerSandboxHypothesis[] {
+    return this.state.hypotheses.map((h) => ({ ...h }));
+  }
+
+  setState(patch: Partial<GardenerSandboxState> | GardenerSandboxState): GardenerSandboxState {
+    const next: GardenerSandboxState = {
+      ...this.state,
+      ...patch,
+      version: 1,
+      hypotheses: (patch.hypotheses ?? this.state.hypotheses).map((h) => ({ ...h })),
+      updatedAtIso: patch.updatedAtIso ?? new Date().toISOString(),
+    };
+    return this.save(next);
+  }
+}
+
+
+export function deriveGardenerHypotheses(params: {
+  existing: GardenerSandboxHypothesis[];
+  ledger: LedgerSnapshot;
+  recentRounds: RoundTraceProjection[];
+  unapprovedWorkflows?: Array<{ id: string; name: string; reinforcements: number }>;
+  nowIso: string;
+}): GardenerSandboxHypothesis[] {
+  const byId = new Map<string, GardenerSandboxHypothesis>();
+  for (const h of params.existing ?? []) {
+    byId.set(h.id, { ...h });
+  }
+
+  const seedOrConfirm = (seed: {
+    id: string;
+    partition: ContextPartition;
+    targetKind: GardenerSandboxHypothesis["targetKind"];
+    statement: string;
+  }): void => {
+    const prev = byId.get(seed.id);
+    if (!prev) {
+      byId.set(seed.id, {
+        id: seed.id,
+        partition: seed.partition,
+        targetKind: seed.targetKind,
+        statement: seed.statement,
+        state: "PROPOSED",
+        confidence: SANDBOX_INITIAL_CONFIDENCE,
+        confirmations: 1,
+        contradictions: 0,
+        createdAtIso: params.nowIso,
+        lastEvidenceAtIso: params.nowIso,
+      });
+      return;
+    }
+    if (prev.state === "PROPOSED" && prev.lastEvidenceAtIso !== params.nowIso) {
+      byId.set(seed.id, advanceSandboxHypothesis(prev, "confirm", params.nowIso));
+    }
+  };
+
+  const activeGoalIds = new Set((params.ledger.goals ?? []).filter((g) => g.status === "active").map((g) => g.id));
+  const rounds = params.recentRounds ?? [];
+  if (rounds.length > 0) {
+    const nonGoalCount = rounds.filter((r) => !(r.goalId && activeGoalIds.has(r.goalId))).length;
+    const nonGoalRoundShare = nonGoalCount / rounds.length;
+    if (nonGoalRoundShare >= 0.6) {
+      seedOrConfirm({
+        id: "hyp:goal-drift-alert",
+        partition: "work_project",
+        targetKind: "goal_drift_alert",
+        statement: `近轮次偏离活跃北极星目标占比达 ${Math.round(nonGoalRoundShare * 100)}%，建议聚焦主目标或归档杂务`,
+      });
+    }
+  }
+
+  for (const wf of params.unapprovedWorkflows ?? []) {
+    if (wf.reinforcements >= 2) {
+      seedOrConfirm({
+        id: `hyp:skill:${wf.id}`,
+        partition: "work_project",
+        targetKind: "skill_proposal",
+        statement: `工作流「${wf.name}」已累计验证 ${wf.reinforcements} 次，建议批准结晶为固化技能`,
+      });
+    }
+  }
+
+  const failedRounds = rounds.filter((r) => r.status === "failed" || r.status === "circuit_broken");
+  const failByRule = new Map<string, number>();
+  const failByTitle = new Map<string, number>();
+  for (const r of failedRounds) {
+    if (r.ruleId) failByRule.set(r.ruleId, (failByRule.get(r.ruleId) ?? 0) + 1);
+    const titleKey = (r.targetRef || r.title || "").trim();
+    if (titleKey) failByTitle.set(titleKey, (failByTitle.get(titleKey) ?? 0) + 1);
+  }
+  let matchedSpecificFailure = false;
+  for (const [ruleId, count] of failByRule.entries()) {
+    if (count >= 2) {
+      matchedSpecificFailure = true;
+      seedOrConfirm({
+        id: `hyp:fail-rule:${ruleId}`,
+        partition: "work_project",
+        targetKind: "rule_demotion",
+        statement: `规则 ${ruleId} 近期连续失败 ${count} 次，建议降级观察或补充防护墓碑`,
+      });
+    }
+  }
+  for (const [label, count] of failByTitle.entries()) {
+    if (count >= 2) {
+      matchedSpecificFailure = true;
+      const hash = crypto.createHash("sha256").update(label, "utf8").digest("hex").slice(0, 8);
+      seedOrConfirm({
+        id: `hyp:fail-pattern:${hash}`,
+        partition: "work_project",
+        targetKind: "tombstone",
+        statement: `「${label.slice(0, 40)}」近期累计失败 ${count} 次，建议提炼为证伪墓碑避免重复踩坑`,
+      });
+    }
+  }
+  if (!matchedSpecificFailure && failedRounds.length >= 2) {
+    seedOrConfirm({
+      id: "hyp:repeated-failures",
+      partition: "work_project",
+      targetKind: "tombstone",
+      statement: `近期出现 ${failedRounds.length} 次失败/熔断轮次，建议复盘并建立防错墓碑`,
+    });
+  }
+
+  return Array.from(byId.values());
+}
+
+
+export function applyGardenerEffects(
+  output: GardenerCycleOutput,
+  targets: {
+    knowledgeGraph: SugentKnowledgeGraph;
+    ledger: StewardshipLedger;
+    onDemoteRule?: (ruleId: string) => void;
+    nowIso?: string;
+  },
+): { prunedEdges: number; updatedRelationships: number; writtenTombstones: number; demotedRules: number } {
+  const nowIso = targets.nowIso ?? new Date().toISOString();
+  let prunedEdges = 0;
+  for (const edgeId of output.pruneEdgeIds ?? []) {
+    if (targets.knowledgeGraph.removeEdge(edgeId, nowIso)) {
+      prunedEdges += 1;
+    }
+  }
+
+  let updatedRelationships = 0;
+  const existingRels = targets.ledger.snapshotForCaller("owner_private").relationships;
+  for (const taste of output.tasteUpdates ?? []) {
+    if (!taste.suggestedPreferences.length) continue;
+    const existing = existingRels.find((r) => r.id === taste.relationshipId || r.name === taste.relationshipId);
+    const mergedPrefs = Array.from(new Set([...(existing?.preferences ?? []), ...taste.suggestedPreferences]));
+    targets.ledger.upsertRelationship(
+      {
+        id: existing?.id ?? taste.relationshipId,
+        partition: existing?.partition ?? taste.partition,
+        name: existing?.name ?? taste.relationshipId,
+        preferences: mergedPrefs,
+      },
+      nowIso,
+    );
+    updatedRelationships += 1;
+  }
+
+  let writtenTombstones = 0;
+  const existingGuards = targets.ledger.snapshotForCaller("owner_private").guardrails;
+  for (const proposal of output.promotedProposals ?? []) {
+    if (proposal.state !== "VALIDATED" || proposal.targetKind !== "tombstone") continue;
+    const guardId = `guard-tombstone-${proposal.id}`;
+    const alreadyExists = existingGuards.some(
+      (g) => g.id === guardId || (g.kind === "tombstone" && g.statement === proposal.statement),
+    );
+    if (alreadyExists) continue;
+    targets.ledger.addGuardrail(
+      {
+        id: guardId,
+        partition: proposal.partition,
+        kind: "tombstone",
+        statement: proposal.statement,
+        evidenceSource: `memory_gardener:${proposal.id}`,
+      },
+      nowIso,
+    );
+    writtenTombstones += 1;
+  }
+
+  let demotedRules = 0;
+  for (const ruleId of output.demotedRuleIds ?? []) {
+    if (targets.onDemoteRule) {
+      targets.onDemoteRule(ruleId);
+      demotedRules += 1;
+    }
+  }
+
+  return { prunedEdges, updatedRelationships, writtenTombstones, demotedRules };
 }

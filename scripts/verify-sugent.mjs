@@ -160,6 +160,19 @@ import {
   sanitizeGroupMessageText,
   DuoStewardCrystallizer,
   buildDuoStewardSystemPrompt,
+  PostTurnDigester,
+  StereoscopicAtlas,
+  GardenerStateStore,
+  deriveGardenerHypotheses,
+  applyGardenerEffects,
+  mergeKnowledgeGraphSnapshots,
+  EpistemicDigestionLoop,
+  buildSiliconCharterPrompt,
+  detectLoyalDissentSignal,
+  distillPartnerWeatherCapsule,
+  renderWeatherCapsuleForDuoPrompt,
+  MembraneError,
+  SymmetricPrivatePocketVault,
 } from "../dist/src/sugent/index.js";
 import { normalizeSettings } from "../dist/src/agent/settings.js";
 import { extractForwardedRecordText, weixinParts } from "../dist/src/channels/weixin/channel.js";
@@ -1765,6 +1778,148 @@ import { extractForwardedRecordText, weixinParts } from "../dist/src/channels/we
   }
 }
 
+// ---------------------------------------------------------------------------
+// 31. Wave P4 Tier-1：记忆回流管道、五维立体关联图谱（StereoscopicAtlas）与无损 E2EE 账本同步
+// ---------------------------------------------------------------------------
+{
+  const s31Dir = fs.mkdtempSync(path.join(os.tmpdir(), "verify-sugent-s31-"));
+  try {
+    const kg = new SugentKnowledgeGraph(s31Dir);
+    const ledger = new StewardshipLedger({ dataDir: s31Dir, knowledgeGraph: kg });
+    const atlas = new StereoscopicAtlas(path.join(s31Dir, "atlas"));
+    const digester = new PostTurnDigester({
+      knowledgeGraph: kg,
+      ledger,
+      onNodeDelta: (delta) => atlas.ingestLegacyDelta(delta, "owner_life", "2026-11-28T10:00:00Z"),
+      nowIso: () => "2026-11-28T10:00:00Z",
+    });
+    const res = await digester.digestTurnNow({
+      userText: "以后记住周五前固定同步项目周报给老板",
+      assistantReply: "好的，已记住这条长期工作约定。",
+      channel: "weixin",
+      peerId: "owner",
+    });
+    assert.equal(res.deterministicNodes >= 1, true);
+
+    atlas.applyDelta({
+      nodes: [
+        {
+          id: "owner:secret-s0",
+          plane: "owner_life",
+          stratum: "raw_episodic",
+          kind: "fact",
+          name: "私密原始账目",
+          summary: "银行流水原文 884210",
+          tags: ["private"],
+          principalAcl: ["owner:M"],
+        },
+      ],
+    });
+    const peerRecall = atlas.recallStereoscopic("账目 周报", {
+      callerPrincipals: ["peer:client-x"],
+    });
+    assert.equal(peerRecall.nodes.some((n) => n.id === "owner:secret-s0"), false);
+
+    const gState = new GardenerStateStore(path.join(s31Dir, "steward"));
+    const hyps = deriveGardenerHypotheses({
+      existing: gState.getHypotheses(),
+      ledger: ledger.snapshotForCaller("owner_private"),
+      recentRounds: [],
+      nowIso: "2026-11-28T10:00:00Z",
+    });
+    assert.equal(Array.isArray(hyps), true);
+
+    ledger.upsertGoal({ id: "goal:s31", partition: "work_project", title: "Wave P4", northStarCriterion: "全链路合龙" });
+    const syncSnap = {
+      lamportClock: 5,
+      deviceId: "mac-1",
+      nodes: kg.allNodes().map((n) => ({
+        id: n.id,
+        type: n.kind,
+        label: n.name,
+        properties: { summary: n.summary, tags: n.tags, reinforcements: n.reinforcements },
+        validFrom: n.updatedAt,
+        supersededAt: null,
+        updatedAt: n.updatedAt,
+        lamportClock: 5,
+      })),
+      edges: [],
+      stewardshipLedger: ledger.exportSnapshotForSync(),
+    };
+    const kh = deriveSyncKeyHierarchy({ passphrase: "correct-horse-battery-s31", kdfIterations: 100_000 });
+    const envelope = sealZeroKnowledgeEnvelope({
+      plaintextPayload: syncSnap,
+      keyHierarchy: kh,
+      subjectSub: "usr_s31_verify_01",
+      payloadType: "knowledge-graph",
+      lamportClock: 5,
+      deviceId: "mac-1",
+    });
+    const opened = openZeroKnowledgeEnvelope({
+      envelope,
+      passphrase: "correct-horse-battery-s31",
+      expectedSubjectSub: "usr_s31_verify_01",
+      expectedPayloadType: "knowledge-graph",
+    });
+    const merged = mergeKnowledgeGraphSnapshots(
+      { lamportClock: 0, deviceId: "mac-2", nodes: [], edges: [] },
+      opened.payload,
+      "mac-2",
+    );
+    assert.equal(merged.stewardshipLedger?.goals?.some((g) => g.id === "goal:s31"), true);
+
+    digester.dispose();
+    atlas.close();
+  } finally {
+    fs.rmSync(s31Dir, { recursive: true, force: true });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 32. Wave P4 Tier-2：SiliconIdentityCore 宪章与认知消化 + CognitiveMembrane 金丝雀零泄露契约
+// ---------------------------------------------------------------------------
+{
+  const s32Dir = fs.mkdtempSync(path.join(os.tmpdir(), "verify-sugent-s32-"));
+  try {
+    const atlas = new StereoscopicAtlas(path.join(s32Dir, "atlas"));
+    const loop = new EpistemicDigestionLoop({ stewardDir: s32Dir, atlas, nowIso: () => "2026-11-28T14:00:00Z" });
+    const charter = buildSiliconCharterPrompt({ surface: "steward_hub", calibratedLessons: ["不要在深夜强推长决策"] });
+    assert.equal(charter.includes("Sugent 硅基个体统一宪章"), true);
+
+    const h1 = loop.recordJudgment({ topicKey: "s32-check", surface: "im_owner", hypothesis: "先给三行结论再附证据有效" });
+    loop.reconcileOutcome({ idOrTopic: h1.id, outcome: "confirmed" });
+    const hDone = loop.reconcileOutcome({ idOrTopic: h1.id, outcome: "confirmed" });
+    assert.equal(hDone?.entry.status, "crystallized");
+    assert.equal(atlas.getNode(h1.id)?.stratum, "crystallized_wisdom");
+
+    const hBad = loop.recordJudgment({ topicKey: "s32-bad", surface: "im_owner", hypothesis: "一次误判假设" });
+    loop.reconcileOutcome({ idOrTopic: hBad.id, outcome: "falsified", evidenceNote: "实测不可行" });
+    assert.equal(atlas.getNode(hBad.id)?.supersededAt !== undefined, true);
+    assert.equal(Boolean(atlas.getNode(`self:tombstone:${hBad.id}`)), true);
+
+    const dissent = detectLoyalDissentSignal({
+      userText: "今晚周六加班做需求冲刺",
+      activeGoals: [],
+      openCommitments: [],
+      guardrails: [],
+      duoAnchors: [{ id: "a1", title: "周六晚上留白散步", detail: "周末共处窗口", protectedWindowKeywords: ["周六", "周末"] }],
+    });
+    assert.equal(dissent?.kind, "duo_agreement_mirror");
+
+    const capsule = distillPartnerWeatherCapsule({ runningSessionCount: 4, quietHoursActive: false, recentDropCount: 5 });
+    const rendered = renderWeatherCapsuleForDuoPrompt(capsule, "Andy", ["SecretCanaryProject", "¥999999"]);
+    assert.equal(rendered.includes("SecretCanaryProject"), false);
+
+    const pockets = new SymmetricPrivatePocketVault({ duoRootDir: s32Dir });
+    pockets.putPrivateNote({ actor: "W", content: "只有W自己能看的私密心绪" });
+    assert.throws(() => pockets.listPocketNotes({ viewer: "M", targetOwner: "W" }), MembraneError);
+
+    atlas.close();
+  } finally {
+    fs.rmSync(s32Dir, { recursive: true, force: true });
+  }
+}
+
 console.log(
-  "verify:sugent — 全部核心契约断言通过 (M1.1–M1.6 / M2.1 / Cowork 联邦 / P0 Broker + P1 幕僚耳麦 + P2 BYOK 诊断与零知识加密同步 / Sprint 1–3 / M1–M4 Vibe Coding 闭环 / 能力自感知与全文读取 / 形象工坊与桌宠契约 / M-Auto 1–4 双环自治与 SIM 演进 / M1–M3 全量模型同步与经验驱动自适应路由 / L0–L3 分层热启动与热更新 / Wave P0 双脑归一与宿主主循环合龙 / GCE 常驻中枢与微信单持有者舰队桥接 / Wave P1 零填表冷启动、ACP 编码军团与隐藏快照防呆 / Wave P2 合盖离线韧性、微信 3 秒转发参谋与端-边联邦标杆武器包 / 云端唯一大脑、跨天全渠道对话记忆与多节点边缘触手中枢 / Wave P3 双微信号前店后厂、助理无头边车与项目群静默纪要 / 人机混合项目规划与现实待办闭环 / Duo 双人关系幕僚与记忆晶化隔离契约)",
+  "verify:sugent — 全部核心契约断言通过 (M1.1–M1.6 / M2.1 / Cowork 联邦 / P0 Broker + P1 幕僚耳麦 + P2 BYOK 诊断与零知识加密同步 / Sprint 1–3 / M1–M4 Vibe Coding 闭环 / 能力自感知与全文读取 / 形象工坊与桌宠契约 / M-Auto 1–4 双环自治与 SIM 演进 / M1–M3 全量模型同步与经验驱动自适应路由 / L0–L3 分层热启动与热更新 / Wave P0 双脑归一与宿主主循环合龙 / GCE 常驻中枢与微信单持有者舰队桥接 / Wave P1 零填表冷启动、ACP 编码军团与隐藏快照防呆 / Wave P2 合盖离线韧性、微信 3 秒转发参谋与端-边联邦标杆武器包 / 云端唯一大脑、跨天全渠道对话记忆与多节点边缘触手中枢 / Wave P3 双微信号前店后厂、助理无头边车与项目群静默纪要 / 人机混合项目规划与现实待办闭环 / Duo 双人关系幕僚与记忆晶化隔离契约 / Wave P4 全量合龙: 记忆回流、五维立体图谱、硅基个体心智核、半透认知膜与无损同步)",
 );

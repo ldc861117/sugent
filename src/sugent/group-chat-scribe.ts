@@ -558,6 +558,45 @@ export class GroupChatScribe {
     return list.map((m) => ({ ...m }));
   }
 
+  async autoDistillReadyGroups(opts?: {
+    minUnarchivedCount?: number;
+    maxAgeMs?: number;
+    nowMs?: number;
+  }): Promise<GroupScribeDigestCard[]> {
+    const minUnarchivedCount = opts?.minUnarchivedCount ?? 15;
+    const maxAgeMs = opts?.maxAgeMs ?? 2 * 3600_000;
+    const parsedNow = Date.parse(this.nowIsoFn());
+    const nowMs = opts?.nowMs ?? (Number.isFinite(parsedNow) ? parsedNow : Date.now());
+    const results: GroupScribeDigestCard[] = [];
+
+    for (const gState of this.groups.values()) {
+      if (!this.whitelistedGroups.has(gState.groupId)) continue;
+      const unarchived = gState.messages.filter((m) => !m.archivedAtIso);
+      if (unarchived.length === 0) continue;
+
+      const countReady = unarchived.length >= minUnarchivedCount;
+      let oldestMs = Number.POSITIVE_INFINITY;
+      for (const m of unarchived) {
+        const ts = Date.parse(m.timestampIso);
+        if (Number.isFinite(ts) && ts < oldestMs) oldestMs = ts;
+      }
+      const ageReady = Number.isFinite(oldestMs) && nowMs - oldestMs >= maxAgeMs;
+      if (!countReady && !ageReady) continue;
+
+      const unarchivedIds = unarchived.map((m) => m.messageId);
+      const alreadyPending = Array.from(this.digests.values()).some((d) => {
+        if (d.groupId !== gState.groupId || d.status !== "pending_approval") return false;
+        const dSet = new Set(d.sourceMessageIds);
+        return dSet.size === unarchivedIds.length && unarchivedIds.every((id) => dSet.has(id));
+      });
+      if (alreadyPending) continue;
+
+      const card = await this.distillGroupDigest({ groupId: gState.groupId });
+      results.push(card);
+    }
+    return results;
+  }
+
   async distillGroupDigest(input: DistillGroupDigestInput): Promise<GroupScribeDigestCard> {
     const groupId = String(input.groupId ?? "").trim();
     if (!groupId || !this.whitelistedGroups.has(groupId)) {

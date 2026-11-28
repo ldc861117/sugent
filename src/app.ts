@@ -261,6 +261,17 @@ export class App {
     this.conciergeBridge = new ConciergeChannelBridge({
       dataDir: config.dataDir,
       knowledgeGraph: this.knowledgeGraph,
+      fetchImpl: ((input, init) => (this.desktop?.fetch ?? globalThis.fetch)(input, init)) as typeof fetch,
+      resolveAssessorEndpoint: () => {
+        const gw = resolveSugentGatewayConfig(this.config, {});
+        const model = this.providers.routing.assessor || gw.routing.assessor;
+        if (gw.baseUrl && gw.apiKey) return { baseUrl: gw.baseUrl, apiKey: gw.apiKey, model };
+        const def = this.providers.getDefaultProvider();
+        if (def?.enabled && def.baseUrl) {
+          return { baseUrl: def.baseUrl, apiKey: def.apiKey, model: def.defaultModel || def.models?.[0] || model };
+        }
+        return undefined;
+      },
       resolveActorRole: ({ channel, botId, account, conversationId, senderId }) => {
         const acctKey = account || botId;
         const ownerPeer = this.access.owner(acctKey, channel)?.peerId;
@@ -370,6 +381,25 @@ export class App {
       },
       ...(opts.stewardHomeDir ? { homeDir: opts.stewardHomeDir } : {}),
       ...(opts.stewardFleetStatePath ? { fleetStatePath: opts.stewardFleetStatePath } : {}),
+      stewardCompleteFn: (system, user) => {
+        const botId = this.store.listBots()[0]?.id || "default";
+        const model = this.providers.routing.steward || this.config.llm.defaultModel || this.providers.routing.executor;
+        return this.models.streamChat(
+          { model: this.routeModel(botId, model), messages: [{ role: "system", content: system }, { role: "user", content: user }], signal: AbortSignal.timeout(45_000) },
+          () => {},
+        );
+      },
+      syncBotMemoryEntry: (text, topic) => {
+        const botId = this.store.listBots()[0]?.id || "default";
+        this.agent?.rememberFromSteward(botId, text, topic);
+      },
+      listBotIds: () => this.store.listBots().map((b) => b.id),
+      demoteProactiveRule: (ruleId) => {
+        const rule = this.store.getRule(ruleId);
+        if (rule && rule.mode === "act") {
+          this.store.updateRule(ruleId, { mode: "observe" });
+        }
+      },
       delegateLocalTask: async (input) => {
         const ch = input.channel === "weixin" || input.channel === "feishu" ? input.channel : "web";
         const active = this.activeOwnerConvByChannel.get(ch);
@@ -441,6 +471,11 @@ export class App {
         }
       },
     });
+    this.conciergeBridge.attachLedger(this.stewardService.ledger);
+    this.p2Service.attachStewardshipLedgerPort({
+      exportLedger: () => this.stewardService.ledger.exportSnapshotForSync(),
+      importLedger: (snap) => this.stewardService.ledger.mergeRemoteSnapshot(snap),
+    });
     if (config.magpie.mode === "managed") {
       this.magpie = new MagpieSupervisor({
         dataDir: config.dataDir,
@@ -505,6 +540,7 @@ export class App {
         : undefined,
       search: this.search,
       connections: this.connections,
+      stewardContextBrief: () => this.stewardService.buildOwnerAgentBrief(),
       onNotice: (text) => this.notice("warn", text),
     });
     this.attention = new Attention({ store: this.store });
@@ -757,7 +793,23 @@ export class App {
     gardenerIntervalMs?: number;
   } = {}) {
     await this.syncOpsBridgeTick().catch((e) => log.warn("ops bridge tick failed", { message: (e as Error).message }));
+    const autoDigests = await this.stewardService.autoDistillGroupScribeTick({ nowMs: input.nowMs }).catch(() => []);
+    if (autoDigests.length > 0 && !this.stewardService.getWorkbench("owner_private").quietHoursActive) {
+      const digestLines = [
+        `【群聊旁听自动提纯 · ${autoDigests.length} 份待审批】`,
+        ...autoDigests.slice(0, 3).map((d) => `- ${d.groupName}: ${d.waitingForCommitments.length + d.iOweCommitments.length} 项待办`),
+      ];
+      await this.pushToOwner(digestLines.join("\n")).catch(() => false);
+    }
     const res = this.stewardService.runScheduledPulse(input);
+    if (
+      res.gardener &&
+      res.gardener.calibrationCardLines.length > 0 &&
+      (!this.stewardService.getWorkbench("owner_private").quietHoursActive || res.gardener.driftReport.urgentTriggered)
+    ) {
+      const gLines = ["【记忆园丁周度校准】", ...res.gardener.calibrationCardLines.slice(0, 6)];
+      await this.pushToOwner(gLines.join("\n")).catch(() => false);
+    }
     if (res.morningDrain && res.morningDrain.emitNow.length > 0) {
       const lines = [
         `【早间对齐简报 · ${res.dateKey}】`,
@@ -980,7 +1032,15 @@ export class App {
       else if (patch[k] !== undefined) mergedRouting[k] = String(patch[k] ?? "");
     }
     if (Object.keys(mergedRouting).length > 0) {
+      const prevRouting = { ...this.providers.routing };
       this.providers.setRoleRouting(mergedRouting);
+      for (const k of ["assessor", "executor", "computerUse", "steward"] as const) {
+        const nextModel = mergedRouting[k];
+        const prevModel = prevRouting[k];
+        if (nextModel && prevModel && nextModel !== prevModel) {
+          this.stewardService.flagModelSwitchOnSim(k === "computerUse" ? "computer_use" : k, prevModel, nextModel);
+        }
+      }
     }
     if (patch.defaultModel !== undefined) {
       this.setDefaultModel(String(patch.defaultModel));
@@ -1455,6 +1515,7 @@ export class App {
       clearInterval(this.stewardPulseTimer);
       this.stewardPulseTimer = undefined;
     }
+    this.stewardService.dispose();
     this.account?.cancelLogin();
     this.sugentAuth?.cancelLogin();
     this.hotReloadBus.close();

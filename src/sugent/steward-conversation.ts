@@ -118,6 +118,15 @@ export interface StewardWorkbenchLike {
     }>;
   };
   concierge?: StewardConciergeView;
+  mindJournal?: { calibratedLessons?: string[] };
+  duoAnchors?: Array<{ id?: string; title: string; detail: string }>;
+  loyalDissent?: {
+    kind: "guardrail_warning" | "duo_agreement_mirror" | "goal_commitment_drift";
+    severity: "gentle_mirror" | "firm_boundary";
+    title: string;
+    mirrorMessage: string;
+    refId?: string;
+  } | null;
   vibeCoding?: { bindings: RepoBindingRecord[]; pipelines: VibePipelineRecord[] };
   capabilities?: CapabilityAwarenessSnapshot;
   opsFleet?: OpsStewardPendingSnapshot;

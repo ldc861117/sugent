@@ -13,18 +13,25 @@ import {
 } from "./byok-diagnostics.js";
 import { buildByokSyncViewModel, type ByokSyncViewModel } from "./byok-sync-viewmodel.js";
 import type { SyncableKGEdge, SyncableKGNode, SyncableKnowledgeGraphSnapshot } from "./e2ee-sync.js";
-import type { EntityKind, KGEdge, KGNode, SugentKnowledgeGraph } from "./knowledge-graph.js";
+import type { EntityKind, KGEdge, KGNode, SkillGateStatus, SugentKnowledgeGraph } from "./knowledge-graph.js";
 import type { LocalBudgetLedger } from "./local-budget.js";
 import type { SugentModelCatalog } from "./model-catalog.js";
 import { createP2GatewayHandlers } from "./p2-gateway-routes.js";
 import type { ProviderRegistry } from "./provider-registry.js";
+import type { LedgerSnapshot } from "./stewardship-ledger.js";
 
 type ProviderEntry = ReturnType<ProviderRegistry["listProviders"]>[number];
+
+export interface StewardshipLedgerSyncPort {
+  exportLedger: () => LedgerSnapshot;
+  importLedger: (snap: LedgerSnapshot) => void;
+}
 
 export interface SyncMetaRecord {
   deviceId: string;
   lamportClock: number;
   lastSyncedAtIso: string | null;
+  itemDigests?: Record<string, { clock: number; sig: string }>;
 }
 
 export interface SugentP2HostServiceOptions {
@@ -35,6 +42,7 @@ export interface SugentP2HostServiceOptions {
   knowledgeGraph: SugentKnowledgeGraph;
   getDefaultModel: () => string;
   getFetch: () => FetchLike;
+  ledgerPort?: StewardshipLedgerSyncPort;
 }
 
 const VALID_PROVIDER_IDS = new Set<SugentProviderId>([
@@ -83,13 +91,42 @@ function resolveRoleForProvider(
   return prov.id === "ollama" || prov.id === "deepseek" ? "assessor" : "executor";
 }
 
+function normalizeItemDigests(
+  raw: unknown,
+): Record<string, { clock: number; sig: string }> | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const out: Record<string, { clock: number; sig: string }> = {};
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    const rec = v as Partial<{ clock: number; sig: string }> | null;
+    if (
+      rec &&
+      typeof rec.clock === "number" &&
+      Number.isFinite(rec.clock) &&
+      typeof rec.sig === "string"
+    ) {
+      out[k] = { clock: Math.max(1, Math.floor(rec.clock)), sig: rec.sig };
+    }
+  }
+  return out;
+}
+
+function digestSyncPayload(payload: unknown): string {
+  return crypto.createHash("sha256").update(JSON.stringify(payload)).digest("hex").slice(0, 24);
+}
+
 export class SugentP2HostService {
   private readonly metaPath: string;
   private lastDiagnostics: ByokDiagnosticsReport | null = null;
   private lastSimulation: CostSandboxSimulation | null = null;
+  private ledgerPort?: StewardshipLedgerSyncPort;
 
   constructor(private readonly opts: SugentP2HostServiceOptions) {
     this.metaPath = path.join(opts.dataDir, "sugent-kg", "sync-meta.json");
+    this.ledgerPort = opts.ledgerPort;
+  }
+
+  attachStewardshipLedgerPort(port: StewardshipLedgerSyncPort): void {
+    this.ledgerPort = port;
   }
 
   private readSyncMeta(): SyncMetaRecord {
@@ -97,6 +134,7 @@ export class SugentP2HostService {
       try {
         const parsed = JSON.parse(fs.readFileSync(this.metaPath, "utf8")) as Partial<SyncMetaRecord>;
         if (typeof parsed.deviceId === "string" && parsed.deviceId.trim()) {
+          const itemDigests = normalizeItemDigests(parsed.itemDigests);
           return {
             deviceId: parsed.deviceId,
             lamportClock:
@@ -104,6 +142,7 @@ export class SugentP2HostService {
                 ? Math.max(1, Math.floor(parsed.lamportClock))
                 : 1,
             lastSyncedAtIso: typeof parsed.lastSyncedAtIso === "string" ? parsed.lastSyncedAtIso : null,
+            ...(itemDigests ? { itemDigests } : {}),
           };
         }
       } catch {
@@ -128,48 +167,110 @@ export class SugentP2HostService {
     fs.renameSync(tmp, this.metaPath);
   }
 
+  private buildNodeDigest(n: KGNode): string {
+    return digestSyncPayload({
+      id: n.id,
+      kind: n.kind,
+      name: n.name,
+      summary: n.summary,
+      tags: n.tags,
+      reinforcements: n.reinforcements,
+      steps: n.steps ?? null,
+      skillGateStatus: n.skillGateStatus ?? null,
+      updatedAt: n.updatedAt,
+    });
+  }
+
+  private buildEdgeDigest(e: KGEdge): string {
+    const updatedAt = (e as KGEdge & { updatedAt?: string }).updatedAt ?? e.supersededAt ?? e.validFrom;
+    return digestSyncPayload({
+      id: e.id,
+      from: e.from,
+      to: e.to,
+      relation: e.relation,
+      weight: e.weight,
+      source: e.source,
+      validFrom: e.validFrom,
+      supersededAt: e.supersededAt ?? null,
+      updatedAt,
+    });
+  }
+
   private exportGraphSnapshot(): SyncableKnowledgeGraphSnapshot {
     const meta = this.readSyncMeta();
+    const prevDigests = meta.itemDigests ?? {};
     const rawNodes = this.opts.knowledgeGraph.allNodes();
     const rawEdges = this.opts.knowledgeGraph.allEdges();
 
-    const nodes: SyncableKGNode[] = rawNodes.map((n) => ({
-      id: n.id,
-      type: n.kind,
-      label: n.name,
-      properties: {
-        summary: n.summary,
-        tags: n.tags,
-        reinforcements: n.reinforcements,
-        ...(n.steps ? { steps: n.steps } : {}),
-      },
-      validFrom: n.updatedAt,
-      supersededAt: null,
-      updatedAt: n.updatedAt,
-      lamportClock: meta.lamportClock,
-    }));
+    const nodeSigs = rawNodes.map((n) => ({ n, key: `node:${n.id}`, sig: this.buildNodeDigest(n) }));
+    const edgeSigs = rawEdges.map((e) => ({ e, key: `edge:${e.id}`, sig: this.buildEdgeDigest(e) }));
+    const dirty =
+      nodeSigs.some((x) => prevDigests[x.key]?.sig !== x.sig) ||
+      edgeSigs.some((x) => prevDigests[x.key]?.sig !== x.sig);
+    const snapshotClock = dirty ? meta.lamportClock + 1 : meta.lamportClock;
+    const nextDigests: Record<string, { clock: number; sig: string }> = {};
 
-    const edges: SyncableKGEdge[] = rawEdges.map((e) => ({
-      id: e.id,
-      source: e.from,
-      target: e.to,
-      relation: e.relation,
-      weight: e.weight,
-      validFrom: e.validFrom,
-      supersededAt: e.supersededAt ?? null,
-      updatedAt: e.supersededAt ?? e.validFrom,
-      lamportClock: meta.lamportClock,
-    }));
+    const nodes: SyncableKGNode[] = nodeSigs.map(({ n, key, sig }) => {
+      const prev = prevDigests[key];
+      const clock = prev && prev.sig === sig ? prev.clock : snapshotClock;
+      nextDigests[key] = { clock, sig };
+      return {
+        id: n.id,
+        type: n.kind,
+        label: n.name,
+        properties: {
+          summary: n.summary,
+          tags: n.tags,
+          reinforcements: n.reinforcements,
+          ...(n.steps ? { steps: n.steps } : {}),
+          ...(n.skillGateStatus ? { skillGateStatus: n.skillGateStatus } : {}),
+        },
+        validFrom: n.updatedAt,
+        supersededAt: null,
+        updatedAt: n.updatedAt,
+        lamportClock: clock,
+      };
+    });
 
+    const edges: SyncableKGEdge[] = edgeSigs.map(({ e, key, sig }) => {
+      const prev = prevDigests[key];
+      const clock = prev && prev.sig === sig ? prev.clock : snapshotClock;
+      nextDigests[key] = { clock, sig };
+      const updatedAt = (e as KGEdge & { updatedAt?: string }).updatedAt ?? e.supersededAt ?? e.validFrom;
+      return {
+        id: e.id,
+        source: e.from,
+        target: e.to,
+        relation: e.relation,
+        weight: e.weight,
+        provenanceSource: e.source,
+        validFrom: e.validFrom,
+        supersededAt: e.supersededAt ?? null,
+        updatedAt,
+        lamportClock: clock,
+      };
+    });
+
+    if (dirty) {
+      this.writeSyncMeta({
+        deviceId: meta.deviceId,
+        lamportClock: snapshotClock,
+        lastSyncedAtIso: meta.lastSyncedAtIso,
+        itemDigests: nextDigests,
+      });
+    }
+    const stewardshipLedger = this.ledgerPort?.exportLedger();
     return {
-      lamportClock: meta.lamportClock,
+      lamportClock: snapshotClock,
       deviceId: meta.deviceId,
       nodes,
       edges,
+      ...(stewardshipLedger ? { stewardshipLedger } : {}),
     };
   }
 
   private applyGraphSnapshot(merged: SyncableKnowledgeGraphSnapshot): void {
+    const itemDigests: Record<string, { clock: number; sig: string }> = {};
     const restoredNodes: KGNode[] = merged.nodes
       .filter((n) => !n.supersededAt)
       .map((n) => {
@@ -183,7 +284,12 @@ export class SugentP2HostService {
           typeof props.reinforcements === "number" && Number.isFinite(props.reinforcements)
             ? props.reinforcements
             : 1;
-        return {
+        const rawGate = props.skillGateStatus;
+        const skillGateStatus: SkillGateStatus | undefined =
+          rawGate === "candidate" || rawGate === "approved" || rawGate === "rejected"
+            ? rawGate
+            : undefined;
+        const node: KGNode = {
           id: n.id,
           kind,
           name: n.label,
@@ -191,27 +297,44 @@ export class SugentP2HostService {
           tags,
           reinforcements,
           ...(steps && steps.length > 0 ? { steps } : {}),
+          ...(skillGateStatus ? { skillGateStatus } : {}),
           updatedAt: n.updatedAt,
         };
+        itemDigests[`node:${node.id}`] = {
+          clock: typeof n.lamportClock === "number" && n.lamportClock > 0 ? n.lamportClock : merged.lamportClock,
+          sig: this.buildNodeDigest(node),
+        };
+        return node;
       });
 
-    const restoredEdges: KGEdge[] = merged.edges.map((e) => ({
-      id: e.id,
-      from: e.source,
-      relation: e.relation,
-      to: e.target,
-      weight: e.weight ?? 1,
-      source: "e2ee_sync",
-      validFrom: e.validFrom,
-      ...(e.supersededAt ? { supersededAt: e.supersededAt } : {}),
-    }));
+    const restoredEdges: KGEdge[] = merged.edges.map((e) => {
+      const edge: KGEdge = {
+        id: e.id,
+        from: e.source,
+        relation: e.relation,
+        to: e.target,
+        weight: e.weight ?? 1,
+        source: e.provenanceSource || "e2ee_sync",
+        validFrom: e.validFrom,
+        ...(e.supersededAt ? { supersededAt: e.supersededAt } : {}),
+      };
+      itemDigests[`edge:${edge.id}`] = {
+        clock: typeof e.lamportClock === "number" && e.lamportClock > 0 ? e.lamportClock : merged.lamportClock,
+        sig: this.buildEdgeDigest(edge),
+      };
+      return edge;
+    });
 
     this.opts.knowledgeGraph.replaceAll(restoredNodes, restoredEdges);
+    if (merged.stewardshipLedger && this.ledgerPort) {
+      this.ledgerPort.importLedger(merged.stewardshipLedger);
+    }
     const cur = this.readSyncMeta();
     this.writeSyncMeta({
       deviceId: cur.deviceId,
       lamportClock: merged.lamportClock,
       lastSyncedAtIso: new Date().toISOString(),
+      itemDigests,
     });
   }
 
@@ -356,6 +479,7 @@ export class SugentP2HostService {
         deviceId: cur.deviceId,
         lamportClock: res.body.data.lamportClock,
         lastSyncedAtIso: res.body.data.uploadedAtIso,
+        ...(cur.itemDigests ? { itemDigests: cur.itemDigests } : {}),
       });
     }
     return res;

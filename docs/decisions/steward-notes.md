@@ -87,3 +87,13 @@
    - 关系星晶通过 `topicKey` 绑定语义议题：当新阶段星晶经双方共鸣确认或满 3 次印证晋升为 `crystallized` 时，自动将同 `topicKey` 旧星晶置为 `superseded`（图谱侧写入 `exclusive: true`），提示词构建器强制过滤 `superseded` 与 `archived` 节点，杜绝反复翻炒已化解摩擦。
    - `bigfive-duo-site` 采用「优先调用 `SUGENT_DUO_HUB_URL` 中枢 + 异常/未配时无缝降级站内同构晶化内核」双保险架构，兼顾统一幕僚大脑演进与 Cloud Run 独立高可用。
 
+## 2026-11-28 · 记忆全景十大断点审计、硅基个体认知核与五维立体图谱（Wave P4 架构定标）
+
+1. **为什么「完全切脑隔离」会制造人格分裂，必须升级为「半透认知膜（Semi-Permeable Cognitive Membrane）」**：
+   - 旧方案将 `duo-spaces/<spaceId>/` 与 `StewardshipLedger` / 核心 `SugentKnowledgeGraph` 物理零连接，导致双重割裂：(a) 主理人连续熬夜救火时，双人关系幕僚完全感知不到其现实精力带宽枯竭，只能背诵静态人格套话；(b) 伴侣双方共同点亮“周五晚不谈工作”微约定后，核心幕僚在微信私聊里毫无感知并继续帮主理人排加班任务。同时 `bigfive-duo-site` 流式对话仍直连 Gemini 未走 `/duo/converse`，且伴侣 `W` 缺少对称的私密口袋。
+   - 正解：以 **`PartnerWeatherCapsule`（仅透传枚举级精力负荷与恢复偏好，零项目/金额/原文词元）** + **双方对称加密私密口袋（`pocket:M_private` / `pocket:W_private`）** + **共认星晶/微约定只读回链至 `owner_life`** 替代机械空气隔离。
+2. **硅基个体连续性：`SiliconIdentityCore` + `EpistemicDigestionLoop` 避坑边界**：
+   - 既要废除 `src/agent/steward.ts:107` 禁止记助手自身回答的自宫条款，又要严守 `2026-11-21` 确立的防膨胀红线（绝不引入 `BioCore` 拟人激素或无确认热改特质向量）。所有助手判断与人际调频经验均先以 `digested_state` 入沙盒，经现实印证或确认后才晋升 `crystallized_wisdom`。
+3. **本轮源码审计暴露的十大工程断流（Wave P4.1 优先止血）**：
+   - `BotRuntime` P0.1 拦截微信/飞书主理人私聊后提前 `return` 导致绕过 `scheduleReview()`；`decideSkillCandidate` 写向孤岛 `<dataDir>/skills` 且 `skillName`/YAML 未转义被 DSH 静默拒载；`MemoryGardener` 返回的修剪/降级/品味更新全部丢弃未落盘；`SugentSIMStore` 运行时 0 调用；`SugentKnowledgeGraph.removeEdge` 不归档节点导致旧事实诈尸且 `query === ""` 绕过 `maxNodes`；`ConciergeChannelBridge` 查找不存在的 `peer:` 标签且全图变金丝雀；`p2-host-service.ts` E2EE 同步丢失 `skillGateStatus` 与 `edge.source` 且漏同步 `ledger.json`。
+

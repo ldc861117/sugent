@@ -13,6 +13,7 @@
  * 4. 经验 -> 固化技能结晶 (Autonomous Skill Crystallization)：
  *    - 当某个 workflow 节点在实践中累计成功执行达到阈值（默认 3 次），自动生成标准 SKILL.md 模板并落盘到技能目录，将"非结构化经验"永久固化为"可执行技能"
  */
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { looksSecret } from "../agent/memory.js";
@@ -57,6 +58,8 @@ export interface KGNode {
   steps?: string[];
   /** 技能结晶确认门禁状态（candidate -> approved / rejected） */
   skillGateStatus?: SkillGateStatus;
+  /** 若节点已被归档或删除（例如孤立记忆），召回与结晶时自动跳过 */
+  supersededAt?: string;
   updatedAt: string;
 }
 
@@ -68,6 +71,7 @@ export interface KGEdge {
   weight: number;
   source: string;
   validFrom: string;
+  updatedAt?: string;
   /** 若被更新的事实取代，则记录取代时间戳，召回活跃子图时自动过滤已过时事实 */
   supersededAt?: string;
 }
@@ -92,6 +96,31 @@ export interface SubgraphSnapshot {
 }
 
 export const SKILL_CRYSTALLIZE_THRESHOLD = 3;
+
+const GENERIC_SKILL_SEGMENTS = new Set(["mem", "wf", "general"]);
+
+/**
+ * 将知识图谱节点 ID 规范化为 DSH 技能目录名：
+ * 纯 ASCII ID 保持稳定（如 `wf:upstream-sync` -> `wf-upstream-sync`）；
+ * 含非 ASCII 字符且 ASCII slug 为空或仅含泛化前缀时追加 8 位确定性 SHA-256 哈希后缀避免碰撞。
+ */
+export function sanitizeDshSkillName(rawId: string): string {
+  const input = String(rawId ?? "");
+  const ascii = input
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  const hasNonAscii = /[^\x00-\x7f]/.test(input);
+  const segments = ascii ? ascii.split("-").filter(Boolean) : [];
+  const onlyGenericOrEmpty =
+    segments.length === 0 ||
+    segments.every((seg) => GENERIC_SKILL_SEGMENTS.has(seg) || seg.length <= 1);
+  if (hasNonAscii && onlyGenericOrEmpty) {
+    const hash = crypto.createHash("sha256").update(input, "utf8").digest("hex").slice(0, 8);
+    return `${ascii ? `${ascii}-` : "skill-"}${hash}`;
+  }
+  return ascii || "skill";
+}
 
 /**
  * 供后台管家模型（steward）从对话归档中抽取结构化知识图谱与可复用 SOP 工作流的系统提示词
@@ -264,6 +293,7 @@ export class SugentKnowledgeGraph {
             existingEdge.to !== edgeInput.to
           ) {
             existingEdge.supersededAt = now;
+            existingEdge.updatedAt = now;
             this.appendJournal({ op: "supersede_edge", edgeId: existingEdge.id, byTo: edgeInput.to });
           }
         }
@@ -279,6 +309,7 @@ export class SugentKnowledgeGraph {
         weight: edgeInput.weight ?? (existing ? existing.weight + 1 : 1),
         source: edgeInput.source,
         validFrom: existing?.validFrom ?? now,
+        updatedAt: now,
       };
       this.edges.set(edgeId, edge);
       upsertedEdges++;
@@ -289,6 +320,30 @@ export class SugentKnowledgeGraph {
     return { upsertedNodes, upsertedEdges };
   }
 
+  private maybeArchiveOrphanMemoryNode(targetId: string, now: string): void {
+    if (!targetId.startsWith("mem:")) return;
+    const targetNode = this.nodes.get(targetId);
+    if (!targetNode || targetNode.supersededAt) return;
+    for (const e of this.edges.values()) {
+      if (!e.supersededAt && (e.from === targetId || e.to === targetId)) {
+        return;
+      }
+    }
+    targetNode.supersededAt = now;
+    targetNode.updatedAt = now;
+    this.appendJournal({ op: "archive_node", id: targetId, reason: "orphan_mem_after_edge_removal" });
+  }
+
+  archiveNode(nodeId: string, now = new Date().toISOString()): boolean {
+    const node = this.nodes.get(nodeId);
+    if (!node || node.supersededAt) return false;
+    node.supersededAt = now;
+    node.updatedAt = now;
+    this.appendJournal({ op: "archive_node", id: nodeId });
+    this.save();
+    return true;
+  }
+
   /**
    * 显式将指定活跃边标记为已取代（用于知识清理、记忆园丁修剪与 ReviewOps 移除）。
    */
@@ -296,7 +351,9 @@ export class SugentKnowledgeGraph {
     const existing = this.edges.get(edgeId);
     if (!existing || existing.supersededAt) return false;
     existing.supersededAt = now;
+    existing.updatedAt = now;
     this.appendJournal({ op: "remove_edge", id: edgeId, source: existing.source });
+    this.maybeArchiveOrphanMemoryNode(existing.to, now);
     this.save();
     return true;
   }
@@ -357,8 +414,10 @@ export class SugentKnowledgeGraph {
         const hay = `${edge.to} ${targetNode?.name ?? ""} ${targetNode?.summary ?? ""}`.toLowerCase();
         if (removeTerms.some((term) => hay.includes(term))) {
           edge.supersededAt = now;
+          edge.updatedAt = now;
           removedEdges++;
           this.appendJournal({ op: "remove_edge", id: edge.id, source: "steward_review" });
+          this.maybeArchiveOrphanMemoryNode(edge.to, now);
         }
       }
     }
@@ -385,7 +444,9 @@ export class SugentKnowledgeGraph {
    * 先通过关键词匹配种子实体，再沿活跃关系边向外扩展 `maxHops` 跳，生成结构化上下文快照。
    */
   recallSubgraph(query: string, maxHops = 2, maxNodes = 20): SubgraphSnapshot {
+    const limit = Math.max(1, maxNodes);
     const rawLower = query.toLowerCase().trim();
+    const CJK_1CHAR_NOISE = /^(?:我|你|他|她|它|在|有|是|不|人|都|也|就|要|会|这|那|个|上|下|里)$/;
     const terms: string[] = [];
     if (rawLower) {
       for (const tok of rawLower.split(/[\s,.;:!?，。；：！？、()（）【】\[\]"'“”‘’]+/).filter(Boolean)) {
@@ -397,48 +458,73 @@ export class SugentKnowledgeGraph {
         );
         for (const seg of cjkClean.split(/\s+/).filter(Boolean)) {
           const chars = Array.from(seg).filter((ch) => /\p{Script=Han}/u.test(ch));
-          if (chars.length === 1) terms.push(chars[0]!);
+          if (chars.length === 1 && !CJK_1CHAR_NOISE.test(chars[0]!)) terms.push(chars[0]!);
           for (let i = 0; i + 1 < chars.length; i++) {
             terms.push(chars[i]! + chars[i + 1]!);
           }
         }
-        if (terms.length === 0) terms.push(tok);
+        if (terms.length === 0 && !CJK_1CHAR_NOISE.test(tok)) terms.push(tok);
       }
     }
-
+    const uniqueTerms = Array.from(new Set(terms));
+    const seedScores = new Map<string, number>();
+    const seedEntries: Array<{ node: KGNode; score: number }> = [];
+    for (const node of this.nodes.values()) {
+      if (node.supersededAt) continue;
+      if (!rawLower) {
+        seedScores.set(node.id, node.reinforcements);
+        seedEntries.push({ node, score: node.reinforcements });
+        continue;
+      }
+      if (uniqueTerms.length === 0) continue;
+      const hay = `${node.id} ${node.name} ${node.summary} ${node.tags.join(" ")}`.toLowerCase();
+      let termHitScore = 0;
+      for (const t of uniqueTerms) {
+        if (hay.includes(t)) termHitScore += 1;
+      }
+      if (termHitScore > 0) {
+        const score = termHitScore * 10 + node.reinforcements;
+        seedScores.set(node.id, score);
+        seedEntries.push({ node, score });
+      }
+    }
+    seedEntries.sort((a, b) => b.score - a.score || b.node.reinforcements - a.node.reinforcements);
     const visited = new Set<string>();
     let frontier = new Set<string>();
-
-    for (const node of this.nodes.values()) {
-      const hay = `${node.id} ${node.name} ${node.summary} ${node.tags.join(" ")}`.toLowerCase();
-      if (!terms.length || terms.some((t) => hay.includes(t))) {
-        visited.add(node.id);
-        frontier.add(node.id);
-      }
+    for (const entry of seedEntries.slice(0, limit)) {
+      visited.add(entry.node.id);
+      frontier.add(entry.node.id);
     }
 
     const active = this.activeEdges();
-    for (let hop = 0; hop < maxHops && frontier.size > 0 && visited.size < maxNodes; hop++) {
+    for (let hop = 0; hop < maxHops && frontier.size > 0 && visited.size < limit; hop++) {
       const nextFrontier = new Set<string>();
       for (const edge of active) {
         if (frontier.has(edge.from) && !visited.has(edge.to)) {
-          visited.add(edge.to);
-          nextFrontier.add(edge.to);
+          const toNode = this.nodes.get(edge.to);
+          if (toNode && !toNode.supersededAt) {
+            visited.add(edge.to);
+            nextFrontier.add(edge.to);
+          }
         } else if (frontier.has(edge.to) && !visited.has(edge.from)) {
-          visited.add(edge.from);
-          nextFrontier.add(edge.from);
+          const fromNode = this.nodes.get(edge.from);
+          if (fromNode && !fromNode.supersededAt) {
+            visited.add(edge.from);
+            nextFrontier.add(edge.from);
+          }
         }
-        if (visited.size >= maxNodes) break;
+        if (visited.size >= limit) break;
       }
       frontier = nextFrontier;
     }
 
     const matchedNodes = Array.from(visited)
       .map((id) => this.nodes.get(id)!)
-      .filter(Boolean)
-      .sort((a, b) => b.reinforcements - a.reinforcements);
-
-    const relevantEdges = active.filter((e) => visited.has(e.from) && visited.has(e.to));
+      .filter((n): n is KGNode => Boolean(n) && !n.supersededAt)
+      .sort((a, b) => (seedScores.get(b.id) ?? b.reinforcements) - (seedScores.get(a.id) ?? a.reinforcements) || b.reinforcements - a.reinforcements)
+      .slice(0, limit);
+    const keptIds = new Set(matchedNodes.map((n) => n.id));
+    const relevantEdges = active.filter((e) => keptIds.has(e.from) && keptIds.has(e.to));
 
     const lines: string[] = [];
     if (matchedNodes.length) {
@@ -470,12 +556,13 @@ export class SugentKnowledgeGraph {
   crystallizeSkills(threshold = SKILL_CRYSTALLIZE_THRESHOLD): Array<{ skillName: string; markdown: string; node: KGNode }> {
     const out: Array<{ skillName: string; markdown: string; node: KGNode }> = [];
     for (const node of this.nodes.values()) {
-      if (node.kind !== "workflow" || node.reinforcements < threshold || !node.steps?.length) continue;
-      const skillName = node.id.replace(/[^a-zA-Z0-9_-]/g, "-").toLowerCase();
+      if (node.supersededAt || node.kind !== "workflow" || node.reinforcements < threshold || !node.steps?.length) continue;
+      const skillName = sanitizeDshSkillName(node.id);
+      const safeDescription = JSON.stringify(node.summary.replace(/\s+/g, " ").trim());
       const md = [
         "---",
         `name: ${skillName}`,
-        `description: ${node.summary}`,
+        `description: ${safeDescription}`,
         "---",
         "",
         `# ${node.name}`,
@@ -497,7 +584,7 @@ export class SugentKnowledgeGraph {
     const out: SkillCandidateSummary[] = [];
     let dirty = false;
     for (const node of this.nodes.values()) {
-      if (node.kind !== "workflow" || node.reinforcements < threshold || !node.steps?.length) continue;
+      if (node.supersededAt || node.kind !== "workflow" || node.reinforcements < threshold || !node.steps?.length) continue;
       if (!node.skillGateStatus) {
         node.skillGateStatus = "candidate";
         dirty = true;
@@ -505,7 +592,7 @@ export class SugentKnowledgeGraph {
       if (!includeDecided && node.skillGateStatus !== "candidate") continue;
       out.push({
         nodeId: node.id,
-        skillName: node.id.replace(/[^a-zA-Z0-9_-]/g, "-").toLowerCase(),
+        skillName: sanitizeDshSkillName(node.id),
         name: node.name,
         summary: node.summary,
         reinforcements: node.reinforcements,
@@ -620,4 +707,17 @@ export class SugentKnowledgeGraph {
     for (const e of edges) this.edges.set(e.id, e);
     this.save();
   }
+}
+
+export function resolveActiveDshSkillDirs(dataDir: string, botIds: readonly string[] = ["default"]): string[] {
+  const base = path.resolve(dataDir);
+  const candidates: string[] = [
+    ...botIds.map((id) => path.join(base, "dsh", id, "skills")),
+    path.join(base, "skills"),
+  ];
+  const selfRepoExtDir = path.join(base, "self-repo", "extensions");
+  if (fs.existsSync(selfRepoExtDir)) {
+    candidates.push(path.join(selfRepoExtDir, ".dsh", "skills"));
+  }
+  return Array.from(new Set(candidates));
 }

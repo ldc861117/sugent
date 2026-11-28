@@ -6,6 +6,7 @@ import {
   randomBytes,
 } from "node:crypto";
 import type { SugentBrokerClaims } from "./auth-broker-contract.js";
+import type { LedgerSnapshot } from "./stewardship-ledger.js";
 
 export type { SugentBrokerClaims } from "./auth-broker-contract.js";
 
@@ -70,6 +71,7 @@ export interface SyncableKGEdge {
   target: string;
   relation: string;
   weight?: number;
+  provenanceSource?: string;
   validFrom: string;
   validUntil?: string | null;
   supersededAt: string | null;
@@ -82,6 +84,7 @@ export interface SyncableKnowledgeGraphSnapshot {
   deviceId: string;
   nodes: SyncableKGNode[];
   edges: SyncableKGEdge[];
+  stewardshipLedger?: LedgerSnapshot;
 }
 
 export function deriveSyncKeyHierarchy(params: {
@@ -402,6 +405,88 @@ function pickWinningRecord<
   };
 }
 
+function mergeNodeRecords(a: SyncableKGNode, b: SyncableKGNode): SyncableKGNode {
+  const merged = pickWinningRecord(a, b);
+  const aReinf = typeof a.properties?.reinforcements === "number" && Number.isFinite(a.properties.reinforcements)
+    ? a.properties.reinforcements
+    : undefined;
+  const bReinf = typeof b.properties?.reinforcements === "number" && Number.isFinite(b.properties.reinforcements)
+    ? b.properties.reinforcements
+    : undefined;
+  if (aReinf === undefined && bReinf === undefined) return merged;
+  return {
+    ...merged,
+    properties: {
+      ...(merged.properties ?? {}),
+      reinforcements: Math.max(aReinf ?? 0, bReinf ?? 0),
+    },
+  };
+}
+
+function mergeEdgeRecords(a: SyncableKGEdge, b: SyncableKGEdge): SyncableKGEdge {
+  const merged = pickWinningRecord(a, b);
+  return {
+    ...merged,
+    weight: Math.max(a.weight ?? 1, b.weight ?? 1),
+  };
+}
+
+function ledgerRecordTs(item: Record<string, unknown>): string {
+  for (const k of ["updatedAt", "createdAt", "lastProgressAt"]) {
+    if (typeof item[k] === "string" && item[k]) return item[k] as string;
+  }
+  return "";
+}
+
+function mergeLedgerArray<T extends { id: string }>(localArr: T[], remoteArr: T[]): T[] {
+  const map = new Map<string, T>();
+  for (const item of localArr) map.set(item.id, item);
+  for (const rItem of remoteArr) {
+    const existing = map.get(rItem.id);
+    if (!existing) {
+      map.set(rItem.id, rItem);
+      continue;
+    }
+    const tsA = ledgerRecordTs(existing as unknown as Record<string, unknown>);
+    const tsB = ledgerRecordTs(rItem as unknown as Record<string, unknown>);
+    const winner = tsA !== tsB
+      ? (tsA > tsB ? existing : rItem)
+      : (JSON.stringify(existing) >= JSON.stringify(rItem) ? existing : rItem);
+    map.set(rItem.id, winner);
+  }
+  return Array.from(map.values()).sort((x, y) => x.id.localeCompare(y.id));
+}
+
+function mergeStewardshipLedgers(
+  local: LedgerSnapshot | undefined,
+  remote: LedgerSnapshot | undefined,
+): LedgerSnapshot | undefined {
+  if (!local && !remote) return undefined;
+  const goals = mergeLedgerArray(local?.goals ?? [], remote?.goals ?? []);
+  const active = goals.filter((g) => g.status === "active");
+  if (active.length > 3) {
+    const keepIds = new Set(
+      [...active]
+        .sort((a, b) => b.lastProgressAt.localeCompare(a.lastProgressAt) || b.id.localeCompare(a.id))
+        .slice(0, 3)
+        .map((g) => g.id),
+    );
+    for (const g of goals) {
+      if (g.status === "active" && !keepIds.has(g.id)) g.status = "paused";
+    }
+  }
+  const updatedAt = [local?.updatedAt ?? "", remote?.updatedAt ?? ""].sort().pop() || new Date().toISOString();
+  return {
+    version: 1,
+    updatedAt,
+    relationships: mergeLedgerArray(local?.relationships ?? [], remote?.relationships ?? []),
+    goals,
+    guardrails: mergeLedgerArray(local?.guardrails ?? [], remote?.guardrails ?? []),
+    commitments: mergeLedgerArray(local?.commitments ?? [], remote?.commitments ?? []),
+    resources: mergeLedgerArray(local?.resources ?? [], remote?.resources ?? []),
+  };
+}
+
 export function mergeKnowledgeGraphSnapshots(
   local: SyncableKnowledgeGraphSnapshot,
   remote: SyncableKnowledgeGraphSnapshot,
@@ -410,31 +495,29 @@ export function mergeKnowledgeGraphSnapshots(
   const nextLamport = Math.max(local.lamportClock, remote.lamportClock) + 1;
 
   const nodeMap = new Map<string, SyncableKGNode>();
-  for (const node of local.nodes) {
-    nodeMap.set(node.id, node);
-  }
+  for (const node of local.nodes) nodeMap.set(node.id, node);
   for (const rNode of remote.nodes) {
     const existing = nodeMap.get(rNode.id);
-    nodeMap.set(rNode.id, existing ? pickWinningRecord(existing, rNode) : rNode);
+    nodeMap.set(rNode.id, existing ? mergeNodeRecords(existing, rNode) : rNode);
   }
 
   const edgeMap = new Map<string, SyncableKGEdge>();
-  for (const edge of local.edges) {
-    edgeMap.set(edge.id, edge);
-  }
+  for (const edge of local.edges) edgeMap.set(edge.id, edge);
   for (const rEdge of remote.edges) {
     const existing = edgeMap.get(rEdge.id);
-    edgeMap.set(rEdge.id, existing ? pickWinningRecord(existing, rEdge) : rEdge);
+    edgeMap.set(rEdge.id, existing ? mergeEdgeRecords(existing, rEdge) : rEdge);
   }
 
   const nodes = Array.from(nodeMap.values()).sort((x, y) => x.id.localeCompare(y.id));
   const edges = Array.from(edgeMap.values()).sort((x, y) => x.id.localeCompare(y.id));
+  const stewardshipLedger = mergeStewardshipLedgers(local.stewardshipLedger, remote.stewardshipLedger);
 
   return {
     lamportClock: nextLamport,
     deviceId: mergingDeviceId,
     nodes,
     edges,
+    ...(stewardshipLedger ? { stewardshipLedger } : {}),
   };
 }
 
@@ -541,6 +624,9 @@ export class ZeroKnowledgeSyncClient {
     }
 
     const envelope = (await res.json()) as ZeroKnowledgeEnvelope;
+    if (!envelope || typeof envelope !== "object" || envelope.v !== 1) {
+      throw new Error("E2EE_UNENCRYPTED_STUB: Remote blob is missing envelope version v=1.");
+    }
     const opened = openZeroKnowledgeEnvelope<SyncableKnowledgeGraphSnapshot>({
       envelope,
       passphrase: params.passphrase,
