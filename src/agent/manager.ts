@@ -80,6 +80,18 @@ export interface AgentManagerOptions {
   maxActiveCrystallizedSkills?: number;
   /** 由宿主提供的五维账本/立体图谱摘要钩子，向 DSH 桌面/后台任务段首注入当前主目标与红线 */
   stewardContextBrief?: (botId: string, conversationId: string) => string;
+  /** amb-steward-fleet 插件：跨端项目态势与治理文档工具（仅私聊可用） */
+  stewardFleetOp?: (
+    params: {
+      botId: string;
+      conversationId?: string;
+      isGroup: boolean;
+      isObserveRule: boolean;
+      op: string;
+      args: Record<string, unknown>;
+    },
+    signal: AbortSignal,
+  ) => Promise<unknown>;
 }
 
 /** 一个进行中的回合（/status、/stop、排队提示、信息面板和故障排查用） */
@@ -202,6 +214,7 @@ export class AgentManager {
       cancel: async (b) => void this.approvals.cancel(String(b?.id ?? ""), "agent"),
       memory: (b) => this.memoryOp(b),
       steward: (b) => this.stewardCall(b),
+      stewardFleet: (b, signal) => this.stewardFleetOpCall(b, signal),
       media: (b) => this.mediaOp(b),
       search: (b, signal) => this.searchOp(b, signal),
       connections: (b, signal) => this.connectionOp(b, signal),
@@ -893,6 +906,33 @@ export class AgentManager {
       if (e instanceof MemoryError) return { error: e.message };
       throw e;
     }
+  }
+
+  /** 插件 → 宿主：跨端全域项目态势与只读文档拉取（群聊强制拒绝）。 */
+  private async stewardFleetOpCall(b: any, signal: AbortSignal): Promise<unknown> {
+    if (!this.o.stewardFleetOp) return { ok: false, error: "steward_fleet is not configured" };
+    const botId = String(b?.botId ?? "");
+    const sessionId = String(b?.sessionId ?? "");
+    const convId = this.resolveConversation(botId, sessionId);
+    const isObserveRule = /^rule-/.test(sessionId);
+    const isTaskSess = /^task-/.test(sessionId);
+    if (!convId && !isObserveRule && !isTaskSess) {
+      return { ok: false, errorCode: "OWNER_PRIVATE_ONLY", error: "unmapped session" };
+    }
+    const conv = convId ? this.o.store.getConversation(convId) : undefined;
+    const isGroup = conv?.kind === "group";
+    if (isGroup) return { ok: false, errorCode: "OWNER_PRIVATE_ONLY", error: "steward_fleet is disabled in group chats" };
+    return this.o.stewardFleetOp(
+      {
+        botId,
+        ...(convId ? { conversationId: convId } : {}),
+        isGroup: false,
+        isObserveRule,
+        op: String(b?.op ?? "overview"),
+        args: b?.args && typeof b.args === "object" && !Array.isArray(b.args) ? (b.args as Record<string, unknown>) : {},
+      },
+      signal,
+    );
   }
 
   /** 插件 → 宿主：代理空闲时取管家判定（phase=idle），压缩完成后回报（phase=done）。 */

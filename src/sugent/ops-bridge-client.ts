@@ -86,6 +86,43 @@ export interface OpsInboxItem {
   createdAtIso?: string;
 }
 
+export interface OpsRoadmapItemSummary {
+  id: string;
+  title: string;
+  status: string;
+  actor?: string;
+}
+
+export interface OpsRoadmapNodeSummary {
+  id?: string;
+  kind?: string;
+  code?: string;
+  title: string;
+  status: string;
+  marker?: string;
+  progress?: {
+    done?: number;
+    inProgress?: number;
+    todo?: number;
+    blocked?: number;
+    total?: number;
+    pct?: number;
+    codeDone?: number;
+    codeTotal?: number;
+    realDone?: number;
+    realTotal?: number;
+  };
+  hasExitGate?: boolean;
+  gates?: { entry?: string[]; exit?: string[] };
+  items?: OpsRoadmapItemSummary[];
+}
+
+export interface OpsRepoPlanDocSummary {
+  path: string;
+  title: string;
+  updatedAtIso?: string;
+}
+
 export interface OpsStewardProjectItem {
   projectKey: string;
   displayName?: string;
@@ -124,14 +161,46 @@ export interface OpsStewardProjectItem {
     updatedAt?: string;
   };
   roadmapSummary?: {
+    schemaVersion?: number;
+    sourcePath?: string;
+    title?: string;
+    activeNodeId?: string;
     activeNode?: {
+      id?: string;
+      kind?: string;
       code?: string;
       title?: string;
       status?: string;
-      progress?: { done?: number; total?: number; pct?: number };
+      progress?: {
+        done?: number;
+        total?: number;
+        pct?: number;
+        codeDone?: number;
+        codeTotal?: number;
+        realDone?: number;
+        realTotal?: number;
+      };
     };
-    totals?: { done?: number; total?: number; pct?: number };
+    totals?: {
+      done?: number;
+      total?: number;
+      pct?: number;
+      codeDone?: number;
+      codeTotal?: number;
+      realDone?: number;
+      realTotal?: number;
+    };
+    overallProgress?: {
+      done?: number;
+      inProgress?: number;
+      todo?: number;
+      blocked?: number;
+      total?: number;
+      pct?: number;
+    };
+    nodes?: OpsRoadmapNodeSummary[];
   };
+  recentPlans?: OpsRepoPlanDocSummary[];
 }
 
 export interface OpsPublicConciergeItem {

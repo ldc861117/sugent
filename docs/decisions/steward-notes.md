@@ -109,3 +109,10 @@
    - `runAtlasSleepConsolidation` 严守“同平面 `>= 3` 条且零冲突才自动合成 `crystallized_wisdom`”纪律：一旦 `detectPairwiseMemoryConflict` 检出数值（如 `30天 vs 60天`）或极性冲突，立即熔断自动合成并生成单问双选项消歧卡；清理低权重边时禁止连带归档仍有其它健康语义支撑的高阶节点。
    - `duo/converse` 防抖自动提炼出的星晶硬性锁定 `status: "candidate"`（且对话自动累加 `reinforcements` 封顶 `< 3`），保留伴侣双方共阅点亮主权；`proactive-cadence.ts` 在纯函数内核（零 `fs`/网络/`Date.now`）内解析 ISO 时区偏移匹配 `M3` 共处护窗并顺延非紧急通知。
    - 主观生成质量评测摒弃未经验证的 1–5 打分，采用 `train(4)/dev(6)/test(12)` 严格零重叠切分的独立二元（`PASS/FAIL`）裁判，并在 Held-out `test` 集上强制 `TPR >= 0.85`、`TNR >= 0.85` 及输出 Rogan-Gladen 偏差校正通过率与 Delta-Method 95% 置信区间。
+
+## 2026-11-28 · 云端零盲区全量路线图树、双源时序合并与 DSH `steward_fleet` 工具注入
+
+1. **为什么云端容器不能只收 `activeNode + totals` 汇总数字，也绝不把 `edge-tentacle` 无条件视为真值**：
+   - 汇总数字导致回答“P3.2 前还有哪些前置待办”时无法看到已完成列表与全部阶段；而离线 `edge-tentacle` 旧脉冲无条件覆盖 `/ops` 会制造状态卡与 `running` 僵死回退。正解是在 `edge-tentacle-hub` 中完整同步 `nodes[].items[]` 与 `recentPlans[]`，同时在 `StewardHostService` 落盘持久化 `ops-remote-snapshot.json` 并按状态卡时间做新旧裁决、对离线节点清除僵死 `running`。
+2. **用 `amb-steward-fleet.mjs` 回环插件打通 DSH 主对话，严守 `packages/dsh-superagent/` 零侵入铁律**：
+   - 不改 DSH 上游包，直接在 `dsh-runtime/plugins/amb-steward-fleet.mjs` 注册 `steward_fleet` 原生工具并通过 `/dsh/steward-fleet` 直连宿主 `StewardHostService`（支持跨节点 `read_repo_doc` 静默只读与群聊/观察规则强制隔离），根治“主对话只能用 bash 翻 `/data` JSON 盲猜”的割裂问题。

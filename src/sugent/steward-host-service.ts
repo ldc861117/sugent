@@ -145,6 +145,7 @@ import {
   type OpsPublicConciergeItem,
   type OpsRemoteCommand,
   type OpsStewardPendingSnapshot,
+  type OpsStewardProjectItem,
 } from "./ops-bridge-client.js";
 import {
   E2eeOfflineDigestVault,
@@ -175,6 +176,7 @@ import {
 } from "./weapon-packages.js";
 import {
   EdgeTentacleHub,
+  readSanitizedGovernanceDocFromRepo,
   redactLocalPaths,
   type EdgeIngestPulseInput,
   type EdgeNodeStatus,
@@ -562,6 +564,7 @@ export class SugentStewardHostService {
   private lastCadenceScan?: StewardWorkbenchSnapshot["cadence"]["lastScan"];
   private lastMorningDrain?: StewardWorkbenchSnapshot["cadence"]["lastMorningDrain"];
   private remoteOpsSnapshot?: OpsStewardPendingSnapshot;
+  private readonly remoteOpsSnapshotPath: string;
   private readonly stagedOpsInbox = new Map<string, OpsInboxItem>();
   private readonly opsCommitmentsMetaPath: string;
   private opsCommitmentsMeta: Record<
@@ -637,7 +640,9 @@ export class SugentStewardHostService {
     this.prefsPath = path.join(stewardDir, "steward-prefs.json");
     this.pulseStatePath = path.join(stewardDir, "pulse-state.json");
     this.opsCommitmentsMetaPath = path.join(stewardDir, "ops-human-commitments-meta.json");
+    this.remoteOpsSnapshotPath = path.join(stewardDir, "ops-remote-snapshot.json");
     this.loadOpsCommitmentsMeta();
+    this.loadRemoteOpsSnapshot();
     this.loadViewedWatermarks();
     this.loadPrefs();
     this.repoBindings = new RepoBindingRegistry({ dataDir: opts.dataDir, nowIso: this.nowIsoFn });
@@ -840,6 +845,7 @@ export class SugentStewardHostService {
         updateRoutingPolicy: (patch) => this.updateRoutingPolicy(patch),
         manageHotUpdate: (input) => this.executeHotUpdateAction(input),
         refreshOpsFleet: () => this.refreshRemoteOpsSnapshot(),
+        readProjectGovernanceDoc: (input) => this.readProjectGovernanceDoc(input),
         proposeOpsInbox: (input) => this.proposeOpsInbox(input),
         recallChatHistory: (input) => this.recallChatHistory(input),
         dispatchEdgeAntigravity: (input) => this.dispatchEdgeAntigravity(input),
@@ -2490,8 +2496,27 @@ export class SugentStewardHostService {
     };
   }
 
+  private loadRemoteOpsSnapshot(): void {
+    try {
+      if (!fs.existsSync(this.remoteOpsSnapshotPath)) return;
+      const parsed = JSON.parse(fs.readFileSync(this.remoteOpsSnapshotPath, "utf8")) as OpsStewardPendingSnapshot;
+      if (parsed && Array.isArray(parsed.projects)) {
+        this.remoteOpsSnapshot = parsed;
+      }
+    } catch {
+      // ignore corrupted snapshot cache
+    }
+  }
+
   setRemoteOpsSnapshot(snapshot: OpsStewardPendingSnapshot | undefined): void {
     this.remoteOpsSnapshot = snapshot;
+    if (snapshot) {
+      try {
+        writeJsonAtomic600(this.remoteOpsSnapshotPath, snapshot);
+      } catch {
+        // ignore best-effort persistence error
+      }
+    }
     this.stagedOpsInbox.clear();
     if (snapshot?.pendingInbox) {
       for (const item of snapshot.pendingInbox) {
@@ -2535,6 +2560,9 @@ export class SugentStewardHostService {
     };
 
     const byKey = new Map<string, OpsStewardPendingSnapshot["projects"][number]>();
+    const onlineNodes = new Set(this.edgeHub.listNodes().filter((n) => n.online).map((n) => n.nodeId));
+    const cardTs = (it: OpsStewardProjectItem | undefined): number =>
+      Date.parse(it?.statusCard?.updatedAt ?? it?.lastActiveAt ?? it?.updatedAtIso ?? "") || 0;
     for (const p of this.remoteOpsSnapshot.projects) {
       if (p?.projectKey) byKey.set(p.projectKey, p);
     }
@@ -2551,22 +2579,38 @@ export class SugentStewardHostService {
       const keepUserDomain = prev.domainSource === "user_override" && Boolean(prev.domain);
       const keepUserStage = prev.stageSource === "user_override" && Boolean(prev.stage);
       const keepUserBoard = prev.boardStatusSource === "user_override" && Boolean(prev.boardStatus);
-      const isRunning = ep.status === "running" || prev.status === "running";
+      const epNodeOnline = ep.nodeId ? onlineNodes.has(ep.nodeId) : false;
+      const isRunning = (epNodeOnline && ep.status === "running") || prev.status === "running";
+      const epMs = cardTs(ep);
+      const prevMs = cardTs(prev);
+      const preferPrevCard = prevMs > epMs && Boolean(prev.statusCard);
+      const chosenCard = preferPrevCard
+        ? (prev.statusCard ?? ep.statusCard)
+        : (prevMs === epMs && prev.statusCard?.reviewState === "confirmed" && ep.statusCard
+            ? { ...ep.statusCard, reviewState: "confirmed" }
+            : (ep.statusCard ?? prev.statusCard));
+      const baseRm = preferPrevCard ? (prev.roadmapSummary ?? ep.roadmapSummary) : (ep.roadmapSummary ?? prev.roadmapSummary);
+      const mergedNodes = baseRm?.nodes?.length ? baseRm.nodes : (ep.roadmapSummary?.nodes ?? prev.roadmapSummary?.nodes);
+      const mergedRoadmap = baseRm ? { ...baseRm, ...(mergedNodes?.length ? { nodes: mergedNodes } : {}) } : undefined;
+      const mergedPlans = ep.recentPlans?.length ? ep.recentPlans : prev.recentPlans;
       byKey.set(ep.projectKey, {
         ...prev,
         ...ep,
         nodes: combinedNodes,
-        status: isRunning ? "running" : (ep.status ?? prev.status),
+        status: isRunning ? "running" : "idle",
         ...(keepUserDomain ? { domain: prev.domain, domainSource: "user_override" } : {}),
         ...(keepUserStage ? { stage: prev.stage, stageSource: "user_override" } : {}),
         ...(keepUserBoard
           ? { boardStatus: prev.boardStatus, boardStatusReason: prev.boardStatusReason, boardStatusSource: "user_override" }
           : isRunning && ep.boardStatus !== "blocked" && prev.boardStatus !== "blocked"
             ? { boardStatus: "active_executing", boardStatusReason: "当前存在活跃运行中的会话" }
-            : {}),
-        statusCard: ep.statusCard ?? prev.statusCard,
-        roadmapSummary: ep.roadmapSummary ?? prev.roadmapSummary,
-        executiveSummary: ep.executiveSummary ?? prev.executiveSummary,
+            : preferPrevCard && prev.boardStatus
+              ? { boardStatus: prev.boardStatus, ...(prev.boardStatusReason ? { boardStatusReason: prev.boardStatusReason } : {}) }
+              : {}),
+        statusCard: chosenCard,
+        ...(mergedRoadmap ? { roadmapSummary: mergedRoadmap } : {}),
+        ...(mergedPlans?.length ? { recentPlans: mergedPlans } : {}),
+        executiveSummary: preferPrevCard ? (prev.executiveSummary ?? ep.executiveSummary) : (ep.executiveSummary ?? prev.executiveSummary),
       });
     }
     const mergedProjects = Array.from(byKey.values()).sort((a, b) => {
@@ -3511,6 +3555,241 @@ export class SugentStewardHostService {
     return out;
   }
 
+  private matchFleetProject(
+    projects: readonly OpsStewardProjectItem[],
+    projectQuery: string,
+  ): OpsStewardProjectItem | undefined {
+    const q = String(projectQuery ?? "").trim().toLowerCase();
+    if (!q) return undefined;
+    const aliases = q === "andy-web" || q === "self-a-web" ? ["andy-web", "self-a-web"] : [q];
+    return projects.find((pr) => {
+      const short = pr.projectKey.split(/[/:]/).pop()?.toLowerCase() ?? "";
+      const hay = `${pr.displayName ?? ""} ${short} ${pr.projectKey}`.toLowerCase();
+      return aliases.some((a) => hay === a || short === a || hay.includes(a) || (short && a.includes(short)));
+    });
+  }
+
+  private resolveLocalRepoRootForProject(proj: OpsStewardProjectItem | undefined, projectQuery: string): string | undefined {
+    const slugs = new Set<string>();
+    const rawSlug = proj?.projectKey.split(/[/:]/).pop();
+    if (rawSlug) slugs.add(rawSlug);
+    if (proj?.displayName) slugs.add(proj.displayName);
+    if (projectQuery.trim()) slugs.add(projectQuery.trim());
+    if (Array.from(slugs).some((s) => /^(?:andy-web|self-a-web)$/i.test(s))) {
+      slugs.add("Andy-web");
+      slugs.add("self-a-web");
+    }
+    for (const b of this.repoBindings.listBindings()) {
+      const hay = `${b.alias} ${path.basename(b.repoRoot)}`.toLowerCase();
+      if (Array.from(slugs).some((s) => hay.includes(s.toLowerCase())) && fs.existsSync(b.repoRoot)) {
+        return b.repoRoot;
+      }
+    }
+    const projectsRoot = path.join(this.homeDir, "Projects");
+    if (fs.existsSync(projectsRoot)) {
+      try {
+        const dirs = fs.readdirSync(projectsRoot);
+        for (const slug of slugs) {
+          const hit = dirs.find((d) => d.toLowerCase() === slug.toLowerCase());
+          if (hit && fs.existsSync(path.join(projectsRoot, hit))) return path.join(projectsRoot, hit);
+        }
+      } catch { /* ignore unreadable projects root */ }
+    }
+    return undefined;
+  }
+
+  private synthesizeSyncedGovernanceDoc(proj: OpsStewardProjectItem, requestedPath: string): string | undefined {
+    const lines: string[] = [];
+    const wantStatus = /status\.md$/i.test(requestedPath);
+    const title = proj.displayName || proj.projectKey;
+    if (wantStatus && proj.statusCard) {
+      lines.push(`# ${title} STATUS (synced snapshot)`, `- review_state: ${proj.statusCard.reviewState ?? "unknown"}`, `- updated_at: ${proj.statusCard.updatedAt ?? proj.lastActiveAt ?? ""}`);
+      if (proj.statusCard.stageGoal) lines.push("", `## 阶段目标`, proj.statusCard.stageGoal);
+      if (proj.statusCard.landed?.length) lines.push("", `## 最近完成`, ...proj.statusCard.landed.map((x) => `- ${x}`));
+      if (proj.statusCard.nextActions?.length) lines.push("", `## 下一步`, ...proj.statusCard.nextActions.map((x, i) => `${i + 1}. ${x}`));
+      if (proj.statusCard.blockers?.length) lines.push("", `## 卡点`, ...proj.statusCard.blockers.map((x) => `- ${x}`));
+      return lines.join("\n");
+    }
+    const rm = proj.roadmapSummary;
+    if (rm?.nodes?.length) {
+      lines.push(`# ${rm.title || `${title} ROADMAP`} (synced snapshot)`);
+      if (rm.overallProgress) {
+        lines.push(`总进度：${rm.overallProgress.done ?? 0}/${rm.overallProgress.total ?? 0} (${rm.overallProgress.pct ?? 0}%)`);
+      }
+      for (const n of rm.nodes) {
+        const p = n.progress;
+        const stat = p ? ` (${p.done ?? 0}/${p.total ?? 0} · ${n.status})` : ` (${n.status})`;
+        lines.push("", `### ${n.code ? `${n.code}: ` : ""}${n.title}${stat}`);
+        for (const it of n.items ?? []) {
+          const box = it.status === "done" ? "[x]" : it.status === "in_progress" ? "[/]" : it.status === "blocked" ? "[!]" : "[ ]";
+          lines.push(`- ${box} ${it.id} (${it.actor ?? "agent"}): ${it.title}`);
+        }
+      }
+      if (proj.recentPlans?.length) {
+        lines.push("", `## Recent Plans`, ...proj.recentPlans.map((pl) => `- \`${pl.path}\`: ${pl.title}`));
+      }
+      return lines.join("\n");
+    }
+    return undefined;
+  }
+
+  async readProjectGovernanceDoc(input: {
+    projectQuery: string;
+    docPath?: string;
+    timeoutMs?: number;
+    callerDomain?: CallerAccessDomain;
+  }): Promise<Record<string, unknown>> {
+    const domain = input.callerDomain ?? "owner_private";
+    if (domain !== "owner_private") {
+      return { ok: false, errorCode: "OWNER_ONLY_TOOL", error: "仅主理人私域可读取项目治理文档" };
+    }
+    const projectQuery = String(input.projectQuery ?? "").trim();
+    if (!projectQuery) return { ok: false, errorCode: "MISSING_PROJECT_QUERY", error: "请提供 projectQuery" };
+    const docPath = String(input.docPath ?? "ROADMAP.md").trim() || "ROADMAP.md";
+    if (!this.remoteOpsSnapshot && this.opts.opsBridge?.isConfigured()) {
+      await this.refreshRemoteOpsSnapshot().catch(() => undefined);
+    }
+    const fleet = this.getMergedOpsFleetSnapshot();
+    const proj = fleet ? this.matchFleetProject(fleet.projects, projectQuery) : undefined;
+    if (proj && (proj.privacyTier ?? proj.tier ?? 1) <= 0) {
+      return { ok: false, errorCode: "TIER_0_LOCAL_ONLY", projectKey: proj.projectKey, error: "该项目为 Tier 0 隐私隔离，禁止跨端读取" };
+    }
+    const localRepo = this.resolveLocalRepoRootForProject(proj, projectQuery);
+    if (localRepo) {
+      const localRes = readSanitizedGovernanceDocFromRepo(localRepo, docPath);
+      if (localRes.ok && localRes.content) {
+        return {
+          ok: true,
+          source: "local_disk",
+          projectKey: proj?.projectKey ?? projectQuery,
+          displayName: proj?.displayName ?? path.basename(localRepo),
+          docPath: localRes.docPath,
+          content: localRes.content,
+        };
+      }
+      if (localRes.errorCode && localRes.errorCode !== "DOC_NOT_FOUND") {
+        return { ok: false, errorCode: localRes.errorCode, error: `文档路径受限: ${localRes.errorCode}` };
+      }
+    }
+    const nodes = this.edgeHub.listNodes();
+    const onlineNode =
+      nodes.find((n) => n.online && (proj?.nodeId === n.nodeId || proj?.nodes?.includes(n.nodeId))) ??
+      nodes.find((n) => n.online);
+    if (onlineNode) {
+      const cmd = this.edgeHub.enqueueCommand({
+        targetNodeId: onlineNode.nodeId,
+        action: "read_repo_doc",
+        title: `只读读取 ${proj?.displayName || projectQuery} · ${docPath}`,
+        ...(proj?.projectKey ? { projectKey: proj.projectKey } : {}),
+        ...(proj?.displayName ? { workspaceHint: proj.displayName } : { workspaceHint: projectQuery }),
+        docPath,
+      });
+      const deadline = Date.now() + Math.max(1_000, Math.min(25_000, input.timeoutMs ?? 18_000));
+      while (Date.now() < deadline) {
+        const cur = this.edgeHub.getCommand(cmd.id);
+        if (cur?.status === "completed" && cur.docContent) {
+          return {
+            ok: true,
+            source: "edge_live",
+            nodeId: onlineNode.nodeId,
+            projectKey: proj?.projectKey ?? projectQuery,
+            displayName: proj?.displayName ?? projectQuery,
+            docPath: cur.docPath ?? docPath,
+            content: cur.docContent,
+          };
+        }
+        if (cur?.status === "failed") break;
+        await new Promise((r) => setTimeout(r, 250));
+      }
+    }
+    if (proj) {
+      const synthesized = this.synthesizeSyncedGovernanceDoc(proj, docPath);
+      if (synthesized) {
+        return {
+          ok: true,
+          source: "synced_snapshot_fallback",
+          projectKey: proj.projectKey,
+          displayName: proj.displayName ?? proj.projectKey,
+          docPath,
+          content: synthesized,
+        };
+      }
+    }
+    return {
+      ok: false,
+      errorCode: onlineNode ? "DOC_READ_TIMEOUT_OR_NOT_FOUND" : "EDGE_OFFLINE_AND_NO_SNAPSHOT",
+      projectKey: proj?.projectKey ?? projectQuery,
+    };
+  }
+
+  async executeDshStewardFleetOp(params: {
+    botId?: string;
+    conversationId?: string;
+    isGroup?: boolean;
+    isObserveRule?: boolean;
+    op: string;
+    args?: Record<string, unknown>;
+  }): Promise<Record<string, unknown>> {
+    if (params.isGroup) {
+      return { ok: false, errorCode: "OWNER_PRIVATE_ONLY", error: "steward_fleet 仅限主理人私聊会话调用" };
+    }
+    const op = String(params.op ?? "overview").trim();
+    const args = params.args ?? {};
+    if (op === "overview") {
+      const refreshed = await this.refreshRemoteOpsSnapshot().catch(() => ({ ok: false, configured: false, snapshot: undefined as undefined, reason: "REFRESH_FAILED" }));
+      const fleet = refreshed.snapshot ?? this.getMergedOpsFleetSnapshot();
+      const allProjects = fleet?.projects ?? [];
+      const q = String(args.projectQuery ?? "").trim().toLowerCase();
+      const aliases = q === "andy-web" || q === "self-a-web" ? ["andy-web", "self-a-web"] : (q ? [q] : []);
+      const filtered = aliases.length
+        ? allProjects.filter((pr) => {
+            const short = pr.projectKey.split(/[/:]/).pop()?.toLowerCase() ?? "";
+            const hay = `${pr.displayName ?? ""} ${short} ${pr.projectKey}`.toLowerCase();
+            return aliases.some((a) => hay.includes(a) || (short && a.includes(short)));
+          })
+        : allProjects.filter((pr) => pr.status === "running" || ((pr.boardStatus ?? "idle_untracked") !== "idle_untracked" && pr.stage !== "archived"));
+      const list = (filtered.length > 0 ? filtered : allProjects).slice(0, q ? 8 : 20);
+      const commitments = this.ledger.snapshotForCaller("owner_private").commitments.filter((c) => c.status === "open" || c.status === "snoozed");
+      return {
+        ok: true,
+        opsConfigured: refreshed.configured,
+        edgeNodes: this.edgeHub.listNodes(),
+        totalProjects: allProjects.length,
+        matchedCount: list.length,
+        projects: list,
+        openCommitments: commitments,
+        pendingInbox: fleet?.pendingInbox ?? [],
+      };
+    }
+    if (op === "read_doc") {
+      return this.readProjectGovernanceDoc({
+        projectQuery: String(args.projectQuery ?? "").trim(),
+        ...(typeof args.docPath === "string" && args.docPath.trim() ? { docPath: args.docPath.trim() } : {}),
+        callerDomain: "owner_private",
+      });
+    }
+    if (params.isObserveRule) {
+      return { ok: false, errorCode: "OBSERVE_RULE_READ_ONLY", error: "只读观察规则禁止执行写操作" };
+    }
+    if (op === "complete_todo") {
+      const refText = String(args.todoQuery ?? args.projectQuery ?? "").trim();
+      if (!refText) return { ok: false, errorCode: "MISSING_TODO_QUERY" };
+      return this.completeCommitmentByRef(refText);
+    }
+    if (op === "dispatch_coding") {
+      const title = String(args.title ?? "").trim();
+      const prompt = String(args.prompt ?? "").trim();
+      if (!title || !prompt) return { ok: false, errorCode: "MISSING_TITLE_OR_PROMPT" };
+      return this.dispatchEdgeAntigravity({
+        title,
+        prompt,
+        ...(typeof args.projectQuery === "string" && args.projectQuery.trim() ? { projectQuery: args.projectQuery.trim() } : {}),
+        ...(typeof args.targetNodeId === "string" && args.targetNodeId.trim() ? { targetNodeId: args.targetNodeId.trim() } : {}),
+      });
+    }
+    return { ok: false, errorCode: `UNKNOWN_OP:${op}` };
+  }
+
   buildOwnerAgentBrief(): string {
     const snap = this.ledger.snapshotForCaller("owner_private");
     const anchors = this.getOwnerDuoAnchors();
@@ -3531,6 +3810,21 @@ export class SugentStewardHostService {
     const parts = [charter];
     if (guards.length) parts.push(`【红线与墓碑】\n${guards.map((g) => `- ${g.statement}`).join("\n")}`);
     if (domainNodes.length) parts.push(`【工程与武器包沉淀 (domain_work)】\n${domainNodes.map((n) => `- [${n.plane}] ${n.name}：${n.summary}`).join("\n")}`);
+    const fleet = this.getMergedOpsFleetSnapshot();
+    const focusLines = (fleet?.projects ?? [])
+      .filter((p) => p.stage === "focus" || p.status === "running" || p.boardStatus === "pending_review")
+      .slice(0, 6)
+      .map((p) => {
+        const rm = p.roadmapSummary?.overallProgress ?? p.roadmapSummary?.totals;
+        const rmStr = rm?.total ? ` · 路线图 ${rm.done ?? 0}/${rm.total}` : "";
+        const goal = p.statusCard?.stageGoal ? `：${p.statusCard.stageGoal.slice(0, 60)}` : "";
+        return `- ${p.displayName || p.projectKey} [${p.boardStatus || p.status || "idle"}${rmStr}]${goal}`;
+      });
+    parts.push([
+      "【全域项目脉冲与零盲区工具指引】",
+      ...(focusLines.length ? focusLines : ["- 暂无本地脉冲快照，可调用 steward_fleet(action='overview') 实时拉取。"]),
+      "- 凡主理人询问任意项目进展、路线图前序/未完成明细、STATUS.md、或跨端派单/销账，务必优先调用 `steward_fleet` 工具（`overview` / `read_doc` / `dispatch_coding` / `complete_todo`），严禁去 /data 手翻 JSON 盲猜或让主人手工粘贴文档。",
+    ].join("\n"));
     return parts.join("\n\n");
   }
 }

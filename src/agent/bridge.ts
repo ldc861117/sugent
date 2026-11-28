@@ -20,6 +20,8 @@ export interface BridgeHandlers {
   memory?(body: any): Promise<unknown>;
   /** amb-memory 插件：上下文管家判定 / 压缩回报 */
   steward?(body: any): Promise<unknown>;
+  /** amb-steward-fleet 插件：跨端全域项目态势、治理文档只读拉取、销账与触手派单 */
+  stewardFleet?(body: any, signal: AbortSignal): Promise<unknown>;
   /** amb-media 插件：生图 / 生视频 */
   media?(body: any): Promise<unknown>;
   /** amb-web-search 插件：web_search 的一次搜索（signal = 连接断了：工具超时或回合被中止） */
@@ -275,6 +277,11 @@ export class AgentBridge {
     else if (url === "/dsh/cancel") out = (await this.h.cancel(body), { ok: true });
     else if (url === "/dsh/memory" && this.h.memory) out = await this.h.memory(body);
     else if (url === "/dsh/steward" && this.h.steward) out = await this.h.steward(body);
+    else if (url === "/dsh/steward-fleet" && this.h.stewardFleet) {
+      const ac = new AbortController();
+      res.on("close", () => ac.abort());
+      out = await this.h.stewardFleet(body, ac.signal);
+    }
     else if (url === "/dsh/media" && this.h.media) return this.longCall(res, this.h.media(body));
     else if (url === "/dsh/search" && this.h.search) {
       const ac = new AbortController();

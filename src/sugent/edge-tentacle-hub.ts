@@ -5,6 +5,9 @@ import path from "node:path";
 import type {
   OpsInboxItem,
   OpsRemoteCommand,
+  OpsRepoPlanDocSummary,
+  OpsRoadmapItemSummary,
+  OpsRoadmapNodeSummary,
   OpsStewardPendingSnapshot,
   OpsStewardProjectItem,
 } from "./ops-bridge-client.js";
@@ -15,6 +18,7 @@ export type EdgeCommandAction =
   | "dispatch_antigravity_new"
   | "dispatch_antigravity_resume"
   | "sync_pulse_now"
+  | "read_repo_doc"
   | "execute_approved_inbox";
 
 export type EdgeCommandStatus = "pending" | "accepted" | "completed" | "failed";
@@ -59,7 +63,12 @@ export interface ParsedRepoStatus {
 }
 
 export interface ParsedRepoRoadmap {
+  schemaVersion?: number;
+  title?: string;
+  activeNodeId?: string;
   activeNode?: {
+    id?: string;
+    kind?: string;
     code?: string;
     title: string;
     status: string;
@@ -86,6 +95,15 @@ export interface ParsedRepoRoadmap {
     realDone?: number;
     realTotal?: number;
   };
+  overallProgress?: {
+    done: number;
+    inProgress: number;
+    todo: number;
+    blocked: number;
+    total: number;
+    pct: number;
+  };
+  nodes?: OpsRoadmapNodeSummary[];
 }
 
 export interface ScanLocalProjectsForEdgeOptions {
@@ -119,6 +137,8 @@ export interface EdgeQueuedCommand extends OpsRemoteCommand {
   conversationId?: string;
   projectKey?: string;
   workspaceHint?: string;
+  docPath?: string;
+  docContent?: string;
   status: EdgeCommandStatus;
   createdAtIso: string;
   pulledAtIso?: string;
@@ -153,6 +173,7 @@ export interface EdgeEnqueueCommandInput {
   conversationId?: string;
   projectKey?: string;
   workspaceHint?: string;
+  docPath?: string;
   createdAtIso?: string;
 }
 
@@ -161,6 +182,8 @@ export interface EdgeAckCommandInput {
   status: "accepted" | "completed" | "failed";
   summary?: string;
   conversationId?: string;
+  docPath?: string;
+  docContent?: string;
   atIso?: string;
 }
 
@@ -189,6 +212,9 @@ export interface EdgeTentacleRunnerOptions {
   dispatchAntigravity?: (
     cmd: EdgeQueuedCommand,
   ) => Promise<{ ok: boolean; summary?: string; conversationId?: string }>;
+  readRepoDoc?: (
+    cmd: EdgeQueuedCommand,
+  ) => Promise<{ ok: boolean; summary?: string; docPath?: string; docContent?: string }>;
   onCycle?: (result: EdgeTentacleRunnerCycleResult) => void;
   intervalMs?: number;
   nowIso?: () => string;
@@ -345,6 +371,8 @@ interface RawRoadmapSection {
 }
 
 interface EvaluatedRoadmapStage {
+  id: string;
+  kind: string;
   code?: string;
   title: string;
   isStageHeading: boolean;
@@ -359,6 +387,8 @@ interface EvaluatedRoadmapStage {
   realDone: number;
   realTotal: number;
   status: string;
+  items: OpsRoadmapItemSummary[];
+  gates: { entry: string[]; exit: string[] };
 }
 
 const STAGE_HEADING_PATTERNS: readonly RegExp[] = [
@@ -441,6 +471,23 @@ function classifyRoadmapBulletItem(rawBody: string): "done" | "in_progress" | "b
   return null;
 }
 
+function extractRoadmapItemDetails(rawBody: string, fallbackIdx: number): { id: string; title: string; actor: "agent" | "human" | "external" } {
+  let body = rawBody.trim().replace(/^\[([ xX/~!-])\]\s*/, "");
+  const codeMatch = DELIV_CODE_RE.exec(body);
+  const id = codeMatch?.[1] ? codeMatch[1].toUpperCase() : `T${fallbackIdx}`;
+  if (codeMatch?.[0]) body = body.slice(codeMatch[0].length).trim();
+  const isHuman = /\[(?:我)(?:[·:\s]+[^\]\n]+)?\]/.test(rawBody);
+  const isExt = !isHuman && /\[(?:等外部|观察窗)(?:[·:\s]+[^\]\n]+)?\]/.test(rawBody);
+  const cleaned = redactLocalPaths(
+    body
+      .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+      .replace(/\*\*|__|[`*]/g, "")
+      .replace(/\s+/g, " ")
+      .trim(),
+  ).slice(0, 120);
+  return { id, title: cleaned || id, actor: isHuman ? "human" : isExt ? "external" : "agent" };
+}
+
 function evaluateSectionLines(lines: readonly string[]): {
   done: number;
   inProgress: number;
@@ -451,6 +498,8 @@ function evaluateSectionLines(lines: readonly string[]): {
   realDone: number;
   realTotal: number;
   hasExitGate: boolean;
+  items: OpsRoadmapItemSummary[];
+  gates: { entry: string[]; exit: string[] };
 } {
   let done = 0;
   let inProgress = 0;
@@ -461,6 +510,9 @@ function evaluateSectionLines(lines: readonly string[]): {
   let realDone = 0;
   let realTotal = 0;
   let hasExitGate = false;
+  const items: OpsRoadmapItemSummary[] = [];
+  const entryGates: string[] = [];
+  const exitGates: string[] = [];
 
   const listItemRe = /^(\s*)(?:[-*+]|\d+[.)])\s+(.*)$/;
   const indents: number[] = [];
@@ -485,7 +537,11 @@ function evaluateSectionLines(lines: readonly string[]): {
     }
     const m = listItemRe.exec(ln);
     if (!m) {
-      if (EXIT_GATE_RE.test(stripped)) hasExitGate = true;
+      const exPara = EXIT_GATE_RE.exec(stripped);
+      if (exPara) {
+        hasExitGate = true;
+        if (exPara[1]?.trim() && exitGates.length < 3) exitGates.push(redactLocalPaths(exPara[1].replace(/[*_`]/g, "").trim()).slice(0, 120));
+      }
       continue;
     }
     const indent = (m[1] ?? "").length;
@@ -499,20 +555,28 @@ function evaluateSectionLines(lines: readonly string[]): {
       modeIndent = indent;
       continue;
     }
-    if (ENTRY_GATE_RE.test(body)) {
+    const enMatch = ENTRY_GATE_RE.exec(body);
+    if (enMatch) {
       mode = "entry_gate";
       modeIndent = indent;
+      if (enMatch[1]?.trim() && entryGates.length < 3) entryGates.push(redactLocalPaths(enMatch[1].replace(/[*_`]/g, "").trim()).slice(0, 120));
       continue;
     }
-    if (EXIT_GATE_RE.test(body)) {
+    const exMatch = EXIT_GATE_RE.exec(body);
+    if (exMatch) {
       mode = "exit_gate";
       modeIndent = indent;
       hasExitGate = true;
+      if (exMatch[1]?.trim() && exitGates.length < 3) exitGates.push(redactLocalPaths(exMatch[1].replace(/[*_`]/g, "").trim()).slice(0, 120));
       continue;
     }
-    if (mode === "entry_gate") continue;
+    if (mode === "entry_gate") {
+      if (entryGates.length < 3) entryGates.push(redactLocalPaths(body.replace(/[*_`]/g, "").trim()).slice(0, 120));
+      continue;
+    }
     if (mode === "exit_gate") {
       hasExitGate = true;
+      if (exitGates.length < 3) exitGates.push(redactLocalPaths(body.replace(/[*_`]/g, "").trim()).slice(0, 120));
       continue;
     }
     if (hasDelivHeader && mode !== "deliverables") continue;
@@ -520,8 +584,11 @@ function evaluateSectionLines(lines: readonly string[]): {
 
     const st = classifyRoadmapBulletItem(body);
     if (st) {
-      const isReal = /\[(?:我|等外部|观察窗)(?:[·:\s]+[^\]\n]+)?\]/.test(body);
-      if (isReal) {
+      const det = extractRoadmapItemDetails(body, items.length + 1);
+      if (items.length < 30) {
+        items.push({ id: det.id, title: det.title, status: st, actor: det.actor });
+      }
+      if (det.actor !== "agent") {
         realTotal += 1;
         if (st === "done") realDone += 1;
       } else {
@@ -535,7 +602,19 @@ function evaluateSectionLines(lines: readonly string[]): {
     else if (st === "todo") todo += 1;
   }
 
-  return { done, inProgress, todo, blocked, codeDone, codeTotal, realDone, realTotal, hasExitGate };
+  return {
+    done,
+    inProgress,
+    todo,
+    blocked,
+    codeDone,
+    codeTotal,
+    realDone,
+    realTotal,
+    hasExitGate,
+    items,
+    gates: { entry: entryGates, exit: exitGates },
+  };
 }
 
 export function parseRepoRoadmapMarkdown(markdown: string): ParsedRepoRoadmap {
@@ -543,6 +622,7 @@ export function parseRepoRoadmapMarkdown(markdown: string): ParsedRepoRoadmap {
   const rawSections: RawRoadmapSection[] = [];
   let inFence = false;
 
+  let docTitle = "";
   for (const line of normalized.split("\n")) {
     if (/^\s{0,3}(?:```|~~~)/.test(line)) {
       inFence = !inFence;
@@ -551,7 +631,10 @@ export function parseRepoRoadmapMarkdown(markdown: string): ParsedRepoRoadmap {
     if (inFence) continue;
     const hm = /^(#{1,4})\s+(.+?)\s*#*\s*$/.exec(line);
     if (hm?.[1] && hm[2]) {
-      rawSections.push({ level: hm[1].length, rawHeading: hm[2].trim(), lines: [] });
+      const lvl = hm[1].length;
+      const hd = hm[2].trim();
+      if (lvl === 1 && !docTitle) docTitle = hd.replace(/[*_`]/g, "").trim();
+      rawSections.push({ level: lvl, rawHeading: hd, lines: [] });
     } else if (rawSections.length > 0) {
       rawSections[rawSections.length - 1]!.lines.push(line);
     }
@@ -562,6 +645,7 @@ export function parseRepoRoadmapMarkdown(markdown: string): ParsedRepoRoadmap {
   );
 
   const stages: EvaluatedRoadmapStage[] = [];
+  const seenStageIds = new Map<string, number>();
   for (let idx = 0; idx < rawSections.length; idx += 1) {
     const sec = rawSections[idx]!;
     if (sec.level < 2) continue;
@@ -596,7 +680,18 @@ export function parseRepoRoadmapMarkdown(markdown: string): ParsedRepoRoadmap {
       status = "in_progress";
     }
 
+    const kindMatch = /^(Horizon|Milestone|Phase|Wave|Sprint|Stage)\s*([A-Za-z0-9._-]+)?/i.exec(parsedHead.code ?? "");
+    const kind = kindMatch?.[1] ? kindMatch[1].toLowerCase() : "stage";
+    const tok = (kindMatch?.[2] ?? parsedHead.code ?? `${stages.length + 1}`).replace(/\s+/g, "").toUpperCase();
+    const prefixMap: Record<string, string> = { horizon: "H", milestone: "M", phase: "P", wave: "W", sprint: "S", stage: "ST" };
+    const rawBaseId = /^[A-Z]/.test(tok) ? tok : `${prefixMap[kind] ?? "ST"}${tok}`;
+    const seenCnt = (seenStageIds.get(rawBaseId) ?? 0) + 1;
+    seenStageIds.set(rawBaseId, seenCnt);
+    const stageId = seenCnt > 1 ? `${rawBaseId}_${seenCnt}` : rawBaseId;
+
     stages.push({
+      id: stageId,
+      kind,
       ...(parsedHead.code ? { code: parsedHead.code } : {}),
       title: parsedHead.title,
       isStageHeading: parsedHead.isStageHeading,
@@ -611,11 +706,16 @@ export function parseRepoRoadmapMarkdown(markdown: string): ParsedRepoRoadmap {
       realDone: counts.realDone,
       realTotal: counts.realTotal,
       status,
+      items: counts.items,
+      gates: counts.gates,
     });
   }
 
   const totalDone = stages.reduce((acc, s) => acc + s.done, 0);
-  const grandTotal = stages.reduce((acc, s) => acc + s.done + s.inProgress + s.todo + s.blocked, 0);
+  const totalInProgress = stages.reduce((acc, s) => acc + s.inProgress, 0);
+  const totalTodo = stages.reduce((acc, s) => acc + s.todo, 0);
+  const totalBlocked = stages.reduce((acc, s) => acc + s.blocked, 0);
+  const grandTotal = totalDone + totalInProgress + totalTodo + totalBlocked;
   const totalCodeDone = stages.reduce((acc, s) => acc + s.codeDone, 0);
   const totalCodeTotal = stages.reduce((acc, s) => acc + s.codeTotal, 0);
   const totalRealDone = stages.reduce((acc, s) => acc + s.realDone, 0);
@@ -626,9 +726,48 @@ export function parseRepoRoadmapMarkdown(markdown: string): ParsedRepoRoadmap {
     pct: grandTotal > 0 ? Math.round((totalDone / grandTotal) * 100) : 0,
     ...(totalRealTotal > 0 ? { codeDone: totalCodeDone, codeTotal: totalCodeTotal, realDone: totalRealDone, realTotal: totalRealTotal } : {}),
   };
+  const overallProgress = {
+    done: totalDone,
+    inProgress: totalInProgress,
+    todo: totalTodo,
+    blocked: totalBlocked,
+    total: grandTotal,
+    pct: totals.pct,
+  };
+  const serializedNodes: OpsRoadmapNodeSummary[] = stages.slice(0, 20).map((s) => {
+    const sTotal = s.done + s.inProgress + s.todo + s.blocked;
+    return {
+      id: s.id,
+      kind: s.kind,
+      ...(s.code ? { code: s.code } : {}),
+      title: s.title,
+      status: s.status,
+      marker: s.explicitActive ? "explicit" : "inferred",
+      progress: {
+        done: s.done,
+        inProgress: s.inProgress,
+        todo: s.todo,
+        blocked: s.blocked,
+        total: sTotal,
+        pct: sTotal > 0 ? Math.round((s.done / sTotal) * 100) : 0,
+        ...(s.realTotal > 0 ? { codeDone: s.codeDone, codeTotal: s.codeTotal, realDone: s.realDone, realTotal: s.realTotal } : {}),
+      },
+      ...(s.hasExitGate ? { hasExitGate: true } : {}),
+      ...((s.gates.entry.length || s.gates.exit.length) ? { gates: s.gates } : {}),
+      items: s.items,
+    };
+  });
 
   const nonEmptyStages = stages.filter((s) => s.done + s.inProgress + s.todo + s.blocked > 0);
-  if (nonEmptyStages.length === 0) return { totals };
+  if (nonEmptyStages.length === 0) {
+    return {
+      schemaVersion: 1,
+      ...(docTitle ? { title: docTitle } : {}),
+      totals,
+      overallProgress,
+      ...(serializedNodes.length ? { nodes: serializedNodes } : {}),
+    };
+  }
 
   let chosen =
     nonEmptyStages.find((s) => s.explicitActive && (s.status === "monitoring" || s.status === "in_progress" || s.status === "blocked")) ??
@@ -643,11 +782,16 @@ export function parseRepoRoadmapMarkdown(markdown: string): ParsedRepoRoadmap {
       chosen = nonEmptyStages[nonEmptyStages.length - 1];
     }
   }
-  if (!chosen) return { totals };
+  if (!chosen) return { schemaVersion: 1, totals, overallProgress, nodes: serializedNodes };
 
   const chosenTotal = chosen.done + chosen.inProgress + chosen.todo + chosen.blocked;
   return {
+    schemaVersion: 1,
+    ...(docTitle ? { title: docTitle } : {}),
+    activeNodeId: chosen.id,
     activeNode: {
+      id: chosen.id,
+      kind: chosen.kind,
       ...(chosen.code ? { code: chosen.code } : {}),
       title: chosen.title,
       status: chosen.status,
@@ -665,7 +809,108 @@ export function parseRepoRoadmapMarkdown(markdown: string): ParsedRepoRoadmap {
       ...(chosen.hasExitGate ? { hasExitGate: true } : {}),
     },
     totals,
+    overallProgress,
+    nodes: serializedNodes,
   };
+}
+
+const SECRET_DOC_PATTERNS = /(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9_]{16,}|Bearer\s+[A-Za-z0-9._-]{16,}|AKIA[0-9A-Z]{16})/g;
+const ALLOWED_ROOT_GOV_DOCS = new Set(["STATUS.md", "ROADMAP.md", "AGENTS.md", "README.md", "TOMBSTONES.md", "TASKS.md", "PHILOSOPHY.md"]);
+
+export function scanRecentRepoPlans(repoDir: string, tier: EdgePrivacyTier): OpsRepoPlanDocSummary[] {
+  if (tier <= 0) return [];
+  const dirs = [path.join(repoDir, "docs", "plans"), path.join(repoDir, "docs", "superpowers", "plans")];
+  const collected: Array<OpsRepoPlanDocSummary & { _mtimeMs: number }> = [];
+  for (const dir of dirs) {
+    if (!fs.existsSync(dir)) continue;
+    let entries: fs.Dirent[] = [];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const ent of entries) {
+      if (!ent.isFile() || !ent.name.toLowerCase().endsWith(".md")) continue;
+      const fullPath = path.join(dir, ent.name);
+      const relPath = path.relative(repoDir, fullPath).replace(/\\/g, "/");
+      let title = ent.name.replace(/\.md$/i, "");
+      let mtimeMs = 0;
+      try {
+        const st = fs.statSync(fullPath);
+        mtimeMs = st.mtimeMs;
+        const head = fs.readFileSync(fullPath, "utf8").slice(0, 1200);
+        const h1 = /^#\s+(.+?)\s*$/m.exec(head);
+        if (h1?.[1]) title = h1[1].replace(/[*_`]/g, "").trim();
+      } catch {
+        continue;
+      }
+      collected.push({
+        path: relPath,
+        title: redactLocalPaths(title).slice(0, tier >= 2 ? 100 : 60),
+        updatedAtIso: new Date(mtimeMs || Date.now()).toISOString(),
+        _mtimeMs: mtimeMs,
+      });
+    }
+  }
+  collected.sort((a, b) => b.path.localeCompare(a.path) || b._mtimeMs - a._mtimeMs);
+  return collected.slice(0, 8).map(({ _mtimeMs: _m, ...rest }) => rest);
+}
+
+export function readSanitizedGovernanceDocFromRepo(
+  repoDir: string,
+  requestedPath = "ROADMAP.md",
+  maxChars = 24_000,
+): { ok: boolean; docPath?: string; content?: string; errorCode?: string } {
+  const cleanReq = String(requestedPath || "ROADMAP.md").trim().replace(/\\/g, "/").replace(/^\.\//, "");
+  if (!cleanReq || cleanReq.startsWith("/") || cleanReq.includes("..") || !cleanReq.toLowerCase().endsWith(".md")) {
+    return { ok: false, errorCode: "INVALID_DOC_PATH" };
+  }
+  const segs = cleanReq.split("/").filter(Boolean);
+  if (
+    segs.some((s) =>
+      s === ".git" ||
+      s === "node_modules" ||
+      s === "08_career" ||
+      /^(?:\.env|secret|credential|token|private_key|id_rsa)/i.test(s),
+    )
+  ) {
+    return { ok: false, errorCode: "FORBIDDEN_DOC_PATH" };
+  }
+  const top = segs[0] ?? "";
+  const isAllowedRoot = segs.length === 1 && ALLOWED_ROOT_GOV_DOCS.has(top.toUpperCase() === "ROADMAP.MD" ? "ROADMAP.md" : top);
+  const isAllowedDir = segs.length >= 2 && (top === "docs" || top === "research");
+  if (!isAllowedRoot && !isAllowedDir && !ALLOWED_ROOT_GOV_DOCS.has(top)) {
+    return { ok: false, errorCode: "UNLISTED_DOC_SCOPE" };
+  }
+
+  const candidates = [cleanReq];
+  if (cleanReq.toLowerCase() === "docs/roadmap.md") candidates.push("ROADMAP.md", "roadmap.md", "docs/roadmap.md");
+  else if (cleanReq.toLowerCase() === "roadmap.md") candidates.push("docs/ROADMAP.md", "docs/roadmap.md", "roadmap.md");
+  else if (cleanReq.toLowerCase() === "status.md") candidates.push("docs/STATUS.md");
+
+  let realRoot = "";
+  try {
+    realRoot = fs.realpathSync(repoDir);
+  } catch {
+    return { ok: false, errorCode: "REPO_UNAVAILABLE" };
+  }
+  for (const rel of candidates) {
+    const abs = path.resolve(realRoot, rel);
+    if (!fs.existsSync(abs)) continue;
+    try {
+      const realTarget = fs.realpathSync(abs);
+      if (realTarget !== realRoot && !realTarget.startsWith(`${realRoot}${path.sep}`)) continue;
+      if (!fs.statSync(realTarget).isFile()) continue;
+      const raw = fs.readFileSync(realTarget, "utf8");
+      const scrubbed = redactLocalPaths(raw).replace(SECRET_DOC_PATTERNS, "[REDACTED]");
+      const cap = Math.max(500, maxChars);
+      const content = scrubbed.length > cap ? `${scrubbed.slice(0, cap)}\n\n...(truncated at ${cap} chars)` : scrubbed;
+      return { ok: true, docPath: path.relative(realRoot, realTarget).replace(/\\/g, "/"), content };
+    } catch {
+      continue;
+    }
+  }
+  return { ok: false, errorCode: "DOC_NOT_FOUND" };
 }
 
 function deriveProjectKeyFromRepo(repoDir: string, nodeId: string): string {
@@ -1115,6 +1360,7 @@ export function scanLocalProjectsForEdge(opts: ScanLocalProjectsForEdgeOptions):
       nowMs,
     });
 
+    const recentPlans = scanRecentRepoPlans(repoDir, tier);
     const sanitizedGoal = parsedStatus?.stageGoal
       ? redactLocalPaths(parsedStatus.stageGoal)
       : parsedRoadmap?.activeNode
@@ -1147,6 +1393,7 @@ export function scanLocalProjectsForEdge(opts: ScanLocalProjectsForEdgeOptions):
             }
           : {}),
         ...(parsedRoadmap ? { roadmapSummary: parsedRoadmap } : {}),
+        ...(recentPlans.length > 0 ? { recentPlans } : {}),
       });
       continue;
     }
@@ -1205,6 +1452,7 @@ export function scanLocalProjectsForEdge(opts: ScanLocalProjectsForEdgeOptions):
           }
         : {}),
       ...(parsedRoadmap ? { roadmapSummary: parsedRoadmap } : {}),
+      ...(recentPlans.length > 0 ? { recentPlans } : {}),
       ...(runningSessions.length > 0
         ? {
             runningSessions: runningSessions.slice(0, 6).map((s) => ({
@@ -1382,17 +1630,29 @@ export class EdgeTentacleHub {
 
   toOpsStewardSnapshot(nowMs = this.nowFn()): OpsStewardPendingSnapshot {
     const mergedByKey = new Map<string, EdgeProjectPulseItem & { _cardMs: number; _pulseMs: number }>();
+    const onlineNodes = new Set(this.listNodes(nowMs).filter((n) => n.online).map((n) => n.nodeId));
 
     for (const [nodeId, projects] of Object.entries(this.state.nodeProjects)) {
+      const nodeOnline = onlineNodes.has(nodeId);
       for (const proj of projects) {
         const key = proj.projectKey;
         if (!key) continue;
         const cardMs = parseIsoMs(proj.statusCard?.updatedAt) || parseIsoMs(proj.updatedAtIso);
         const pulseMs = parseIsoMs(proj.updatedAtIso) || parseIsoMs(this.state.nodes[nodeId]?.lastSeenAtIso);
+        const effRunning = nodeOnline && proj.status === "running";
+        const effBoardStatus = !nodeOnline && proj.status === "running" && proj.boardStatus === "active_executing"
+          ? (proj.statusCard?.reviewState === "pending_review" ? "pending_review" : "planned_ready")
+          : proj.boardStatus;
+        const normProj: EdgeProjectPulseItem = {
+          ...proj,
+          status: effRunning ? "running" : "idle",
+          boardStatus: effBoardStatus,
+          ...(!nodeOnline && proj.runningSessions?.length ? { runningSessions: [] } : {}),
+        };
         const existing = mergedByKey.get(key);
         if (!existing) {
           mergedByKey.set(key, {
-            ...proj,
+            ...normProj,
             nodeId,
             nodes: Array.from(new Set([...(proj.nodes ?? []), nodeId])),
             _cardMs: cardMs,
@@ -1402,32 +1662,35 @@ export class EdgeTentacleHub {
         }
 
         const combinedNodes = Array.from(new Set([...(existing.nodes ?? []), ...(proj.nodes ?? []), nodeId]));
-        const isRunning = existing.status === "running" || proj.status === "running";
-        const useIncomingCard = cardMs >= existing._cardMs && Boolean(proj.statusCard);
+        const isRunning = existing.status === "running" || normProj.status === "running";
+        const useIncomingCard = cardMs >= existing._cardMs && Boolean(normProj.statusCard);
         const useIncomingBase = pulseMs >= existing._pulseMs;
         const mergedSessions = [
           ...(existing.runningSessions ?? []),
-          ...(proj.runningSessions ?? []),
+          ...(normProj.runningSessions ?? []),
         ].slice(0, 8);
+        const baseRm = useIncomingCard ? normProj.roadmapSummary ?? existing.roadmapSummary : existing.roadmapSummary ?? normProj.roadmapSummary;
+        const mergedNodes = baseRm?.nodes?.length ? baseRm.nodes : (normProj.roadmapSummary?.nodes ?? existing.roadmapSummary?.nodes);
+        const mergedRoadmap = baseRm ? { ...baseRm, ...(mergedNodes?.length ? { nodes: mergedNodes } : {}) } : undefined;
+        const mergedPlans = normProj.recentPlans?.length ? normProj.recentPlans : existing.recentPlans;
 
         mergedByKey.set(key, {
-          ...(useIncomingBase ? { ...existing, ...proj } : { ...proj, ...existing }),
-          statusCard: useIncomingCard ? proj.statusCard : existing.statusCard ?? proj.statusCard,
+          ...(useIncomingBase ? { ...existing, ...normProj } : { ...normProj, ...existing }),
+          statusCard: useIncomingCard ? normProj.statusCard : existing.statusCard ?? normProj.statusCard,
           executiveSummary: useIncomingCard
-            ? proj.executiveSummary ?? existing.executiveSummary
-            : existing.executiveSummary ?? proj.executiveSummary,
-          roadmapSummary: useIncomingCard
-            ? proj.roadmapSummary ?? existing.roadmapSummary
-            : existing.roadmapSummary ?? proj.roadmapSummary,
+            ? normProj.executiveSummary ?? existing.executiveSummary
+            : existing.executiveSummary ?? normProj.executiveSummary,
+          ...(mergedRoadmap ? { roadmapSummary: mergedRoadmap } : {}),
+          ...(mergedPlans?.length ? { recentPlans: mergedPlans } : {}),
           nodeId: useIncomingBase ? nodeId : existing.nodeId,
           nodes: combinedNodes,
-          status: isRunning ? "running" : (useIncomingBase ? proj.status : existing.status),
+          status: isRunning ? "running" : (useIncomingBase ? normProj.status : existing.status),
           boardStatus:
-            existing.boardStatus === "blocked" || proj.boardStatus === "blocked"
+            existing.boardStatus === "blocked" || normProj.boardStatus === "blocked"
               ? "blocked"
               : isRunning
                 ? "active_executing"
-                : (useIncomingBase ? proj.boardStatus : existing.boardStatus),
+                : (useIncomingBase ? normProj.boardStatus : existing.boardStatus),
           ...(mergedSessions.length > 0 ? { runningSessions: mergedSessions } : {}),
           _cardMs: Math.max(existing._cardMs, cardMs),
           _pulseMs: Math.max(existing._pulseMs, pulseMs),
@@ -1472,6 +1735,7 @@ export class EdgeTentacleHub {
       ...(input.conversationId ? { conversationId: input.conversationId } : {}),
       ...(input.projectKey ? { projectKey: input.projectKey } : {}),
       ...(input.workspaceHint ? { workspaceHint: input.workspaceHint } : {}),
+      ...(input.docPath ? { docPath: input.docPath } : {}),
       status: "pending",
       createdAtIso: nowIso,
       updatedAtIso: nowIso,
@@ -1483,6 +1747,12 @@ export class EdgeTentacleHub {
     }
     this.persist();
     return { ...cmd };
+  }
+
+  getCommand(commandId: string): EdgeQueuedCommand | undefined {
+    const cleanId = String(commandId ?? "").trim();
+    const cmd = cleanId ? this.state.commands.find((c) => c.id === cleanId) : undefined;
+    return cmd ? { ...cmd } : undefined;
   }
 
   listCommands(opts?: { targetNodeId?: string; limit?: number }): EdgeQueuedCommand[] {
@@ -1536,10 +1806,15 @@ export class EdgeTentacleHub {
     cmd.updatedAtIso = atIso;
     if (input.summary) cmd.summary = redactLocalPaths(input.summary).slice(0, 360);
     if (input.conversationId) cmd.conversationId = input.conversationId;
+    if (input.docPath) cmd.docPath = String(input.docPath).slice(0, 240);
+    if (typeof input.docContent === "string") {
+      cmd.docContent = redactLocalPaths(input.docContent).replace(SECRET_DOC_PATTERNS, "[REDACTED]").slice(0, 24_000);
+    }
     this.persist();
 
     let ownerNotifyText: string | undefined;
-    if (!wasTerminal && (input.status === "completed" || input.status === "failed")) {
+    const silentReadOnly = cmd.action === "read_repo_doc" || cmd.action === "sync_pulse_now";
+    if (!silentReadOnly && !wasTerminal && (input.status === "completed" || input.status === "failed")) {
       const statusLabel = input.status === "completed" ? "已完成" : "执行失败";
       const detail = cmd.summary ? `：${cmd.summary}` : "";
       ownerNotifyText = `【触手执行回执 · ${input.nodeId || cmd.targetNodeId}】${statusLabel}「${cmd.title}」${detail}`;
@@ -1647,6 +1922,19 @@ export class EdgeTentacleRunner {
                 status: "completed",
                 summary: `已同步 ${projects.length} 个本地项目脉冲`,
               };
+            } else if (cmd.action === "read_repo_doc") {
+              if (this.opts.readRepoDoc) {
+                const out = await this.opts.readRepoDoc(cmd);
+                ackBody = {
+                  nodeId: this.nodeId,
+                  status: out.ok ? "completed" : "failed",
+                  ...(out.summary ? { summary: out.summary } : {}),
+                  ...(out.docPath ? { docPath: out.docPath } : {}),
+                  ...(out.docContent ? { docContent: out.docContent } : {}),
+                };
+              } else {
+                ackBody = { nodeId: this.nodeId, status: "failed", summary: "READ_REPO_DOC_UNAVAILABLE" };
+              }
             } else if (this.opts.dispatchAntigravity) {
               const out = await this.opts.dispatchAntigravity(cmd);
               ackBody = {

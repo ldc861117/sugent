@@ -149,6 +149,11 @@ export interface StewardLlmToolsPort<TWorkbench extends StewardWorkbenchLike = S
     snapshot?: StewardWorkbenchLike["opsFleet"];
     reason?: string;
   }>;
+  readProjectGovernanceDoc?(input: {
+    projectQuery: string;
+    docPath?: string;
+    callerDomain?: CallerAccessDomain;
+  }): Promise<Record<string, unknown>>;
   proposeOpsInbox?(input: {
     title: string;
     summary?: string;
@@ -440,12 +445,13 @@ const LLM_TOOLS = [
     type: "function",
     function: {
       name: "manage_ops_fleet",
-      description: "实时查询运营总控台 (/ops) 的跨节点项目最新进展（含 STATUS.md 状态卡、阶段目标、最近完成、路线图进度、在途任务、下一步与卡点）或生成排期/派单草案写入待签批收件箱。当主人询问任意项目的最新进展、状态或路线图（如 airtoken、sugent、Andy-web）时，务必优先调用此工具 action='overview' 并传入 projectQuery。",
+      description: "实时查询运营总控台 (/ops) 与边缘触手的跨节点项目全量态势（含 STATUS.md 状态卡、阶段目标、路线图全量阶段与条目明细 nodes[].items[]、recentPlans 计划索引）、跨端只读拉取指定项目的 ROADMAP.md / STATUS.md / docs/plans/*.md 原文，或生成排期/派单草案写入待签批收件箱。当主人询问任意项目的最新进展、状态或某编号之前的待办时，优先调用 action='overview' 或 action='read_doc'。",
       parameters: {
         type: "object",
         properties: {
-          action: { type: "string", enum: ["overview", "propose_inbox"] },
-          projectQuery: { type: "string", description: "可选，按项目名称或关键词筛选单个项目最新进展（如 airtoken）" },
+          action: { type: "string", enum: ["overview", "read_doc", "propose_inbox"] },
+          projectQuery: { type: "string", description: "按项目名称或关键词筛选项目（如 airtoken、sugent、Andy-web、self-a-web）" },
+          docPath: { type: "string", description: "action='read_doc' 时的治理文档相对路径，默认 ROADMAP.md，也可为 STATUS.md 或 docs/plans/*.md" },
           title: { type: "string", description: "排期或派单草案标题" },
           summary: { type: "string", description: "草案具体内容与验收要点" },
           targetNodeId: { type: "string", description: "目标执行节点，默认 local-mac" },
@@ -845,7 +851,7 @@ export class StewardLlmAgent<TWorkbench extends StewardWorkbenchLike = StewardWo
     if (name === "manage_model_routing") return this.executeModelRoutingTool(args);
     if (name === "manage_hot_update") return this.executeHotUpdateTool(args);
     if (name === "delegate_local_execution") return this.executeLocalDelegationTool(args, channel);
-    if (name === "manage_ops_fleet") return this.executeOpsFleetTool(args, wb);
+    if (name === "manage_ops_fleet") return this.executeOpsFleetTool(args, wb, domain);
     if (name === "recall_chat_history") return this.executeRecallChatHistoryTool(args, domain);
     if (name === "dispatch_edge_antigravity") return this.executeDispatchEdgeAntigravityTool(args, domain);
     if (name === "analyze_forwarded_chat") return this.executeAnalyzeForwardedChatTool(args, domain);
@@ -1048,8 +1054,26 @@ export class StewardLlmAgent<TWorkbench extends StewardWorkbenchLike = StewardWo
     return { ...res };
   }
 
-  private async executeOpsFleetTool(args: Record<string, unknown>, wb: TWorkbench): Promise<Record<string, unknown>> {
+  private async executeOpsFleetTool(
+    args: Record<string, unknown>,
+    wb: TWorkbench,
+    domain: CallerAccessDomain,
+  ): Promise<Record<string, unknown>> {
     const act = String(args.action ?? "overview");
+    if (act === "read_doc") {
+      if (domain !== "owner_private") {
+        return { ok: false, errorCode: "OWNER_ONLY_TOOL", reason: "跨节点读取项目治理文档仅限主理人私域调用" };
+      }
+      const fn = this.opts.toolsPort.readProjectGovernanceDoc;
+      if (!fn) return { ok: false, errorCode: "READ_DOC_UNAVAILABLE" };
+      const projectQuery = String(args.projectQuery ?? "").trim();
+      if (!projectQuery) return { ok: false, errorCode: "MISSING_PROJECT_QUERY" };
+      return fn({
+        projectQuery,
+        ...(typeof args.docPath === "string" && args.docPath.trim() ? { docPath: args.docPath.trim() } : {}),
+        callerDomain: domain,
+      });
+    }
     if (act === "overview") {
       const refreshed = await this.opts.toolsPort.refreshOpsFleet?.();
       const fleet = refreshed?.snapshot ?? wb.opsFleet;
@@ -1075,6 +1099,7 @@ export class StewardLlmAgent<TWorkbench extends StewardWorkbenchLike = StewardWo
         lastActiveAt: pr.lastActiveAt || pr.updatedAtIso,
         statusCard: pr.statusCard,
         roadmapSummary: pr.roadmapSummary,
+        ...(pr.recentPlans?.length ? { recentPlans: pr.recentPlans } : {}),
         executiveSummary: pr.executiveSummary,
       });
       const runningNowList = allProjects.filter((pr) => pr.status === "running");

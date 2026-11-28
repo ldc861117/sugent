@@ -2048,7 +2048,42 @@ import { extractForwardedRecordText, weixinParts } from "../dist/src/channels/we
   }
 }
 
+// 30. 零盲区全量路线图树、双源时序合并、read_repo_doc 与 DSH steward_fleet 桥接契约
+{
+  const {
+    EdgeTentacleHub,
+    parseRepoRoadmapMarkdown,
+    readSanitizedGovernanceDocFromRepo,
+    SugentStewardHostService,
+  } = await import("../dist/src/sugent/index.js");
+  const s30Dir = fs.mkdtempSync(path.join(os.tmpdir(), "sugent-v30-"));
+  try {
+    const repo = path.join(s30Dir, "Projects", "self-a-web");
+    fs.mkdirSync(path.join(repo, "docs", "plans"), { recursive: true });
+    fs.writeFileSync(path.join(repo, "ROADMAP.md"), "### Phase 1\n- [x] **P1.1 Done**\n### Phase 3\n- [x] **P3.1 Done**\n- [ ] **P3.2 Next**\n");
+    const parsedRm = parseRepoRoadmapMarkdown(fs.readFileSync(path.join(repo, "ROADMAP.md"), "utf8"));
+    assert.equal((parsedRm.nodes?.length ?? 0) >= 2 && parsedRm.nodes?.[1]?.items?.[0]?.id === "P3.1", true);
+    assert.equal(readSanitizedGovernanceDocFromRepo(repo, ".env").ok, false);
+    assert.equal(readSanitizedGovernanceDocFromRepo(repo, "docs/ROADMAP.md").docPath, "ROADMAP.md");
+
+    const svc30 = new SugentStewardHostService({
+      dataDir: s30Dir,
+      homeDir: s30Dir,
+      knowledgeGraph: new SugentKnowledgeGraph(path.join(s30Dir, "kg")),
+      localBudgets: new LocalBudgetLedger(s30Dir),
+    });
+    const ov = await svc30.executeDshStewardFleetOp({ op: "overview", args: { projectQuery: "Andy-web" } });
+    assert.equal(ov.ok, true);
+    const doc = await svc30.executeDshStewardFleetOp({ op: "read_doc", args: { projectQuery: "Andy-web", docPath: "ROADMAP.md" } });
+    assert.equal(doc.ok && String(doc.content).includes("P3.2"), true);
+    const grpBlock = await svc30.executeDshStewardFleetOp({ isGroup: true, op: "overview" });
+    assert.equal(grpBlock.ok, false);
+  } finally {
+    fs.rmSync(s30Dir, { recursive: true, force: true });
+  }
+}
+
 console.log(
-  "verify:sugent — 全部核心契约断言通过 (M1.1–M1.6 / M2.1 / Cowork 联邦 / P0 Broker + P1 幕僚耳麦 + P2 BYOK 诊断与零知识加密同步 / Sprint 1–3 / M1–M4 Vibe Coding 闭环 / 能力自感知与全文读取 / 形象工坊与桌宠契约 / M-Auto 1–4 双环自治与 SIM 演进 / M1–M3 全量模型同步与经验驱动自适应路由 / L0–L3 分层热启动与热更新 / Wave P0 双脑归一与宿主主循环合龙 / GCE 常驻中枢与微信单持有者舰队桥接 / Wave P1 零填表冷启动、ACP 编码军团与隐藏快照防呆 / Wave P2 合盖离线韧性、微信 3 秒转发参谋与端-边联邦标杆武器包 / 云端唯一大脑、跨天全渠道对话记忆与多节点边缘触手中枢 / Wave P3 双微信号前店后厂、助理无头边车与项目群静默纪要 / 人机混合项目规划与现实待办闭环 / Duo 双人关系幕僚与记忆晶化隔离契约 / Wave P4 全量合龙: 记忆回流、五维立体图谱、硅基个体心智核、半透认知膜与无损同步 / Wave P5 全面跃迁: 原生五平面 E2EE v2 漫游、混合语义 RRF 与 S0->S3 原话溯源、全表面参谋与 M5 外事半透膜、双轨隐式自省与睡眠重整、双人自动候选星晶与 M3 护窗及三层校准评测飞轮)",
+  "verify:sugent — 全部核心契约断言通过 (M1.1–M1.6 / M2.1 / Cowork 联邦 / P0 Broker + P1 幕僚耳麦 + P2 BYOK 诊断与零知识加密同步 / Sprint 1–3 / M1–M4 Vibe Coding 闭环 / 能力自感知与全文读取 / 形象工坊与桌宠契约 / M-Auto 1–4 双环自治与 SIM 演进 / M1–M3 全量模型同步与经验驱动自适应路由 / L0–L3 分层热启动与热更新 / Wave P0 双脑归一与宿主主循环合龙 / GCE 常驻中枢与微信单持有者舰队桥接 / Wave P1 零填表冷启动、ACP 编码军团与隐藏快照防呆 / Wave P2 合盖离线韧性、微信 3 秒转发参谋与端-边联邦标杆武器包 / 云端唯一大脑、跨天全渠道对话记忆与多节点边缘触手中枢 / Wave P3 双微信号前店后厂、助理无头边车与项目群静默纪要 / 人机混合项目规划与现实待办闭环 / Duo 双人关系幕僚与记忆晶化隔离契约 / Wave P4 全量合龙: 记忆回流、五维立体图谱、硅基个体心智核、半透认知膜与无损同步 / Wave P5 全面跃迁: 原生五平面 E2EE v2 漫游、混合语义 RRF 与 S0->S3 原话溯源、全表面参谋与 M5 外事半透膜、双轨隐式自省与睡眠重整、双人自动候选星晶与 M3 护窗及三层校准评测飞轮 / 零盲区全量路线图树与 DSH steward_fleet 桥接)",
 );
 

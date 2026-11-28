@@ -814,6 +814,12 @@ export class AgentHost {
       // 后台任务：聊天会话的 task_start / task_message / task_list；任务会话的限定工具、任务规则、task_report、收尾
       "    - id: amb-tasks",
       `      name: ${yamlStr(path.join(this.o.runtimeDir, "plugins", "amb-tasks.mjs"))}`,
+      ...(fs.existsSync(path.join(this.o.runtimeDir, "plugins", "amb-steward-fleet.mjs"))
+        ? [
+            "    - id: amb-steward-fleet",
+            `      name: ${yamlStr(path.join(this.o.runtimeDir, "plugins", "amb-steward-fleet.mjs"))}`,
+          ]
+        : []),
       ...this.selfEvolutionPluginLines(),
       ...this.computerUseLines(apps),
       ...this.fullAccessLines(),

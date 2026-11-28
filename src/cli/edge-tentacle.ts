@@ -8,6 +8,7 @@ import { AntigravityDispatcher } from "../sugent/antigravity-dispatcher.js";
 import { CausalLedger } from "../sugent/causal-ledger.js";
 import {
   EdgeTentacleRunner,
+  readSanitizedGovernanceDocFromRepo,
   scanLocalProjectsForEdge,
   type EdgeProjectPulseItem,
   type EdgeQueuedCommand,
@@ -125,8 +126,8 @@ export function parseEdgeTentacleCliConfig(
     path.resolve(expandHome(p, homeDir)),
   );
 
-  const parsedInterval = Number.parseInt(flagInterval || merged("SUGENT_EDGE_INTERVAL_SEC") || "45", 10);
-  const intervalSec = Math.max(10, Number.isFinite(parsedInterval) ? parsedInterval : 45);
+  const parsedInterval = Number.parseInt(flagInterval || merged("SUGENT_EDGE_INTERVAL_SEC") || "15", 10);
+  const intervalSec = Math.max(10, Number.isFinite(parsedInterval) ? parsedInterval : 15);
 
   if (!dryRunScan && (!hubUrl || !edgeToken)) {
     throw new Error("Missing SUGENT_HUB_URL or SUGENT_EDGE_TOKEN (or pass --dry-run-scan for local check).");
@@ -262,6 +263,20 @@ export async function runEdgeTentacleMain(
             ok: res.ok,
             summary: res.ok ? `已在 ${cfg.nodeId} 启动新会话` : (res.message ?? res.errorCode ?? "start_failed"),
             ...(res.conversationId ? { conversationId: res.conversationId } : {}),
+          };
+        },
+        readRepoDoc: async (cmd) => {
+          const ws = resolveWorkspacePathForCommand(cmd, cfg.projectsDirs);
+          if (!ws) return { ok: false, summary: "WORKSPACE_NOT_FOUND" };
+          const readRes = readSanitizedGovernanceDocFromRepo(ws, cmd.docPath ?? "ROADMAP.md");
+          if (!readRes.ok || !readRes.content) {
+            return { ok: false, summary: readRes.errorCode ?? "DOC_READ_FAILED" };
+          }
+          return {
+            ok: true,
+            summary: `已读取 ${readRes.docPath}`,
+            docPath: readRes.docPath,
+            docContent: readRes.content,
           };
         },
       });

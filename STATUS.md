@@ -2,20 +2,20 @@
 status_version: 1
 project: sugent
 review_state: pending_review
-updated_by: agent@cloud-devbox
-updated_at: "2026-11-28T17:05:00+08:00"
+updated_by: agent@local-mac
+updated_at: "2026-11-28T19:00:00+08:00"
 confirmed_by: ""
 confirmed_at: ""
 ---
 
 ## 阶段目标
 
-Wave P5 全量合龙验收，静候助理号养号满期扫码
+Wave P5 全量合龙并消除云端 Sugent 全域项目视野与工具盲区
 
 ## 最近完成
 
-- 按两梯队六泳道完成 [`Wave P5`](./docs/plans/2026-11-28-p5-holistic-memory-elevation-and-calibrated-evals.md)（`P5.1–P5.6`）：原生单一图谱直写与五平面+心智日志无损 E2EE v2 漫游、中英同义词+SQLite 向量 `RRF(k=60)` 与 `S0->S3` 原话溯源、`Dropzone`/微信 3s 全表面参谋与 `M5` 外事半透膜、双轨隐式反馈消化与园丁睡眠重整、双人自动候选星晶与 `M3` 节律护窗。
-- 建成三层记忆评测飞轮并刷新 [`定量评测报告`](./research/2026-11-28-memory-capability-evaluation-report.md)：72 场景 L1（同义词 `Recall@5` `100.0%`、E2EE v2 保留率 `100.0%`、隐式自省 `100.0%`、`M1–M5` 15 金丝雀泄露 `0.0%`）、4 组多日脱敏 Trace L2（`100.0%`）及 36 题 Held-out 二元 Judge L3（`TPR/TNR = 1.000 >= 0.85` + Rogan-Gladen 95% CI）；`typecheck`、`test:sugent`（82 文件 / 324 用例）与 `verify:sugent` 全绿。
+- 按两梯队六泳道完成 [`Wave P5`](./docs/plans/2026-11-28-p5-holistic-memory-elevation-and-calibrated-evals.md)（`P5.1–P5.6`）并建成 L1/L2/L3 三层记忆校准评测飞轮。
+- 落地「零盲区全量路线图与 DSH 桥接」：同步全量 `nodes[].items[]` 与 `recentPlans[]`、新增 `ops-remote-snapshot.json` 持久化与双源时序合并（清除离线僵死 `running`）、新增防外泄 `read_repo_doc` 跨端只读拉取，以及 `amb-steward-fleet.mjs` 原生 `steward_fleet` DSH 工具（`verify:sugent` 第 1–30 节全绿）。
 
 ## 在途
 

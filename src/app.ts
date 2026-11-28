@@ -552,6 +552,7 @@ export class App {
       search: this.search,
       connections: this.connections,
       stewardContextBrief: () => this.stewardService.buildOwnerAgentBrief(),
+      stewardFleetOp: (p) => this.stewardService.executeDshStewardFleetOp(p),
       onNotice: (text) => this.notice("warn", text),
     });
     this.attention = new Attention({ store: this.store });

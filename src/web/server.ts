@@ -673,6 +673,8 @@ export async function startWebServer(app: App, opts: { port?: number; host?: str
           status: b.status,
           ...(typeof b.summary === "string" ? { summary: b.summary } : {}),
           ...(typeof b.conversationId === "string" ? { conversationId: b.conversationId } : {}),
+          ...(typeof b.docPath === "string" ? { docPath: b.docPath } : {}),
+          ...(typeof b.docContent === "string" ? { docContent: b.docContent } : {}),
         });
         if (!ack.ok) throw new HttpError(404, "edge command not found");
         if (ack.ownerNotifyText && !app.stewardService.getWorkbench("owner_private").quietHoursActive) {
